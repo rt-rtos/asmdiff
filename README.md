@@ -6,6 +6,8 @@ harness file across a matrix of compilers, extracts each variant function's
 assembly, and prints side-by-side listings plus a summary of instruction
 counts and outbound calls.
 
+Defaults to shorepine/amy compiler flags. Should easily be re-toolable to any GNU-as-ELF asm.
+  
 Its home use case: checking whether an expression that used to constant-fold
 (e.g. `x * exp2f(5)` → one multiply) turns into a library call (e.g.
 `ldexpf(x, 5)` → `jmp ldexpf@PLT`) after a "cleanup". That distinction is
@@ -25,7 +27,7 @@ float new_scale(float x) { return ldexpf(x, -5); }
 Run:
 
 ```
-$ tools/asmdiff/asmdiff.py myharness.c
+$ asmdiff.py myharness.c
 ```
 
 Output (gcc section shown, one per compiler):
@@ -52,7 +54,7 @@ A worked example is included — `asmdiff_example.c` reproduces the
 exp2f/ldexpf analysis for both constant and runtime shift amounts:
 
 ```
-$ tools/asmdiff/asmdiff.py tools/asmdiff/asmdiff_example.c
+$ asmdiff.py asmdiff_example.c
 ```
 
 ## Command reference
@@ -272,7 +274,7 @@ including file first, each tree picks up **its own** headers automatically —
 so a change made in a header (a macro, a typedef) is compared by pointing
 `--across` at any `.c` file that uses it, without touching that `.c` file.
 
-## Worked example: exp2f vs ldexpf in the real AMY sources
+## Worked example: exp2f vs ldexpf in shorepine/AMY sources
 
 Suppose the proposal is to change AMY's float-mode shift macros in
 `src/amy_fixedpoint.h` from `(s) * exp2f(b)` to `ldexpf((s), (b))`. No
@@ -292,7 +294,7 @@ git worktree add ../amy-baseline HEAD
 #      #define SHIFTL(s, b) ldexpf((s), (b))
 
 # 4. Compare real functions containing both kinds of shift site:
-tools/asmdiff/asmdiff.py ../amy-baseline/src/log2_exp2.c src/log2_exp2.c \
+asmdiff.py ../amy-baseline/src/log2_exp2.c src/log2_exp2.c \
     --across exp2_lut --across log2_lut --cc 'gcc -O3 -Wall'
 
 # 5. Clean up
