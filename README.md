@@ -1,7 +1,9 @@
 # asmdiff — per-function assembly comparison for paired C implementations
 
+> asmdiff is a command-line tool for comparing the generated assembly of individual C functions across implementations, compiler flags, compiler versions, and source revisions. It is intended for investigating compiler code generation rather than benchmarking runtime performance.
+
 `asmdiff.py` answers one question fast: **when I rewrite a C construct, what
-does the compiler actually emit — before and after?** It compiles a small
+does the compiler actually emit - before and after?** It compiles a small
 harness file across a matrix of compilers, extracts each variant function's
 assembly, and prints side-by-side listings plus a summary of instruction
 counts and outbound calls.
