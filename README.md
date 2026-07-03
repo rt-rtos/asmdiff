@@ -113,13 +113,14 @@ asmdiff.py src/filters.c --across dsps_biquad_f32_ansi \
 ```bash
 # Size vs Performance Optimizations
 asmdiff.py src/filters.c --across dsps_biquad_f32_ansi \
-    --cc 'gcc -0s' --cc 'gcc -02'
+    --cc 'gcc -Os' --cc 'gcc -O3'
 
 ```
 
 ```
 cc#1: gcc -Os
-cc#2: gcc -O2
+cc#2: gcc -O3
+
 == cc#1 vs cc#2 ==
 
 dsps_biquad_f32_ansi [cc#1]                  | dsps_biquad_f32_ansi [cc#2]
