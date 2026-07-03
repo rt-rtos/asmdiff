@@ -380,4 +380,196 @@ standard library. To port:
   visibility rather than silence.
 - Columns truncate long instruction lines to keep pairs aligned; when a
   line matters, widen it via the `width` parameter of `side_by_side()` or
-  read the raw `-S` output by hand.
+  read the raw `-S` output by hand
+
+  ---
+## pretend FAQ
+### Why not just run objdump by hand?
+
+The two commands above (steps 4–5) replace a manual workflow with real
+friction at every step. Walking through it end to end on a single,
+one-sided example — did `x * exp2f(-5)` fold to a multiply, or did
+`ldexpf(x, n)` become a libcall — shows where the effort goes.
+
+**1. Compile to an object, remembering every project flag by hand.**
+
+```bash
+gcc -O3 -Wall -Wno-strict-aliasing -Wextra -Wno-unused-parameter \
+    -Wpointer-arith -Wno-float-conversion -Wno-missing-declarations \
+    -DAMY_WAVETABLE -Isrc -c src/log2_exp2.c -o /tmp/candidate.o
+```
+
+Drop one flag (say `-Wno-float-conversion`) and nothing errors — the build
+just quietly takes a different codegen path, and the comparison you're
+about to make is invalid without telling you so. Repeat this for the
+baseline tree with its own `-I`, and again for every extra compiler you
+want in the matrix.
+
+**2. Disassemble the function out of the object.**
+
+```bash
+objdump -dr --no-show-raw-insn -M no-aliases /tmp/candidate.o
+```
+
+For a libcall site (`ldexpf(x, n)` with a runtime `n`), the real output is:
+
+```
+0000000000000000 <g>:
+   0:	endbr64
+   4:	jmp    9 <g+0x9>
+			5: R_X86_64_PLT32	ldexpf-0x4
+```
+
+The call target isn't in the instruction — `jmp 9 <g+0x9>` points at an
+unresolved stub inside the same function. The actual symbol, `ldexpf`, only
+shows up in the relocation line underneath, and you have to know to cross-
+reference it by hand. Compare that to `gcc -S`, which prints the symbol
+inline because it hasn't been through a linker/relocation step yet:
+
+```
+g:
+	endbr64
+	jmp	ldexpf@PLT
+```
+
+That's why asmdiff compiles with `-S` instead of going through `objdump` on
+a linked object — the thing you're looking for (is this a libcall, and to
+what) is already text, not a relocation entry you have to decode.
+
+**3. Strip the noise objdump adds that `-S` doesn't.** Every instruction
+line carries a leading address and (unless `--no-show-raw-insn` is passed)
+raw opcode bytes; there's a `file format elf64-x86-64` banner, a
+`Disassembly of section .text:` header, and an address-annotated function
+label instead of a bare one. None of it is informative for a codegen diff,
+all of it has to be deleted by hand before two functions are readable
+side by side — and it has to be deleted from **every** file in the
+comparison, four of them for the two-function/two-tree case above.
+
+**4. Diff the cleaned pair.** `diff -y --width=100 old.txt new.txt` aligns
+by content match, not position — once the two versions diverge even
+slightly it starts pairing unrelated lines, and it has no header row to
+label which side is which. `asmdiff` prints its own aligned columns
+(`side_by_side()`) with the two function names as headers, and never loses
+the pairing because it doesn't try to align by content — it just walks
+both lists in lockstep.
+
+**5. Count instructions and classify calls by hand.** Grep for `call`/`jmp`
+in the cleaned text, then manually exclude the ones that are really local
+branches (`jmp 4011a0 <exp2_lut+0x40>`) rather than calls to another
+symbol — the exact distinction `CALL_RE` in `asmdiff.py` encodes once so
+you don't re-derive it per function. Then hand-build a table from four
+separate counts.
+
+**6. Do all of the above again per compiler.** asmdiff's default matrix is
+gcc *and* clang; by hand that's every step above, twice.
+
+For the full worked example — two functions, two trees, one compiler —
+the manual version is roughly: 2 compiles (with hand-retyped flags) → 4
+`objdump`/relocation-lookup passes → noise-stripped by hand on 4 files →
+2 `diff -y` runs that don't survive drift → manual instruction counts and
+call classification on 4 files → a hand-assembled summary table. The
+`asmdiff.py` version is the one command already shown above. Neither
+workflow can skip understanding *why* the two functions differ — that part
+is still your judgment — but everything upstream of that judgment, where a
+dropped flag or a misread relocation silently invalidates the comparison,
+is what the tool removes.
+
+### Why not just run gcc -S by hand?
+
+`-S` output sidesteps the relocation-decoding problem above — call targets
+are already symbolic text, no PLT stub to resolve. That removes step 2 of
+the objdump workflow. It does not remove the rest.
+
+**1. Compile to text instead of an object** — same flags, same risk of a
+silently dropped one:
+
+```bash
+gcc -O3 -Wall -Wno-strict-aliasing -Wextra -Wno-unused-parameter \
+    -Wpointer-arith -Wno-float-conversion -Wno-missing-declarations \
+    -DAMY_WAVETABLE -Isrc -S src/log2_exp2.c -o /tmp/log2_exp2.s
+```
+
+**2. Find where the function starts and ends in the `.s` file.** The real
+output for `exp2_lut` in this repo (current build, `AMY_USE_FIXEDPOINT`
+on):
+
+```
+exp2_lut:
+.LFB71:
+	.cfi_startproc
+	endbr64
+	movl	%edi, %edx
+	leaq	2+exp2_fxpt_lutable(%rip), %rcx
+	...
+	ret
+	.cfi_endproc
+.LFE71:
+	.size	exp2_lut, .-exp2_lut
+```
+
+There's no `objdump`-style address column to strip, but you still have to
+find the boundary by hand: the function starts at a column-0 label
+(`exp2_lut:`, not `.LFB71:` — that's a bracketing label, not the function),
+and ends at its `.size` directive — which only gcc reliably emits; on a
+compiler that doesn't, you'd fall back to "next function label", which is
+exactly the two-case rule `extract_functions()` implements once instead of
+you re-deriving it per file.
+
+**3. Strip compiler furniture — but not indiscriminately.** `.cfi_*`,
+`.LFB`/`.LFE` bracket labels, and `.p2align` carry no information. A local
+`.L`-numbered label sometimes does, though, and you can't tell which
+without reading the body. `log2_lut` in the same file:
+
+```
+log2_lut:
+.LFB70:
+	.cfi_startproc
+	endbr64
+	xorl	%eax, %eax
+	cmpl	$8388607, %edi
+	jg	.L9
+	.p2align 4,,10
+	.p2align 3
+.L3:
+	addl	%edi, %edi
+	subl	$1, %eax
+	cmpl	$8388607, %edi
+	jle	.L3
+	cmpl	$16777215, %edi
+	jle	.L11
+	.p2align 4,,10
+	.p2align 3
+.L5:
+	sarl	%edi
+	addl	$1, %eax
+.L9:
+	cmpl	$16777215, %edi
+	jg	.L5
+.L11:
+	...
+```
+
+`.L3`, `.L5`, `.L9`, `.L11` are live loop targets — `jg .L9` and `jle .L3`
+jump to them. A quick-and-dirty cleanup pass like `grep -v '^\.'` (strip
+every line starting with a dot) deletes those labels along with the
+`.p2align` noise sitting right next to them, and now the function has
+dangling jumps to labels that no longer exist — silently wrong, not an
+error. The correct rule is "drop this specific set of directives and this
+specific set of *bracketing* labels, keep everything else" — which is a
+narrower, easier-to-get-wrong rule than it looks, and it's what `NOISE`
+and `NOISE_LABEL` encode once in `asmdiff.py` instead of per file.
+
+**4. Everything downstream is unchanged from the objdump case:** pair the
+two cleaned functions up for reading, count instructions, classify
+`call`/`jmp` lines as libcalls vs. local branches, repeat per function,
+per file, per compiler, and assemble a summary table by hand.
+
+So `-S` over `objdump` buys back exactly one step — the call target is
+already a name, not a relocation to look up — and leaves the rest of the
+manual pipeline (locate, strip correctly, pair, count, classify, tally,
+multiplied by every function/tree/compiler in the matrix) in place. That
+remaining pipeline is `extract_functions()`, `analyze()`,
+`side_by_side()`, and `summary_table()` in `asmdiff.py` — written once,
+instead of re-derived by hand every time someone wants to answer "did this
+still fold?"
+
