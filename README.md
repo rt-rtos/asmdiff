@@ -7,9 +7,11 @@
 does the compiler actually emit - before and after?** It compiles a small
 harness file across a matrix of compilers, extracts each variant function's
 assembly, and prints side-by-side listings plus a summary of instruction
-counts and outbound calls.
+counts, outbound calls, and loop spans.
 
-Defaults to shorepine/amy compiler flags. Should easily be re-toolable to any GNU-as-ELF asm.
+Compilers and flags are configured per project through named targets in an
+`asmdiff.toml` file — the tool itself has no project-specific defaults and
+parses any GNU-as ELF assembly.
   
 Its home use case: checking whether an expression that used to constant-fold
 (e.g. `x * exp2f(5)` → one multiply) turns into a library call (e.g.
@@ -44,14 +46,21 @@ endbr64                                      | endbr64
 mulss   .LC0(%rip), %xmm0                    | movl    $-5, %edi
 ret                                          | jmp     ldexpf@PLT
 
-function   role       insns  calls
-old_scale  baseline   3      -
-new_scale  candidate  3      ldexpf
+function   role       insns  calls   loop spans
+old_scale  baseline   3      -       -
+new_scale  candidate  3      ldexpf  -
 ```
 
 Read the `calls` column first: `-` means the construct lowered to inline
 instructions; a symbol name means a libcall. The side-by-side asm above it is
 the evidence.
+
+The `loop spans` column reports `label:N` for every local label that some
+instruction branches back to: N instructions lie between the label and the
+last backward branch targeting it. Whole-function `insns` charges loop-hoisting
+changes for their one-time setup/writeback code; the span count is the part
+that repeats. Which span is your hot loop — and how often it runs — the
+listing and your source know, not the tool.
 
 A worked example is included — `asmdiff_example.c` reproduces the
 exp2f/ldexpf analysis for both constant and runtime shift amounts:
@@ -64,16 +73,24 @@ $ asmdiff.py asmdiff_example.c
 
 ```
 asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]... [--across FUNC]...
-           [--cc 'CC FLAGS']... [-- EXTRA_FLAGS...]
+           [--cc 'CC FLAGS']... [--target NAME]... [--config PATH]
+           [-- EXTRA_FLAGS...]
 ```
 
 | Option | Meaning |
 |---|---|
-| `SOURCE.c` | C file to compile — a purpose-built harness or a real project source. A second file may be given with `--across` to compare versions. |
-| `--pair OLD:NEW` | Compare two *different* functions within one compilation. Repeatable. Default: every `old_X` is auto-paired with its `new_X`. |
+| `SOURCE.c` | C file to compile — a purpose-built harness or a real project source. A second file may be given: with `--across` to compare a function, without it for a whole-file A/B summary. |
+| `--pair OLD:NEW` | Compare two *different* functions within one compilation. Repeatable. Default: every `old_X` is auto-paired with its `new_X`; with no pairs at all, the whole-file summary is printed instead. |
 | `--across FUNC` | Compare the *same* function across two compilations (see below). Repeatable. Mutually exclusive with `--pair`. |
-| `--cc 'CC FLAGS'` | One compiler invocation, command and flags in a single quoted string. Repeatable to build a matrix. Default: `gcc` and `clang`, each with AMY's Makefile flags (see below). |
+| `--cc 'CC FLAGS'` | One compiler invocation, command and flags in a single quoted string. Repeatable to build a matrix. |
+| `--target NAME` | A named target from the config file, resolved to a `--cc` entry. Repeatable; appended to the matrix after `--cc` entries. |
+| `--config PATH` | Config file to use. Default search: `asmdiff.toml` next to `SOURCE.c`, then in the current directory, then `~/.config/`. First hit wins. |
 | `-- FLAGS...` | Everything after a bare `--` is appended to *every* compiler invocation. |
+
+With no `--cc` and no `--target`, the config file's top-level
+`default` target(s) are used; without a config file, plain `gcc -O3` and
+`clang -O3`. The tool's own advice applies: compile at the flags your
+project ships with — put them in a target.
 
 Examples:
 
@@ -93,6 +110,82 @@ Compilers missing from `PATH` are skipped with a warning; the run fails only
 if none are usable. Exit status is non-zero only for operational failures
 (compile error — the compiler's stderr is shown — unknown `--pair` name, no
 usable compiler). Differing assembly is the expected result, never an error.
+
+## Config file: named targets
+
+Retyping a cross-compiler path and ten flags per run is the enemy of actually
+looking at assembly. A TOML config (stdlib `tomllib`, Python ≥ 3.11) names
+each compiler+flags combination once:
+
+```toml
+# asmdiff.toml — next to your harnesses, in CWD, or in ~/.config/
+default = "s3-amy"          # target(s) used when no --cc/--target is given
+
+[s3-amy]                     # production-like ESP32-S3 codegen
+cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+flags = [
+  "-O2", "-DAMY_USE_FIXEDPOINT", "-DNDEBUG",
+  "-Wno-strict-aliasing", "-mlongcalls",
+  "-I$HOME/project/components/amy/src",
+]
+
+[host-fixed]                 # same defines on host gcc
+cc = "gcc"
+flags = ["-O2", "-DAMY_USE_FIXEDPOINT", "-I$HOME/amy/src"]
+```
+
+`cc` values expand `~` and `$VARS` and may be glob patterns, so a config
+survives toolchain upgrades (`esp-14` → `esp-15`) without editing. A
+pattern matching several installed toolchains resolves to the highest
+version-sorted one — numerically, so `esp-15` beats `esp-9` — and the
+choice is printed to stderr; the `==` header in the output always shows
+the fully resolved command that actually ran. No match is an error. Pin
+the exact directory instead when reproducibility matters more than
+convenience. Flags expand `$VARS` only (no globbing).
+
+A target is exactly a saved `--cc` entry — nothing else changes. Useful
+shapes:
+
+```bash
+asmdiff.py h.c                                  # config default target(s)
+asmdiff.py h.c --target s3-amy --target host-fixed   # two-target matrix
+asmdiff.py h.c --across f --target s3-amy --cc 'gcc -O2'  # mix freely
+```
+
+A config placed next to your harness files travels with them: any invocation
+naming a source in that directory finds it, from any CWD. `default` may be a
+single name or a list (a whole default matrix). The
+included `asmdiff.example.toml` is a starting point. If a flag or include
+path must vary per machine, that's what per-machine config files are for —
+nothing lives in the tool.
+
+## Whole-file summary
+
+With no `--pair`, no `--across`, and no `old_*`/`new_*` functions to
+auto-pair, the tool prints what it parsed instead of erroring: every
+function's counts plus a file total. With two files, one block per file:
+
+```
+$ asmdiff.py old/delay.c new/delay.c
+
+== xtensa-esp32s3-elf-gcc -O2 ... ==
+
+-- old/delay.c --
+
+function         insns  calls        loop spans
+stereo_reverb    437    -            .L108:327
+...
+TOTAL (13 functions)  956   malloc_caps, free, ...  -
+
+-- new/delay.c --
+...
+TOTAL (13 functions)  1028  malloc_caps, free, ...  -
+```
+
+The TOTAL row is a coarse sanity check — did this refactor move the file's
+weight, did a call appear that shouldn't have? It sums parsed function
+bodies only (no literal pools, data, or alignment), so it is not a size
+measurement, and per-function rows are where the real information is.
 
 ## Comparing the same function across two builds (`--across`)
 
@@ -116,7 +209,7 @@ asmdiff.py src/filters.c --across dsps_biquad_f32_ansi \
 ```bash
 # Size vs Performance Optimizations
 asmdiff.py src/filters.c --across dsps_biquad_f32_ansi \
-    --cc 'gcc -Os' --cc 'gcc -O3'
+    --cc 'gcc -Os' --cc 'gcc -O2'
 
 ```
 
@@ -221,10 +314,14 @@ ret                                          | movl    %r11d, %r12d
                                              | popq    %r13
                                              | ret
 
-function                     role       insns  calls
-dsps_biquad_f32_ansi [cc#1]  baseline   59     SMULR6
-dsps_biquad_f32_ansi [cc#2]  candidate  89     -
+function                     role       insns  calls   loop spans
+dsps_biquad_f32_ansi [cc#1]  baseline   59     SMULR6  .L27:32
+dsps_biquad_f32_ansi [cc#2]  candidate  89     -       .L26:54
 ```
+
+(The columns describe, they don't rank: here `-O2` is bigger by every
+count, and only the listing shows why — `SMULR6` inlined into the loop
+body, vector setup around it. Whether that trade is good is your call.)
 
 The output prints a legend mapping `cc#N` tags to the full compiler
 invocations, then one section per baseline/candidate pairing. Runnable
@@ -254,9 +351,9 @@ call    ldexpf@PLT                           |
 leave                                        |
 ret                                          |
 
-function       role       insns  calls
-new_rt [cc#1]  baseline   13     ldexpf
-new_rt [cc#2]  candidate  2      ldexpf
+function       role       insns  calls   loop spans
+new_rt [cc#1]  baseline   13     ldexpf  -
+new_rt [cc#2]  candidate  2      ldexpf  -
 ```
 
 **Two files** — before/after versions of a source file (e.g. from a git
@@ -335,9 +432,59 @@ probed the same way.
    x86 (`call`, `jmp` tail calls), ARM (`bl`, `blx`), RISC-V (`call`,
    `tail`, `jal`), and Xtensa (`call0/4/8/12`, `callx*`, `j`). Local-label
    branches and register-indirect x86 jumps are not counted as calls.
+4. Loop spans come from label references alone — no mnemonic tables, no
+   control-flow analysis. The next section walks through it.
+
+### How a span is found
+
+The parser sees only the cleaned `-S` text of one function: instructions
+and local labels, as line positions rather than addresses. Two passes:
+
+1. Record the position of every local label line (`.L2:`).
+2. Scan each instruction's operands for label-shaped tokens (`.L…`). A
+   token counts only if that label exists **inside this function body**.
+   That one rule filters out literal-pool references — `mulss .LC0(%rip)`,
+   `l32r a8, .LC44` — because `.LC*` labels are emitted in data sections
+   outside the body and are never in the label map.
+
+An instruction that references a label *above* itself is a backward
+branch, whatever its mnemonic (`jne`, `bne`, `bnez.n`, `jnz` — the tool
+never needs to know). The span runs from the label to the last such
+branch, inclusive:
+
+```
+.L2:                    ─┐
+    addl  $1, %eax       │
+    cmpl  $8, %eax       │  span ".L2:3"
+    jne   .L2           ─┘  backward reference
+    ret                     outside the span
+```
+
+Several back-edges to one label (a `continue` plus the loop bottom) merge
+into that label's single span. Nested labels report separately — the
+outer span simply contains the inner one. Forward references (loop exits
+like `jle .L24`) are ignored.
+
+The one arch-specific case is Xtensa zero-overhead loops, where the
+hardware — not a branch — repeats the body, and the `loop` instruction
+names its *end* label, forward:
+
+```
+    loopgt a3, .L5          runs once; not part of the span
+    addi.n a2, a2, 1    ─┐
+    s32i.n a2, a4, 0    ─┘  span ".L5:2"
+.L5:
+    retw.n
+```
+
+That is the entire mechanism. There is no CFG, no trip count, and no
+notion of "the" loop: a backward `goto` produces a span exactly like a
+`for` loop, and an unrolled loop's span is the unrolled body. The column
+states where the compiler laid out a repeatable region — nothing more.
 
 No verdicts are printed. The tool reports facts; whether a libcall on that
-path matters is your judgment.
+path — or an instruction inside a span rather than outside it — matters is
+your judgment.
 
 ## Writing good harnesses
 
@@ -346,8 +493,8 @@ path matters is your judgment.
   there. The fold-vs-libcall answer depends on exactly this.
 - Keep functions non-`static` so the compiler must emit them standalone.
 - Compile at the **flags your project ships with** — a construct that folds
-  at `-O3 -ffast-math` may not fold at plain `-O3`. The default flags here
-  are AMY's for that reason.
+  at `-O3 -ffast-math` may not fold at plain `-O3`. Encode them once as a
+  config target and make it the `default`.
 - Beware of over-synthetic harnesses: a function whose whole body is the
   construct can tail-call (`jmp f`) where real surrounding code would
   `call f` and continue. Same libcall either way, but instruction counts
@@ -356,17 +503,13 @@ path matters is your judgment.
 ## Porting to another project
 
 The tool is one stdlib-only Python 3 file with no imports outside the
-standard library. To port:
+standard library, and contains no project-specific constants. To port:
 
 1. Copy this directory (or just `asmdiff.py`).
-2. Edit the constants at the top of `asmdiff.py`:
-   - `AMY_CFLAGS` — replace with your project's real build flags.
-   - `SRC_DIR` — points at AMY's `src/` for `#include "amy.h"` harnesses;
-     it is only added when the directory exists, so you can delete the
-     block or repoint it at your include directory.
-   - `DEFAULT_COMPILERS` — the compilers run when `--cc` is not given.
-3. Run the self-tests: `python3 test_asmdiff.py -v` (17 tests, no compiler
-   needed).
+2. Write an `asmdiff.toml` for the new project's toolchain and flags
+   (start from `asmdiff.example.toml`) and drop it next to your
+   harnesses, in your working directory, or in `~/.config/`.
+3. Run the self-tests: `python3 test_asmdiff.py -v` (no compiler needed).
 
 ## Limitations
 
@@ -380,6 +523,13 @@ standard library. To port:
   visibility rather than silence.
 - Columns truncate long instruction lines to keep pairs aligned; when a
   line matters, widen it via the `width` parameter of `side_by_side()` or
+  read the raw `-S` output by hand.
+- Loop spans are layout facts, not loop analysis. Label numbers are
+  compiler-assigned, so a baseline's `.L27` and a candidate's `.L26` may
+  or may not be "the same" loop — match them through the listing, not by
+  name. Unrolled or versioned loops (common at `-O3`) appear as several
+  spans or as one large span; the tool reports what it sees and does not
+  reassemble them into a source-level loop.
   read the raw `-S` output by hand
 
   ---

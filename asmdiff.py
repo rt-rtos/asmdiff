@@ -3,27 +3,36 @@
 
 Compiles a harness C file across a matrix of compilers, extracts each
 variant function's assembly from the -S output, and prints side-by-side
-listings plus a summary of instruction counts and outbound calls.
+listings plus a summary of instruction counts, outbound calls, and loop
+spans (instructions between a local label and its last backward branch).
 Automates fold-vs-libcall analysis when evaluating micro-optimisations
 (e.g. "does this still compile to one instruction, or is it a libcall?").
 
 Usage:
     tools/asmdiff/asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]...
                              [--across FUNC]... [--cc 'CC FLAGS']...
+                             [--target NAME]... [--config PATH]
                              [-- EXTRA_FLAGS...]
 
-Two comparison modes:
+Three modes:
   --pair OLD:NEW  compares two different functions within one compilation
-                  (default; with no --pair, old_X/new_X names auto-pair).
+                  (with no --pair, old_X/new_X names auto-pair).
   --across FUNC   compares the SAME function across two compilations:
                   either one file under two --cc entries (flag/define
                   variants), or two source files (before/after versions)
                   under each compiler in the matrix.
+  (neither)       whole-file summary: per-function counts plus a file
+                  total, for one file or side by side for two.
 
-With no --cc, gcc and clang are each run with AMY's Makefile flags.
+Compilers come from --cc strings, from named targets in an asmdiff.toml
+config file (--target NAME), from the config's `default` entry, or —
+failing all of those — plain `gcc -O3` and `clang -O3`.
 Flags after a bare `--` are appended to every compiler invocation.
 """
 import argparse
+import glob
+import hashlib
+import os
 import re
 import shlex
 import shutil
@@ -33,21 +42,14 @@ import tempfile
 from itertools import zip_longest
 from pathlib import Path
 
-SRC_DIR = Path(__file__).resolve().parents[2] / "src"
+try:
+    import tomllib  # Python >= 3.11; config files are optional without it
+except ModuleNotFoundError:
+    tomllib = None
 
-# AMY's real build flags, from the repo Makefile.  When porting this tool
-# to another project, replace these with that project's release flags —
-# the whole point is to read asm at the flags the code actually ships with.
-AMY_CFLAGS = [
-    "-O3", "-Wall", "-Wno-strict-aliasing", "-Wextra",
-    "-Wno-unused-parameter", "-Wpointer-arith", "-Wno-float-conversion",
-    "-Wno-missing-declarations", "-DAMY_WAVETABLE",
-]
-# When the tool lives inside the AMY repo, let a harness #include "amy.h"
-# and exercise the real macros.  Harmlessly absent anywhere else.
-if SRC_DIR.is_dir():
-    AMY_CFLAGS.append("-I" + str(SRC_DIR))
 DEFAULT_COMPILERS = ["gcc", "clang"]
+FALLBACK_FLAGS = "-O3"
+CONFIG_NAME = "asmdiff.toml"
 
 # A label at column 0 that is not a local (.L*) label starts a function.
 FUNC_LABEL = re.compile(r"^([A-Za-z_][\w$.]*):")
@@ -123,6 +125,53 @@ def analyze(lines):
     return insns, calls
 
 
+# A local-label operand (branch target, zero-overhead loop end).  Literal
+# pool labels (.LC0) also match, but they are emitted outside function
+# bodies, so they never appear in the label map built from a body.
+LABEL_REF = re.compile(r"\.L[\w$.]+")
+
+
+def loop_spans(lines):
+    """Return [(label, insns)] spans for cleaned asm lines.
+
+    A span is the run of instructions from a local label to the last
+    instruction that references it from below — a backward branch, which
+    is what a compiled loop looks like on every target the tool parses.
+    Xtensa zero-overhead loops (loop/loopnez/loopgt) reference their END
+    label instead; there the span is the instructions the loop encloses.
+    Spans are reported in order of appearance, one per label; nested
+    labels yield nested spans.  The count states how many instructions
+    lie in the span — nothing about trip count or hotness, which the
+    reader must judge from the source.
+    """
+    label_at = {ln[:-1]: i for i, ln in enumerate(lines)
+                if ln.endswith(":")}
+    spans = {}
+    for i, ln in enumerate(lines):
+        if ln.endswith(":"):
+            continue
+        mnem = ln.split(None, 1)[0]
+        for ref in LABEL_REF.findall(ln):
+            if ref not in label_at:
+                continue
+            j = label_at[ref]
+            if j < i:                       # label above: backward branch
+                lo, hi = j, i
+            elif mnem.startswith("loop"):   # Xtensa: end label below
+                lo, hi = i + 1, j - 1
+            else:
+                continue
+            if ref in spans:                # several edges to one label
+                lo = min(lo, spans[ref][0])
+                hi = max(hi, spans[ref][1])
+            spans[ref] = (lo, hi)
+    result = []
+    for ref, (lo, hi) in sorted(spans.items(), key=lambda kv: kv[1]):
+        insns = sum(1 for ln in lines[lo:hi + 1] if not ln.endswith(":"))
+        result.append((ref, insns))
+    return result
+
+
 def auto_pairs(names):
     """Pair old_X with new_X for every X present in both."""
     names = list(names)
@@ -130,11 +179,117 @@ def auto_pairs(names):
             if n.startswith("old_") and "new_" + n[4:] in names]
 
 
-def build_matrix(cc_args):
-    """Explicit --cc strings verbatim, else gcc+clang with AMY's flags."""
-    if cc_args:
-        return list(cc_args)
-    return [" ".join([cc] + AMY_CFLAGS) for cc in DEFAULT_COMPILERS]
+def find_config(explicit, sources):
+    """Locate the config file; first hit wins, no merging.
+
+    Order: --config PATH, then asmdiff.toml next to the first source
+    file (a harness directory can carry its own targets), then the
+    current directory, then ~/.config/asmdiff.toml.
+    """
+    if explicit:
+        path = Path(explicit)
+        if not path.is_file():
+            sys.exit(f"error: config file not found: {explicit}")
+        return path
+    for candidate in (Path(sources[0]).resolve().parent / CONFIG_NAME,
+                      Path.cwd() / CONFIG_NAME,
+                      Path.home() / ".config" / CONFIG_NAME):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_config(path):
+    """Parse a TOML config: one [table] per target, optional top-level
+    `default` naming the target(s) to run when no --cc/--target is given."""
+    if tomllib is None:
+        sys.exit(f"error: {path} exists but this Python has no tomllib "
+                 "(config files need Python >= 3.11)")
+    try:
+        with open(path, "rb") as fh:
+            return tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        sys.exit(f"error: {path}: {exc}")
+
+
+def _version_key(path):
+    """Sort key that orders embedded numbers numerically, so
+    esp-15.2.0 ranks above esp-9.1.0 (lexical order would not)."""
+    return [(0, int(tok)) if tok.isdigit() else (1, tok)
+            for tok in re.split(r"(\d+)", path)]
+
+
+def resolve_cc(cc, name):
+    """Expand ~, $VARS, and glob patterns in a target's cc value.
+
+    A pattern like .../xtensa-esp-elf/esp-*/bin/...-gcc keeps the config
+    toolchain-version agnostic.  If it matches several installed
+    toolchains the highest version-sorted one is used, and the choice is
+    printed so it is never silent; no match is an error.
+    """
+    expanded = os.path.expandvars(os.path.expanduser(cc))
+    if not any(ch in expanded for ch in "*?["):
+        return expanded
+    matches = sorted(glob.glob(expanded), key=_version_key)
+    if not matches:
+        sys.exit(f"error: target [{name}]: cc pattern matched nothing: "
+                 + expanded)
+    if len(matches) > 1:
+        print(f"target [{name}]: cc pattern matched {len(matches)} "
+              f"toolchains, using {matches[-1]}", file=sys.stderr)
+    return matches[-1]
+
+
+def target_command(config, name, config_path):
+    """Resolve a named [target] table to one 'CC FLAGS' matrix entry."""
+    entry = (config or {}).get(name)
+    if not isinstance(entry, dict):
+        known = sorted(k for k, v in (config or {}).items()
+                       if isinstance(v, dict))
+        sys.exit(f"error: no [{name}] target in "
+                 f"{config_path or 'any config file'}"
+                 + ("; targets: " + ", ".join(known) if known
+                    else "; no targets defined"))
+    cc = entry.get("cc")
+    if not isinstance(cc, str):
+        sys.exit(f'error: target [{name}] needs cc = "compiler"')
+    flags = entry.get("flags", [])
+    if isinstance(flags, str) or not all(isinstance(f, str) for f in flags):
+        sys.exit(f"error: target [{name}]: flags must be an array of strings")
+    flags = [os.path.expandvars(f) for f in flags]
+    return shlex.join([resolve_cc(cc, name), *flags])
+
+
+def build_matrix(cc_args, target_args, config, config_path):
+    """Resolve the compiler matrix.
+
+    --cc strings verbatim, then --target entries, in that order.  With
+    neither, the config's `default` (a target name or list of names);
+    with no config or no default, plain gcc/clang at -O3.
+    """
+    entries = list(cc_args)
+    entries += [target_command(config, name, config_path)
+                for name in target_args]
+    if entries:
+        return entries
+    default = (config or {}).get("default")
+    if default:
+        names = [default] if isinstance(default, str) else list(default)
+        return [target_command(config, name, config_path) for name in names]
+    return [f"{cc} {FALLBACK_FLAGS}" for cc in DEFAULT_COMPILERS]
+
+
+def asm_output_name(cc_cmd, harness):
+    """Filesystem-safe .s name for one (compiler, source) compilation.
+
+    The readable slug of a compiler command can exceed NAME_MAX when the
+    command embeds absolute toolchain/include paths; long slugs are
+    truncated and kept unique with a short hash of the full command.
+    """
+    tag = re.sub(r"\W+", "_", cc_cmd)
+    if len(tag) > 64:
+        tag = tag[:53] + "_" + hashlib.sha1(cc_cmd.encode()).hexdigest()[:10]
+    return tag + "_" + Path(harness).stem + ".s"
 
 
 def compile_to_asm(cc_cmd, extra_flags, harness, out_dir):
@@ -148,8 +303,7 @@ def compile_to_asm(cc_cmd, extra_flags, harness, out_dir):
         print(f"warning: {argv[0]} not found on PATH, skipping",
               file=sys.stderr)
         return None
-    out_s = Path(out_dir) / (
-        re.sub(r"\W+", "_", cc_cmd) + "_" + Path(harness).stem + ".s")
+    out_s = Path(out_dir) / asm_output_name(cc_cmd, harness)
     cmd = argv + list(extra_flags) + ["-S", "-o", str(out_s), str(harness)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -168,17 +322,51 @@ def side_by_side(left, right, ltitle, rtitle, width=44):
     return "\n".join(rows)
 
 
-def summary_table(pairs, funcs):
-    """Instruction counts and outbound calls for every pair member."""
-    rows = [("function", "role", "insns", "calls")]
-    for old, new in pairs:
-        for name, role in ((old, "baseline"), (new, "candidate")):
-            insns, calls = analyze(funcs[name])
-            rows.append((name, role, str(insns), ", ".join(calls) or "-"))
-    widths = [max(len(row[i]) for row in rows) for i in range(4)]
+def render_table(rows):
+    """Column-aligned text for a list of equal-length string tuples."""
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
     return "\n".join(
         "  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip()
         for row in rows)
+
+
+def format_spans(spans):
+    return " ".join(f"{label}:{n}" for label, n in spans) or "-"
+
+
+def summary_table(pairs, funcs):
+    """Instruction counts, outbound calls, and loop spans per pair member."""
+    rows = [("function", "role", "insns", "calls", "loop spans")]
+    for old, new in pairs:
+        for name, role in ((old, "baseline"), (new, "candidate")):
+            insns, calls = analyze(funcs[name])
+            rows.append((name, role, str(insns),
+                         ", ".join(calls) or "-",
+                         format_spans(loop_spans(funcs[name]))))
+    return render_table(rows)
+
+
+def file_summary_table(funcs):
+    """Per-function counts plus a whole-file total row.
+
+    The total sums instruction counts over every function parsed from
+    the -S output and unions their outbound calls — a coarse A/B sanity
+    check, not a code-size measurement (literal pools, data, and
+    alignment are not included).
+    """
+    rows = [("function", "insns", "calls", "loop spans")]
+    total_insns, all_calls = 0, []
+    for name, lines in funcs.items():
+        insns, calls = analyze(lines)
+        total_insns += insns
+        for sym in calls:
+            if sym not in all_calls:
+                all_calls.append(sym)
+        rows.append((name, str(insns), ", ".join(calls) or "-",
+                     format_spans(loop_spans(lines))))
+    rows.append((f"TOTAL ({len(funcs)} functions)", str(total_insns),
+                 ", ".join(all_calls) or "-", "-"))
+    return render_table(rows)
 
 
 def file_tags(a, b):
@@ -256,8 +444,39 @@ def run_across(sources, matrix, fn_names, extra_flags, tmp):
     return 0
 
 
+def run_summary(sources, matrix, extra_flags, tmp):
+    """No pairs to compare: whole-file summary, one block per file."""
+    tags = (file_tags(*sources) if len(sources) == 2
+            else [Path(sources[0]).name])
+    ran_any = False
+    for cc_cmd in matrix:
+        sections = []
+        for src in sources:
+            asm = compile_to_asm(cc_cmd, extra_flags, src, tmp)
+            if asm is None:
+                break
+            sections.append(extract_functions(asm))
+        if len(sections) < len(sources):
+            continue
+        ran_any = True
+        print(f"\n== {cc_cmd} ==")
+        for tag, funcs in zip(tags, sections):
+            if len(sections) > 1:
+                print(f"\n-- {tag} --")
+            print()
+            print(file_summary_table(funcs) if funcs
+                  else "(no functions found)")
+    if not ran_any:
+        sys.exit("error: no usable compiler in the matrix")
+    return 0
+
+
 def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
-    """--pair mode: two different functions within one compilation."""
+    """--pair mode: two different functions within one compilation.
+
+    With no --pair and no old_X/new_X functions to auto-pair, falls
+    back to the whole-file summary for this compilation.
+    """
     ran_any = False
     for cc_cmd in matrix:
         asm = compile_to_asm(cc_cmd, extra_flags, source, tmp)
@@ -268,9 +487,10 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
         pairs = ([tuple(p.split(":", 1)) for p in pair_specs]
                  or auto_pairs(funcs))
         if not pairs:
-            sys.exit("error: no --pair given and no old_X/new_X "
-                     "functions found; functions in asm: "
-                     + (", ".join(funcs) or "none"))
+            print(f"\n== {cc_cmd} ==\n")
+            print(file_summary_table(funcs) if funcs
+                  else "(no functions found)")
+            continue
         missing = sorted({n for p in pairs for n in p if n not in funcs})
         if missing:
             sys.exit("error: function(s) not in asm: "
@@ -312,16 +532,29 @@ def main(argv=None):
     parser.add_argument("--cc", action="append", default=[],
                         metavar="'CC FLAGS'",
                         help="compiler and flags as one string (repeatable); "
-                             "default: gcc and clang with AMY's Makefile flags")
+                             "default: config default target, else gcc and "
+                             "clang at " + FALLBACK_FLAGS)
+    parser.add_argument("--target", action="append", default=[],
+                        metavar="NAME",
+                        help="named [table] from the config file, resolved "
+                             "to a --cc entry (repeatable; appended to the "
+                             "matrix after --cc entries)")
+    parser.add_argument("--config", metavar="PATH",
+                        help=f"config file; default search: {CONFIG_NAME} "
+                             "next to SOURCE.c, in the current directory, "
+                             "then in ~/.config/")
     args = parser.parse_args(argv)
 
     if len(args.sources) > 2:
         parser.error("at most two source files may be given")
     if args.across and args.pair:
         parser.error("--across and --pair are mutually exclusive")
-    if len(args.sources) == 2 and not args.across:
-        parser.error("two source files require --across FUNC")
-    matrix = build_matrix(args.cc)
+    if len(args.sources) == 2 and args.pair:
+        parser.error("--pair compares within one file; "
+                     "use --across FUNC for two files")
+    config_path = find_config(args.config, args.sources)
+    config = load_config(config_path) if config_path else None
+    matrix = build_matrix(args.cc, args.target, config, config_path)
     if args.across and len(args.sources) == 1 and len(matrix) < 2:
         parser.error("--across on one file needs at least two --cc entries")
     for spec in args.pair:
@@ -332,6 +565,8 @@ def main(argv=None):
         if args.across:
             return run_across(args.sources, matrix, args.across,
                               extra_flags, tmp)
+        if len(args.sources) == 2:
+            return run_summary(args.sources, matrix, extra_flags, tmp)
         return run_pairs(args.sources[0], matrix, args.pair,
                          extra_flags, tmp)
 

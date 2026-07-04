@@ -1,0 +1,36 @@
+# asmdiff config — named compiler+flags targets.
+#
+# Copy to one of the locations asmdiff searches (first hit wins):
+#   1. the path given with --config
+#   2. asmdiff.toml next to the SOURCE.c being compiled
+#   3. asmdiff.toml in the current directory
+#   4. ~/.config/asmdiff.toml
+#
+# Each [table] is a target usable as `--target NAME`; the optional
+# top-level `default` names the target(s) used when no --cc/--target
+# is given.  Compile at the flags your project ships with — that is
+# the whole point of the tool.
+
+default = "amy-host"
+
+[amy-host]
+cc = "gcc"
+flags = [
+  "-O3", "-Wall", "-Wno-strict-aliasing", "-Wextra",
+  "-Wno-unused-parameter", "-Wpointer-arith", "-Wno-float-conversion",
+  "-Wno-missing-declarations", "-DAMY_WAVETABLE",
+  # For harnesses that #include "amy.h", point at the AMY sources:
+  # "-I/path/to/amy/src",
+]
+
+# cc values may use ~, $VARS, and glob patterns.  A glob that matches
+# several installed toolchains resolves to the highest version-sorted
+# one (announced on stderr); pin the exact esp-NN directory instead if
+# reproducibility across sessions matters more than convenience.
+[s3-amy]
+cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+flags = [
+  "-O2", "-DAMY_USE_FIXEDPOINT", "-DNDEBUG",
+  "-Wno-strict-aliasing", "-Wno-float-conversion",
+  "-mlongcalls", "-Wpointer-arith",
+]
