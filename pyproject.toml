@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "asmdiff"
+version = "0.1.0"
+description = "Compare per-function assembly between paired C implementations"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.8"
+authors = [
+    { name = "Rasmus Tikkanen" },
+]
+keywords = ["assembly", "compiler", "gcc", "clang", "codegen", "disassembly"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Debuggers",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/rt-rtos/asmdiff"
+Repository = "https://github.com/rt-rtos/asmdiff"
+
+[project.scripts]
+asmdiff = "asmdiff:main"
+
+[tool.hatch.build.targets.wheel]
+include = ["asmdiff.py"]
