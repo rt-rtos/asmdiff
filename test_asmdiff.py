@@ -74,6 +74,77 @@ looper:
 \t.size\tlooper, .-looper
 """
 
+# A switch lowered to a jump table, faithful to `gcc -O2 -S`.  The table is
+# emitted *inside* the function body (between the label and `.size`) via a
+# .rodata/.text toggle, with self-relative entries `.long .Lx-.L4` — data,
+# not instructions, and their .L4 operand must not read as a backward branch.
+SWITCH_ASM = """\
+\t.globl\tsel
+\t.type\tsel, @function
+sel:
+.LFB0:
+\t.cfi_startproc
+\tendbr64
+\tcmpl\t$4, %edi
+\tja\t.L9
+\tleaq\t.L4(%rip), %rcx
+\tmovl\t%edi, %edi
+\tmovslq\t(%rcx,%rdi,4), %rax
+\taddq\t%rcx, %rax
+\tnotrack jmp\t*%rax
+\t.section\t.rodata
+\t.align 4
+.L4:
+\t.long\t.L8-.L4
+\t.long\t.L7-.L4
+\t.long\t.L6-.L4
+\t.long\t.L5-.L4
+\t.long\t.L3-.L4
+\t.text
+\t.p2align 4,,10
+.L5:
+\tmovl\t%esi, %eax
+\txorl\t%edx, %eax
+\tret
+.L3:
+\tmovl\t%esi, %eax
+\torl\t%edx, %eax
+\tret
+.L8:
+\tleal\t(%rsi,%rdx), %eax
+\tret
+.L7:
+\tmovl\t%esi, %eax
+\tsubl\t%edx, %eax
+\tret
+.L6:
+\tmovl\t%esi, %eax
+\timull\t%edx, %eax
+\tret
+\t.cfi_endproc
+\t.size\tsel, .-sel
+"""
+
+# Jump tables on other targets use plain (non-self-relative) label entries,
+# plus stray inline constants; all are data directives, none are branches.
+DATA_DIRECTIVES_ASM = """\
+\t.type\ttbl, @function
+tbl:
+\t.cfi_startproc
+\tjx\ta8
+.Ltab:
+\t.word\t.La
+\t.word\t.Lb
+\t.byte\t3
+\t.quad\t0
+.La:
+\tadd.n\ta2, a2, a2
+\tretw.n
+.Lb:
+\tretw.n
+\t.size\ttbl, .-tbl
+"""
+
 
 class TestExtractFunctions(unittest.TestCase):
     def test_gcc_functions_found(self):
@@ -171,6 +242,37 @@ class TestLoopSpans(unittest.TestCase):
         # the operand matches the label-reference pattern.
         lines = ["l32r\ta8, .LC44", "ret"]
         self.assertEqual(asmdiff.loop_spans(lines), [])
+
+
+class TestJumpTableData(unittest.TestCase):
+    """Inline data (switch jump tables, constants) emitted inside a function
+    body is not counted as instructions and never reads as a loop span."""
+
+    def test_table_entries_stripped_from_body(self):
+        body = asmdiff.extract_functions(SWITCH_ASM)["sel"]
+        self.assertFalse(any(".long" in line for line in body))
+        self.assertIn(".L4:", body)  # the table's anchor label is kept
+
+    def test_table_entries_not_counted_as_instructions(self):
+        body = asmdiff.extract_functions(SWITCH_ASM)["sel"]
+        insns, calls = asmdiff.analyze(body)
+        self.assertEqual(insns, 22)   # 27 before the fix (5 .long entries)
+        self.assertEqual(calls, [])   # notrack jmp *%rax is not a call
+
+    def test_self_relative_table_is_not_a_phantom_span(self):
+        # `.long .L5-.L4` references the table base .L4 from below; without
+        # stripping, that reads as a backward branch and invents a loop.
+        body = asmdiff.extract_functions(SWITCH_ASM)["sel"]
+        self.assertEqual(asmdiff.loop_spans(body), [])
+
+    def test_various_data_directives_stripped(self):
+        # .word/.byte/.quad jump tables and constants on other targets.
+        body = asmdiff.extract_functions(DATA_DIRECTIVES_ASM)["tbl"]
+        for directive in (".word", ".byte", ".quad"):
+            self.assertFalse(any(directive in line for line in body), directive)
+        insns, _ = asmdiff.analyze(body)
+        self.assertEqual(insns, 4)    # 8 before the fix (4 data entries)
+        self.assertEqual(asmdiff.loop_spans(body), [])
 
 
 class TestAutoPairs(unittest.TestCase):

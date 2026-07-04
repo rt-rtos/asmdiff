@@ -60,6 +60,15 @@ NOISE = re.compile(
 )
 # Compiler-generated bracketing labels that add nothing (.LFB0:, .Lfunc_end0:).
 NOISE_LABEL = re.compile(r"^\.(LFB|LFE|Lfunc_begin|Lfunc_end)\d*:")
+# Data emitted *inside* a function body: switch jump tables (.long/.word
+# entries), inline constants, strings.  These are not instructions, so they
+# must not be counted; and a self-relative table entry (".long .L5-.L4")
+# references its base label from below, which the loop-span scan would
+# otherwise read as a backward branch and report as a phantom loop.
+DATA = re.compile(
+    r"^\.(long|quad|word|hword|short|byte|[248]byte|value|zero|octa|"
+    r"string|ascii|asciz|single|double|float|dc(\.[abwlq])?)\b"
+)
 
 
 def extract_functions(asm_text):
@@ -67,9 +76,10 @@ def extract_functions(asm_text):
 
     A function body runs from its column-0 label to the matching .size
     directive (gcc and clang both emit one on ELF) or the next function
-    label.  Comment lines, CFI/section/alignment directives, and
-    compiler bracketing labels are dropped; instructions and meaningful
-    local labels (loop targets) are kept, whitespace-stripped.
+    label.  Comment lines, CFI/section/alignment directives, compiler
+    bracketing labels, and inline data (switch jump tables, constants) are
+    dropped; instructions and meaningful local labels (loop targets) are
+    kept, whitespace-stripped.
     """
     funcs = {}
     current = None
@@ -87,7 +97,7 @@ def extract_functions(asm_text):
         line = raw.strip()
         if not line or line.startswith(("#", "//")):
             continue
-        if NOISE.match(line) or NOISE_LABEL.match(line):
+        if NOISE.match(line) or NOISE_LABEL.match(line) or DATA.match(line):
             continue
         funcs[current].append(line)
     return funcs
