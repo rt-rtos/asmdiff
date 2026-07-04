@@ -1,7 +1,12 @@
 # asmdiff 
 ## per-function assembly comparison for paired C implementations
 
-> asmdiff is a command-line tool for comparing the generated assembly of individual C functions across implementations, compiler flags, compiler versions, and source revisions. It is intended for investigating compiler code generation rather than benchmarking runtime performance.
+> asmdiff is a stdlib only command-line tool for comparing the generated assembly of individual C functions across implementations, compiler flags, compiler versions, and source revisions. It is intended for investigating compiler code generation rather than benchmarking runtime performance.
+
+### Try it yourself:
+
+`$ uvx asmdiff` / `$ pipx asmdiff`
+--- 
 
 `asmdiff.py` answers one question fast: **when I rewrite a C construct, what
 does the compiler actually emit - before and after?** It compiles a small
@@ -10,12 +15,9 @@ assembly, and prints side-by-side listings plus a summary of instruction
 counts, outbound calls, and loop spans.
 
 Compilers and flags are configured per project through named targets in an
-`asmdiff.toml` file — the tool itself has no project-specific defaults and
-parses any GNU-as ELF assembly.
+`asmdiff.toml` file  and parses any GNU-as ELF assembly.
   
-Its home use case: checking whether an expression that used to constant-fold
-(e.g. `x * exp2f(5)` → one multiply) turns into a library call (e.g.
-`ldexpf(x, 5)` → `jmp ldexpf@PLT`) after a "cleanup". That distinction is
+Whether something constant folds or turns into a libcall is a distinction that is
 invisible in source review and decisive on hot paths.
 
 ## Quick start
