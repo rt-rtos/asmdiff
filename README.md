@@ -674,9 +674,45 @@ notion of "the" loop: a backward `goto` produces a span exactly like a
 `for` loop, and an unrolled loop's span is the unrolled body. The column
 states where the compiler laid out a repeatable region — nothing more.
 
-No verdicts are printed. The tool reports facts; whether a libcall on that
-path — or an instruction inside a span rather than outside it — matters is
-your judgment.
+## Interpreting the numbers
+
+The tool prints no verdicts. It reports facts; whether a libcall on that
+path - or an instruction inside a span rather than outside it - matters
+is your judgment. If you are new to reading assembly diffs, the
+misreadings to avoid are few and predictable:
+
+- **Instructions are not cycles.** The `insns` column counts lines of
+  assembly, not time. A `call8 __udivdi3` is one line and hundreds of
+  cycles; an integer divide costs many adds; one cache-missing load can
+  cost more than the rest of the function. Treat the count as a *size*
+  and *structure* fact - a call appearing, a loop body growing, a
+  softfloat sequence materializing - and measure time on the target.
+
+- **The cost of a call is in the callee.** The listing shows only the
+  call site. The `-O3` version of `new_rt` above is two instructions,
+  but its runtime is still `ldexpf`'s. Ask what work moved, not what
+  line count shrank.
+
+- **Weigh the span, not the function.** One instruction added inside a
+  loop that runs per sample outweighs twenty added to setup code. The
+  whole-function count charges both the same.
+
+- **Bigger is often faster.** Unrolling and vectorization raise every
+  count on purpose - the `-Os` vs `-O3` biquad above is bigger by every
+  number and does far more per iteration. If smaller meant faster,
+  `-Os` would be called `-O3`.
+
+- **Only compare like environments.** Same flags, same header
+  configuration on both sides; take the `[no db entry]` warning
+  seriously. A diff between two configurations describes the
+  configurations, not your edit.
+
+None of this should discourage looking - the opposite. A run costs a
+second, so codegen questions that used to be settled by folklore
+("everyone knows X is faster") can just be answered: sweep the `-O`
+levels, append `-fno-math-errno` after `--`, try the other compiler,
+read what actually came out. When the listing surprises you, that is
+the tool doing its job.
 
 ## Writing good harnesses
 
