@@ -286,6 +286,48 @@ class TestAutoPairs(unittest.TestCase):
         self.assertEqual(asmdiff.auto_pairs(["old_x", "new_y"]), [])
 
 
+class TestSplitPositionals(unittest.TestCase):
+    """SOURCE.c FUNC grammar: extra positionals are files when they
+    exist, function names when bare, and errors when path-like typos."""
+
+    def test_existing_file_is_a_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            second = Path(tmp) / "b.c"
+            second.touch()
+            sources, fns = asmdiff.split_positionals(["a.c", str(second)])
+        self.assertEqual(sources, ["a.c", str(second)])
+        self.assertEqual(fns, [])
+
+    def test_bare_name_is_a_function(self):
+        sources, fns = asmdiff.split_positionals(["a.c", "render_lut"])
+        self.assertEqual(sources, ["a.c"])
+        self.assertEqual(fns, ["render_lut"])
+
+    def test_several_function_names(self):
+        sources, fns = asmdiff.split_positionals(["a.c", "f", "g"])
+        self.assertEqual(sources, ["a.c"])
+        self.assertEqual(fns, ["f", "g"])
+
+    def test_missing_source_suffix_arg_errors(self):
+        with self.assertRaises(SystemExit) as ctx:
+            asmdiff.split_positionals(["a.c", "typo.c"])
+        self.assertIn("no such file", str(ctx.exception))
+
+    def test_missing_path_separator_arg_errors(self):
+        with self.assertRaises(SystemExit) as ctx:
+            asmdiff.split_positionals(["a.c", "src/render"])
+        self.assertIn("no such file", str(ctx.exception))
+
+    def test_uppercase_asm_suffix_is_path_like(self):
+        with self.assertRaises(SystemExit):
+            asmdiff.split_positionals(["a.c", "startup.S"])
+
+    def test_first_positional_is_always_a_source(self):
+        sources, fns = asmdiff.split_positionals(["no_suffix_name"])
+        self.assertEqual(sources, ["no_suffix_name"])
+        self.assertEqual(fns, [])
+
+
 class TestAsmOutputName(unittest.TestCase):
     def test_short_command_stays_readable(self):
         self.assertEqual(asmdiff.asm_output_name("gcc -O3", "h.c"),
@@ -975,6 +1017,118 @@ class TestRendering(unittest.TestCase):
                          r"TOTAL \(2 functions\)\s+7\s+malloc, free\s+-")
 
 
+class TestInspectRendering(unittest.TestCase):
+    def test_listing_layout(self):
+        funcs = asmdiff.extract_functions(LOOP_ASM)
+        lines = asmdiff.listing("looper", funcs["looper"]).splitlines()
+        self.assertEqual(lines[0], "looper:")
+        self.assertEqual(lines[1], "\txorl\t%eax, %eax")
+        self.assertEqual(lines[2], ".L2:")   # local label back at column 0
+        self.assertEqual(lines[3], "\taddl\t$1, %eax")
+
+    def test_inspect_table_only_requested_functions(self):
+        funcs = asmdiff.extract_functions(GCC_ASM)
+        out = asmdiff.inspect_table(["new_const"], funcs)
+        lines = out.splitlines()
+        self.assertIn("function", lines[0])
+        self.assertEqual(len(lines), 2)      # header + the one function
+        self.assertRegex(lines[1], r"new_const\s+2\s+ldexpf\s+-")
+        self.assertNotIn("TOTAL", out)
+
+    def test_inspect_table_loop_spans(self):
+        funcs = asmdiff.extract_functions(LOOP_ASM)
+        out = asmdiff.inspect_table(["looper"], funcs)
+        self.assertRegex(out.splitlines()[1], r"looper\s+5\s+-\s+\.L2:3")
+
+
+class TestRunInspect(unittest.TestCase):
+    """Layout selection in inspect mode, with compile_to_asm stubbed."""
+
+    def _run(self, matrix, fn_names, layout=None):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                asmdiff.run_inspect("h.c", matrix, fn_names, layout,
+                                    [], "/tmp")
+        finally:
+            asmdiff.compile_to_asm = real
+        return out.getvalue()
+
+    def test_one_compiler_plain_listing_and_stats(self):
+        out = self._run(["gcc -O2"], ["new_const"])
+        self.assertIn("new_const:", out)
+        self.assertIn("\tjmp\tldexpf@PLT", out)
+        self.assertIn("function", out)           # stats table present
+        self.assertNotIn("==", out)              # no per-compiler header
+        self.assertNotIn(" | ", out)             # not side-by-side
+
+    def test_two_compilers_side_by_side(self):
+        out = self._run(["gcc -O2", "clang -O2"], ["new_const"])
+        self.assertIn("cc#1: gcc -O2", out)
+        self.assertIn("== cc#1 vs cc#2 ==", out)
+        self.assertIn(" | ", out)
+
+    def test_three_compilers_sequential_blocks(self):
+        out = self._run(["gcc -O1", "gcc -O2", "gcc -O3"], ["new_const"])
+        self.assertEqual(out.count("== gcc -O"), 3)
+        self.assertNotIn(" | ", out)
+
+    def test_multiple_functions_listed(self):
+        out = self._run(["gcc -O2"], ["old_const", "new_const"])
+        self.assertIn("old_const:", out)
+        self.assertIn("new_const:", out)
+
+    def test_forced_list_with_two_compilers(self):
+        out = self._run(["gcc -O2", "clang -O2"], ["new_const"],
+                        layout="list")
+        self.assertIn("== gcc -O2 ==", out)
+        self.assertNotIn(" | ", out)
+
+    def test_forced_side_by_side_with_three_compilers(self):
+        out = self._run(["gcc -O1", "gcc -O2", "gcc -O3"], ["new_const"],
+                        layout="side-by-side")
+        self.assertIn("== cc#1 vs cc#2 ==", out)
+        self.assertIn("== cc#1 vs cc#3 ==", out)
+
+    def test_forced_side_by_side_with_one_compiler_errors(self):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    asmdiff.run_inspect("h.c", ["gcc -O2"], ["new_const"],
+                                        "side-by-side", [], "/tmp")
+        finally:
+            asmdiff.compile_to_asm = real
+        self.assertIn("side-by-side", str(ctx.exception))
+
+    def test_unknown_function_lists_seen(self):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                asmdiff.run_inspect("h.c", ["gcc -O2"], ["nope"],
+                                    None, [], "/tmp")
+        finally:
+            asmdiff.compile_to_asm = real
+        msg = str(ctx.exception)
+        self.assertIn("not in asm: nope", msg)
+        self.assertIn("old_const", msg)          # functions seen listed
+
+    def test_no_usable_compiler_errors(self):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: None
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                asmdiff.run_inspect("h.c", ["gcc -O2"], ["f"],
+                                    None, [], "/tmp")
+        finally:
+            asmdiff.compile_to_asm = real
+        self.assertIn("no usable compiler", str(ctx.exception))
+
+
 class TestFileTags(unittest.TestCase):
     def test_distinct_basenames_used_directly(self):
         self.assertEqual(asmdiff.file_tags("p/old.c", "p/new.c"),
@@ -1005,16 +1159,96 @@ class TestAcrossValidation(unittest.TestCase):
                            "mutually exclusive")
 
     def test_two_files_with_pair_rejected(self):
-        self._expect_error(["a.c", "b.c", "--pair", "x:y"],
-                           "--pair compares within one file")
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "a.c", Path(tmp) / "b.c"
+            a.touch()
+            b.touch()
+            self._expect_error([str(a), str(b), "--pair", "x:y"],
+                               "--pair compares within one file")
 
     def test_at_most_two_files(self):
-        self._expect_error(["a.c", "b.c", "c.c", "--across", "f"],
-                           "at most two")
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = []
+            for name in ("a.c", "b.c", "c.c"):
+                p = Path(tmp) / name
+                p.touch()
+                argv.append(str(p))
+            self._expect_error(argv + ["--across", "f"], "at most two")
 
     def test_across_one_file_needs_two_cc_entries(self):
         self._expect_error(["a.c", "--across", "f", "--cc", "gcc -O3"],
                            "at least two --cc")
+
+
+class TestInspectValidation(unittest.TestCase):
+    """CLI validation for the SOURCE.c FUNC inspect grammar."""
+
+    def _expect_error(self, argv, fragment):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                asmdiff.main(argv)
+        # parser.error writes to stderr; sys.exit carries the message
+        self.assertIn(fragment, err.getvalue() + str(ctx.exception))
+
+    def test_function_with_pair_rejected(self):
+        self._expect_error(["x.c", "f", "--pair", "a:b"],
+                           "cannot be combined")
+
+    def test_function_with_across_rejected(self):
+        self._expect_error(["x.c", "f", "--across", "g"],
+                           "cannot be combined")
+
+    def test_two_files_plus_function_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "a.c", Path(tmp) / "b.c"
+            a.touch()
+            b.touch()
+            self._expect_error([str(a), str(b), "f"], "--across")
+
+    def test_layout_without_function_rejected(self):
+        self._expect_error(["x.c", "--layout", "list"],
+                           "--layout only applies")
+
+    def test_layout_value_checked(self):
+        self._expect_error(["x.c", "f", "--layout", "diagonal"],
+                           "invalid choice")
+
+    def test_typo_filename_is_not_a_function(self):
+        self._expect_error(["x.c", "typo.c"], "no such file")
+
+
+class TestShortAliases(unittest.TestCase):
+    """-p/-a/-db/-l are aliases of --pair/--across/--compile-commands/
+    --layout: each hits that option's own validation."""
+
+    def _expect_error(self, argv, fragment):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                asmdiff.main(argv)
+        self.assertIn(fragment, err.getvalue() + str(ctx.exception))
+
+    def test_p_is_pair(self):
+        self._expect_error(["x.c", "-p", "nocolon"], "expects OLD:NEW")
+
+    def test_a_is_across(self):
+        self._expect_error(["x.c", "-a", "f", "--cc", "gcc -O3"],
+                           "at least two --cc")
+
+    def test_l_is_layout(self):
+        self._expect_error(["x.c", "-l", "list"], "--layout only applies")
+
+    def test_db_is_compile_commands(self):
+        # Bare -db in a directory tree with no database is the
+        # --compile-commands discovery error.
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp) / "a" / "b"
+            cwd.mkdir(parents=True)
+            (Path(tmp) / ".git").mkdir()     # stop the walk-up inside tmp
+            with _inside(cwd):
+                self._expect_error(["x.c", "f", "-db"],
+                                   "no compile_commands.json")
 
 
 if __name__ == "__main__":

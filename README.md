@@ -71,24 +71,43 @@ exp2f/ldexpf analysis for both constant and runtime shift amounts:
 $ asmdiff.py asmdiff_example.c
 ```
 
+## Quick inspect: one function, no comparison
+
+To just look at what a compiler emits for one function, name it after
+the file - no harness, no pairing:
+
+    $ asmdiff.py src/oscillators.c render_lut
+
+With one usable compiler you get the function's listing and a stats
+row; with exactly two (the default gcc + clang matrix) the listings
+appear side by side; with a bigger matrix each compiler gets its own
+block. `-l list` / `-l side-by-side` forces a presentation. Several
+function names can be given at once.
+
+A bare name is inspected as a function; an argument that exists on
+disk is a second source file, and a path-looking argument that does
+not exist is an error - a mistyped filename is never silently searched
+for as a symbol.
+
 ## Command reference
 
 ```
-asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]... [--across FUNC]...
+asmdiff.py SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
            [--cc 'CC FLAGS']... [--target NAME]... [--config PATH]
-           [--compile-commands [PATH]] [--flags-like PATH] [-v]
-           [-- EXTRA_FLAGS...]
+           [--compile-commands [PATH]] [--flags-like PATH]
+           [--layout list|side-by-side] [-v] [-- EXTRA_FLAGS...]
 ```
 
 | Option | Meaning |
 |---|---|
-| `SOURCE.c` | C file to compile — a purpose-built harness or a real project source. A second file may be given: with `--across` to compare a function, without it for a whole-file A/B summary. |
-| `--pair OLD:NEW` | Compare two *different* functions within one compilation. Repeatable. Default: every `old_X` is auto-paired with its `new_X`; with no pairs at all, the whole-file summary is printed instead. |
-| `--across FUNC` | Compare the *same* function across two compilations (see below). Repeatable. Mutually exclusive with `--pair`. |
+| `SOURCE.c` | C file to compile — a purpose-built harness or a real project source. A second file may be given: with `--across` to compare a function, without it for a whole-file A/B summary. Bare names after the file are functions to inspect (see [Quick inspect](#quick-inspect-one-function-no-comparison)). |
+| `-p, --pair OLD:NEW` | Compare two *different* functions within one compilation. Repeatable. Default: every `old_X` is auto-paired with its `new_X`; with no pairs at all, the whole-file summary is printed instead. |
+| `-a, --across FUNC` | Compare the *same* function across two compilations (see below). Repeatable. Mutually exclusive with `--pair`. |
+| `-l, --layout list\|side-by-side` | Force the inspect-mode presentation instead of the adaptive default (1 usable compiler lists, 2 go side by side, more list). Inspect mode only. |
 | `--cc 'CC FLAGS'` | One compiler invocation, command and flags in a single quoted string. Repeatable to build a matrix. |
 | `--target NAME` | A named target from the config file, resolved to a `--cc` entry. Repeatable; appended to the matrix after `--cc` entries. |
 | `--config PATH` | Config file to use. Default search: `asmdiff.toml` next to `SOURCE.c`, then in the current directory, then `~/.config/`. First hit wins. |
-| `--compile-commands [PATH]` | Borrow each source's include/define flags from a `compile_commands.json`; with no `PATH`, walk up from the CWD checking each directory and its `build/` until the repository root. See [below](#borrowing-includes-from-compile_commandsjson). |
+| `-db, --compile-commands [PATH]` | Borrow each source's include/define flags from a `compile_commands.json`; with no `PATH`, walk up from the CWD checking each directory and its `build/` until the repository root. See [below](#borrowing-includes-from-compile_commandsjson). |
 | `--flags-like PATH` | A source with no `compile_commands` entry borrows the flags recorded for `PATH` — the way to compare a modified copy of a project source under its original's header environment. |
 | `-v`, `--verbose` | On compile failure, print the full compiler command and complete error output. Default shows only the compiler, the source, and the first error lines. |
 | `-- FLAGS...` | Everything after a bare `--` is appended to *every* compiler invocation. |

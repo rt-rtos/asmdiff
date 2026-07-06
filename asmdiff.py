@@ -9,14 +9,20 @@ Automates fold-vs-libcall analysis when evaluating micro-optimisations
 (e.g. "does this still compile to one instruction, or is it a libcall?").
 
 Usage:
-    tools/asmdiff/asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]...
-                             [--across FUNC]... [--cc 'CC FLAGS']...
-                             [--target NAME]... [--config PATH]
-                             [--compile-commands [PATH]]
-                             [--flags-like PATH] [-v]
+    tools/asmdiff/asmdiff.py SOURCE.c [SOURCE2.c | FUNC...]
+                             [--pair OLD:NEW]... [--across FUNC]...
+                             [--cc 'CC FLAGS']... [--target NAME]...
+                             [--config PATH] [--compile-commands [PATH]]
+                             [--flags-like PATH]
+                             [--layout list|side-by-side] [-v]
                              [-- EXTRA_FLAGS...]
 
-Three modes:
+Four modes:
+  SOURCE.c FUNC   inspect: print the named function's assembly, no
+                  comparison.  One usable compiler prints a listing
+                  plus a stats row, exactly two print side by side,
+                  more print one block per compiler; --layout forces
+                  list or side-by-side.
   --pair OLD:NEW  compares two different functions within one compilation
                   (with no --pair, old_X/new_X names auto-pair).
   --across FUNC   compares the SAME function across two compilations:
@@ -486,6 +492,33 @@ def auto_pairs(names):
             if n.startswith("old_") and "new_" + n[4:] in names]
 
 
+# Suffixes that make a nonexistent positional read as a mistyped source
+# file rather than a function name to inspect.
+SOURCE_SUFFIXES = {".c", ".h", ".i", ".s", ".cc", ".cpp", ".cxx", ".hpp"}
+
+
+def split_positionals(positionals):
+    """Split positional arguments into source files and function names.
+
+    The first positional is always a source.  A later one that exists
+    on disk is a source too; a bare name is a function to inspect; a
+    path-looking argument that does not exist (a separator, or a source
+    suffix) is a mistyped file - exiting beats searching the assembly
+    for a symbol named like a filename.
+    """
+    sources, fn_names = positionals[:1], []
+    for arg in positionals[1:]:
+        if Path(arg).exists():
+            sources.append(arg)
+        elif ("/" in arg or os.sep in arg
+                or Path(arg).suffix.lower() in SOURCE_SUFFIXES):
+            sys.exit(f"error: no such file: {arg} (a function name to "
+                     "inspect must be a bare symbol, not a path)")
+        else:
+            fn_names.append(arg)
+    return sources, fn_names
+
+
 def find_config(explicit, sources):
     """Locate the config file; first hit wins, no merging.
 
@@ -784,6 +817,25 @@ def file_summary_table(funcs):
     return render_table(rows)
 
 
+def listing(name, lines):
+    """gcc-style listing of one extracted function: the function label
+    at column 0, instructions tabbed, kept local labels back at
+    column 0 (extract_functions stores them whitespace-stripped)."""
+    body = [line if line.endswith(":") else "\t" + line for line in lines]
+    return "\n".join([f"{name}:"] + body)
+
+
+def inspect_table(fn_names, funcs):
+    """Stats rows for the inspected functions only - no pair roles and
+    no whole-file total, unlike summary_table/file_summary_table."""
+    rows = [("function", "insns", "calls", "loop spans")]
+    for name in fn_names:
+        insns, calls = analyze(funcs[name])
+        rows.append((name, str(insns), format_calls(calls),
+                     format_spans(loop_spans(funcs[name]))))
+    return render_table(rows)
+
+
 def file_tags(a, b):
     """Shortest distinct labels for two source paths in across-mode output."""
     pa, pb = Path(a), Path(b)
@@ -928,6 +980,52 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
     return 0
 
 
+def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp):
+    """Inspect mode: print named functions' assembly, no comparison.
+
+    The presentation adapts to how many matrix entries compiled: one
+    gives a plain listing with a stats table, exactly two give the
+    --across side-by-side, more give one block per compiler.  --layout
+    forces list or side-by-side instead.
+    """
+    usable = []
+    for idx, cc_cmd in enumerate(matrix, start=1):
+        asm = compile_to_asm(cc_cmd, extra_flags, source, tmp)
+        if asm is not None:
+            usable.append((f"cc#{idx}", cc_cmd, extract_functions(asm)))
+    if not usable:
+        sys.exit("error: no usable compiler in the matrix")
+    for _, cc_cmd, funcs in usable:
+        missing = sorted({f for f in fn_names if f not in funcs})
+        if missing:
+            sys.exit("error: function(s) not in asm: " + ", ".join(missing)
+                     + f" under {cc_cmd}; functions seen: "
+                     + ", ".join(funcs))
+    if layout == "side-by-side" and len(usable) < 2:
+        sys.exit("error: --layout side-by-side needs at least two usable "
+                 "compilers in the matrix")
+    if layout is None:
+        layout = "side-by-side" if len(usable) == 2 else "list"
+    if layout == "side-by-side":
+        print()
+        for tag, cc_cmd, _ in usable:
+            print(f"{tag}: {cc_cmd}")
+        base_tag, _, base_funcs = usable[0]
+        for tag, _, funcs in usable[1:]:
+            print(f"\n== {base_tag} vs {tag} ==\n")
+            report_across(fn_names, base_funcs, funcs, base_tag, tag)
+        return 0
+    for _, cc_cmd, funcs in usable:
+        if len(usable) > 1:
+            print(f"\n== {cc_cmd} ==")
+        for name in fn_names:
+            print()
+            print(listing(name, funcs[name]))
+        print()
+        print(inspect_table(fn_names, funcs))
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     extra_flags = []
@@ -940,17 +1038,23 @@ def main(argv=None):
         epilog="Flags after a bare -- are appended to every compiler "
                "invocation, e.g.: asmdiff.py h.c -- -fno-math-errno")
     parser.add_argument("sources", nargs="+", metavar="SOURCE.c",
-                        help="C file to compile; give two files with "
-                             "--across to compare versions of a function")
-    parser.add_argument("--pair", action="append", default=[],
+                        help="C file to compile; follow it with bare "
+                             "function names to inspect their assembly, "
+                             "or give two files with --across to compare "
+                             "versions of a function")
+    parser.add_argument("-p", "--pair", action="append", default=[],
                         metavar="OLD:NEW",
                         help="compare two functions within one compilation "
                              "(repeatable); default: auto-pair old_X/new_X")
-    parser.add_argument("--across", action="append", default=[],
+    parser.add_argument("-a", "--across", action="append", default=[],
                         metavar="FUNC",
                         help="compare the same function across two "
                              "compilations (repeatable): one file + two "
                              "--cc entries, or two files")
+    parser.add_argument("-l", "--layout", choices=["list", "side-by-side"],
+                        help="force the inspect presentation instead of "
+                             "adapting to the matrix (1 usable compiler "
+                             "lists, 2 go side by side, more list)")
     parser.add_argument("--cc", action="append", default=[],
                         metavar="'CC FLAGS'",
                         help="compiler and flags as one string (repeatable); "
@@ -961,7 +1065,7 @@ def main(argv=None):
                         help="named [table] from the config file, resolved "
                              "to a --cc entry (repeatable; appended to the "
                              "matrix after --cc entries)")
-    parser.add_argument("--compile-commands", nargs="?", const=True,
+    parser.add_argument("-db", "--compile-commands", nargs="?", const=True,
                         default=None, metavar="PATH",
                         help="borrow each source's include/define flags from "
                              "a compile_commands.json; with no PATH, search "
@@ -987,30 +1091,43 @@ def main(argv=None):
     VERBOSE = args.verbose
     FLAGS_LIKE = args.flags_like
 
-    if len(args.sources) > 2:
+    sources, fn_names = split_positionals(args.sources)
+    if len(sources) > 2:
         parser.error("at most two source files may be given")
+    if fn_names and len(sources) == 2:
+        parser.error("bare function names inspect within one file; "
+                     "use --across FUNC for two files")
+    if fn_names and (args.pair or args.across):
+        parser.error("bare function names (inspect) cannot be combined "
+                     "with --pair or --across")
+    if args.layout and not fn_names:
+        parser.error("--layout only applies when inspecting functions "
+                     "(SOURCE.c FUNC ...)")
     if args.across and args.pair:
         parser.error("--across and --pair are mutually exclusive")
-    if len(args.sources) == 2 and args.pair:
+    if len(sources) == 2 and args.pair:
         parser.error("--pair compares within one file; "
                      "use --across FUNC for two files")
-    config_path = find_config(args.config, args.sources)
+    config_path = find_config(args.config, sources)
     config = load_config(config_path) if config_path else None
     matrix = build_matrix(args.cc, args.target, config, config_path,
                           args.compile_commands)
-    if args.across and len(args.sources) == 1 and len(matrix) < 2:
+    if args.across and len(sources) == 1 and len(matrix) < 2:
         parser.error("--across on one file needs at least two --cc entries")
     for spec in args.pair:
         if ":" not in spec:
             parser.error(f"--pair expects OLD:NEW, got {spec!r}")
 
     with tempfile.TemporaryDirectory(prefix="asmdiff") as tmp:
+        if fn_names:
+            return run_inspect(sources[0], matrix, fn_names, args.layout,
+                               extra_flags, tmp)
         if args.across:
-            return run_across(args.sources, matrix, args.across,
+            return run_across(sources, matrix, args.across,
                               extra_flags, tmp)
-        if len(args.sources) == 2:
-            return run_summary(args.sources, matrix, extra_flags, tmp)
-        return run_pairs(args.sources[0], matrix, args.pair,
+        if len(sources) == 2:
+            return run_summary(sources, matrix, extra_flags, tmp)
+        return run_pairs(sources[0], matrix, args.pair,
                          extra_flags, tmp)
 
 
