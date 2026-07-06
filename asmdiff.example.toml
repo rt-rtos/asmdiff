@@ -42,8 +42,9 @@ flags = ["-O2", "-mlongcalls", "-DNDEBUG"]
 # never transcribe include paths by hand.  The compiler and -O/-m flags
 # still come from cc/flags; only the header environment is borrowed.
 # A path expands ~ and $VARS; `compile_commands = true` instead searches
-# ./, ./build, ../, ../build at run time (a source missing from a database
-# found that way is compiled without borrowed flags, with a note).
+# at run time: each directory from the CWD up to the repository root,
+# and its build/ subdirectory (a source missing from a database found
+# that way is compiled without borrowed flags, with a note).
 [esp32s3-idf]
 cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
 flags = ["-O2", "-mlongcalls"]

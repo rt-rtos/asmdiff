@@ -12,7 +12,7 @@ Usage:
     tools/asmdiff/asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]...
                              [--across FUNC]... [--cc 'CC FLAGS']...
                              [--target NAME]... [--config PATH]
-                             [--compile-commands [PATH]]
+                             [--compile-commands [PATH]] [-v]
                              [-- EXTRA_FLAGS...]
 
 Three modes:
@@ -35,9 +35,10 @@ the include/define flags recorded there for the source being compiled are
 added to that target's command, so a real project source resolves its
 headers the way its own build system does (e.g. an ESP-IDF component).
 compile_commands = true in a target — or a bare --compile-commands on the
-command line — instead searches ./, ./build, ../, ../build for the
-database; a source absent from a database found that way is compiled
-without borrowed flags (with a note) rather than being an error.
+command line — instead finds the database by checking each directory from
+the CWD up to the repository root, and its build/ subdirectory; a source
+absent from a database found that way is compiled without borrowed flags
+(with a note) rather than being an error.
 """
 import argparse
 import glob
@@ -73,6 +74,11 @@ CONFIG_NAME = "asmdiff.toml"
 _CC_DB_PATH_FLAGS = ("-I", "-iquote", "-isystem", "-idirafter",
                      "-include", "-imacros", "-isysroot")
 _CC_DB_PLAIN_FLAGS = ("-D", "-U")
+# Driver-level flags that also shape the header environment: a specs file
+# can swap the entire libc header set (ESP-IDF v6 selects picolibc via
+# -specs=picolibc.specs), and --sysroot moves every system include.  Both
+# accept =-glued and split spellings; both are re-emitted =-glued.
+_CC_DB_EQ_FLAGS = ("-specs", "--specs", "--sysroot")
 _DB_CACHE = {}
 _MISS_NOTED = set()
 
@@ -105,6 +111,43 @@ def _abs_against(directory, value):
     return str(p)
 
 
+def _expand_response_files(tokens, directory, depth=0):
+    """Inline GCC @file response files: each @FILE token is replaced by the
+    shlex-split contents of FILE, resolved against the entry's ``directory``
+    (the CWD the driver ran from).  Build systems park header-environment
+    flags there — ESP-IDF v6 hides -specs=picolibc.specs in one — so
+    skipping them silently loses flags this feature exists to borrow.
+    An unreadable file is warned about and dropped; nesting is bounded as
+    a cycle guard.
+    """
+    out = []
+    for tok in tokens:
+        if not tok.startswith("@") or len(tok) == 1:
+            out.append(tok)
+            continue
+        path = _abs_against(directory, tok[1:])
+        try:
+            content = Path(path).read_text()
+        except OSError:
+            print(f"warning: response file {path} not readable; "
+                  "flags inside it are not borrowed", file=sys.stderr)
+            continue
+        inner = shlex.split(content)
+        if depth < 8:
+            inner = _expand_response_files(inner, directory, depth + 1)
+        out += inner
+    return out
+
+
+def _specs_value(directory, value):
+    """A specs argument with a path separator is a file path (resolved like
+    any other); a bare name (picolibc.specs) is looked up in the compiler's
+    own search directories and must pass through untouched."""
+    if "/" in value or os.sep in value:
+        return _abs_against(directory, value)
+    return value
+
+
 def include_flags(tokens, directory):
     """Pick header-search, forced-include, and define flags out of one
     recorded compile command; make relative paths absolute against
@@ -125,6 +168,19 @@ def include_flags(tokens, directory):
                 matched = True
                 break
         if not matched:
+            for f in _CC_DB_EQ_FLAGS:
+                value = None
+                if tok == f and i + 1 < n:                # -specs file
+                    value, extra = tokens[i + 1], 1
+                elif tok.startswith(f + "="):             # -specs=file
+                    value = tok[len(f) + 1:]
+                if value is not None:
+                    resolve = (_specs_value if f.endswith("specs")
+                               else _abs_against)
+                    flags.append(f + "=" + resolve(directory, value))
+                    matched = True
+                    break
+        if not matched:
             for f in _CC_DB_PLAIN_FLAGS:
                 if tok == f and i + 1 < n:                # -D FOO
                     flags.append(f + tokens[i + 1])
@@ -138,18 +194,26 @@ def include_flags(tokens, directory):
 
 
 def find_compile_commands():
-    """Locate a compile_commands.json near the current directory.
+    """Locate a compile_commands.json by walking up from the current
+    directory.
 
-    Searched in order: ./, ./build, ../, ../build — first hit wins.  This
-    covers running asmdiff from a project root or from one directory below
-    it (a component dir), with the database where CMake/idf.py leaves it.
-    Returns None when nothing is found.
+    Each directory from the CWD upward is checked for the database itself,
+    then for build/compile_commands.json (where CMake and idf.py leave it),
+    so the search works from a project root or from any depth of component
+    directory.  The walk stops at the first directory containing .git (the
+    repository root — checked after that directory's own candidates) or
+    after a bounded number of levels, so an unrelated database further up
+    the filesystem is never picked up.  Returns None when nothing is found.
     """
-    cwd = Path.cwd()
-    for d in (cwd, cwd / "build", cwd.parent, cwd.parent / "build"):
-        candidate = d / "compile_commands.json"
-        if candidate.is_file():
-            return str(candidate)
+    d = Path.cwd()
+    for _ in range(10):
+        for candidate in (d / "compile_commands.json",
+                          d / "build" / "compile_commands.json"):
+            if candidate.is_file():
+                return str(candidate)
+        if (d / ".git").exists() or d.parent == d:
+            return None
+        d = d.parent
     return None
 
 
@@ -159,8 +223,9 @@ def _discovered_db(who):
     not a silent no-op."""
     found = find_compile_commands()
     if found is None:
-        sys.exit(f"error: {who}: no compile_commands.json found in "
-                 "./, ./build, ../, or ../build")
+        sys.exit(f"error: {who}: no compile_commands.json found in the "
+                 "current directory, its build/, or any parent up to the "
+                 "repository root")
     return found
 
 
@@ -212,6 +277,7 @@ def compile_commands_flags(db_path, source, missing_ok=False):
             args = entry.get("arguments")
             tokens = (list(args) if isinstance(args, list)
                       else shlex.split(entry.get("command", "")))
+            tokens = _expand_response_files(tokens, directory)
             return include_flags(tokens, directory)
         if Path(f).name == want.name:
             name_seen = True
@@ -229,10 +295,18 @@ def compile_commands_flags(db_path, source, missing_ok=False):
 
 # A label at column 0 that is not a local (.L*) label starts a function.
 FUNC_LABEL = re.compile(r"^([A-Za-z_][\w$.]*):")
-# Assembler directives that carry no information worth reading.
+# .type NAME, @object|@function — gcc/clang emit this before the label on
+# ELF.  Objects (string constants like __func__, global state, LUTs) get
+# column-0 labels too and must not be reported as functions.  The type
+# marker is @ on x86/Xtensa/RISC-V, % on ARM, # on some targets.
+TYPE_DIRECTIVE = re.compile(r'^\s*\.type\s+([^,\s]+)\s*,\s*[@%#]?(\w+)')
+# Assembler directives that carry no information worth reading.  .local/
+# .comm/.lcomm declare zero-initialised data, .literal/.literal_position
+# are Xtensa literal-pool bookkeeping — none of them is an instruction.
 NOISE = re.compile(
     r"^\s*\.(cfi_|p2align|align\b|loc\b|file\b|text\b|globl\b|global\b|"
-    r"type\b|section\b|ident\b|weak\b|hidden\b|addrsig|build_version)"
+    r"type\b|section\b|ident\b|weak\b|hidden\b|addrsig|build_version|"
+    r"local\b|comm\b|lcomm\b|literal_position|literal\b)"
 )
 # Compiler-generated bracketing labels that add nothing (.LFB0:, .Lfunc_end0:).
 NOISE_LABEL = re.compile(r"^\.(LFB|LFE|Lfunc_begin|Lfunc_end)\d*:")
@@ -252,18 +326,28 @@ def extract_functions(asm_text):
 
     A function body runs from its column-0 label to the matching .size
     directive (gcc and clang both emit one on ELF) or the next function
-    label.  Comment lines, CFI/section/alignment directives, compiler
-    bracketing labels, and inline data (switch jump tables, constants) are
-    dropped; instructions and meaningful local labels (loop targets) are
-    kept, whitespace-stripped.
+    label.  Labels typed ``@object`` (string constants, global state,
+    lookup tables) are data, not functions, and are skipped entirely;
+    an untyped label still counts as a function so hand-written asm
+    keeps working.  Comment lines, CFI/section/alignment directives,
+    compiler bracketing labels, and inline data (switch jump tables,
+    constants) are dropped; instructions and meaningful local labels
+    (loop targets) are kept, whitespace-stripped.
     """
     funcs = {}
     current = None
+    data_labels = set()
     for raw in asm_text.splitlines():
+        t = TYPE_DIRECTIVE.match(raw)
+        if t and t.group(2) != "function":
+            data_labels.add(t.group(1))
         m = FUNC_LABEL.match(raw)
         if m:
-            current = m.group(1)
-            funcs[current] = []
+            if m.group(1) in data_labels:
+                current = None
+            else:
+                current = m.group(1)
+                funcs[current] = []
             continue
         if current is None:
             continue
@@ -453,7 +537,7 @@ def target_command(config, name, config_path):
         if not isinstance(db, str):
             sys.exit(f"error: target [{name}]: compile_commands must be a "
                      "path to a compile_commands.json, or true to search "
-                     "./, ./build, ../, ../build")
+                     "upward from the current directory")
         db = os.path.expandvars(os.path.expanduser(db))
     return Target(shlex.join([resolve_cc(cc, name), *flags]), db, discovered)
 
@@ -489,6 +573,31 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None):
         entries = [e if getattr(e, "compile_commands", None) is not None
                    else Target(e, db, discovered) for e in entries]
     return entries
+
+
+# --verbose: print full compiler command lines and untrimmed stderr.
+VERBOSE = False
+# Without --verbose, a failed compile shows this many stderr lines — enough
+# for the include chain plus the first error, which is the actionable part.
+MAX_STDERR_LINES = 20
+
+
+def _compile_failure(cmd, stderr):
+    """Exit for a failed compile.
+
+    A borrowed-flags command runs to hundreds of tokens and a broken
+    header environment produces pages of stderr; dumping both buries the
+    actual error.  Default: compiler + source + the first stderr lines.
+    --verbose restores the complete command and output.
+    """
+    if VERBOSE:
+        sys.exit(f"error: compile failed: {shlex.join(cmd)}\n{stderr}")
+    lines = stderr.splitlines()
+    shown = "\n".join(lines[:MAX_STDERR_LINES])
+    dropped = len(lines) - MAX_STDERR_LINES
+    more = f"\n... {dropped} more stderr lines" if dropped > 0 else ""
+    sys.exit(f"error: {cmd[0]} failed on {cmd[-1]}\n{shown}{more}\n"
+             "(re-run with --verbose for the full command and output)")
 
 
 def asm_output_name(cc_cmd, harness):
@@ -527,7 +636,7 @@ def compile_to_asm(cc_cmd, extra_flags, harness, out_dir):
            + ["-S", "-o", str(out_s), str(harness)])
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        sys.exit(f"error: compile failed: {' '.join(cmd)}\n{proc.stderr}")
+        _compile_failure(cmd, proc.stderr)
     return out_s.read_text()
 
 
@@ -554,14 +663,28 @@ def format_spans(spans):
     return " ".join(f"{label}:{n}" for label, n in spans) or "-"
 
 
+# Real firmware dispatch functions call dozens of distinct symbols; an
+# uncapped list makes summary rows thousands of characters wide.
+MAX_CALLS_SHOWN = 8
+
+
+def format_calls(calls):
+    """Comma-joined callee list, capped at MAX_CALLS_SHOWN for readability."""
+    if not calls:
+        return "-"
+    if len(calls) > MAX_CALLS_SHOWN:
+        return (", ".join(calls[:MAX_CALLS_SHOWN])
+                + f", +{len(calls) - MAX_CALLS_SHOWN} more")
+    return ", ".join(calls)
+
+
 def summary_table(pairs, funcs):
     """Instruction counts, outbound calls, and loop spans per pair member."""
     rows = [("function", "role", "insns", "calls", "loop spans")]
     for old, new in pairs:
         for name, role in ((old, "baseline"), (new, "candidate")):
             insns, calls = analyze(funcs[name])
-            rows.append((name, role, str(insns),
-                         ", ".join(calls) or "-",
+            rows.append((name, role, str(insns), format_calls(calls),
                          format_spans(loop_spans(funcs[name]))))
     return render_table(rows)
 
@@ -582,10 +705,10 @@ def file_summary_table(funcs):
         for sym in calls:
             if sym not in all_calls:
                 all_calls.append(sym)
-        rows.append((name, str(insns), ", ".join(calls) or "-",
+        rows.append((name, str(insns), format_calls(calls),
                      format_spans(loop_spans(lines))))
     rows.append((f"TOTAL ({len(funcs)} functions)", str(total_insns),
-                 ", ".join(all_calls) or "-", "-"))
+                 format_calls(all_calls), "-"))
     return render_table(rows)
 
 
@@ -763,13 +886,20 @@ def main(argv=None):
                         default=None, metavar="PATH",
                         help="borrow each source's include/define flags from "
                              "a compile_commands.json; with no PATH, search "
-                             "./, ./build, ../, ../build.  A target whose "
+                             "each directory (and its build/) from the CWD "
+                             "up to the repository root.  A target whose "
                              "config names its own compile_commands keeps it")
     parser.add_argument("--config", metavar="PATH",
                         help=f"config file; default search: {CONFIG_NAME} "
                              "next to SOURCE.c, in the current directory, "
                              "then in ~/.config/")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="on compile failure, print the full compiler "
+                             "command and complete error output instead of "
+                             "the first lines")
     args = parser.parse_args(argv)
+    global VERBOSE
+    VERBOSE = args.verbose
 
     if len(args.sources) > 2:
         parser.error("at most two source files may be given")

@@ -76,7 +76,7 @@ $ asmdiff.py asmdiff_example.c
 ```
 asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]... [--across FUNC]...
            [--cc 'CC FLAGS']... [--target NAME]... [--config PATH]
-           [--compile-commands [PATH]] [-- EXTRA_FLAGS...]
+           [--compile-commands [PATH]] [-v] [-- EXTRA_FLAGS...]
 ```
 
 | Option | Meaning |
@@ -87,7 +87,8 @@ asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]... [--across FUNC]...
 | `--cc 'CC FLAGS'` | One compiler invocation, command and flags in a single quoted string. Repeatable to build a matrix. |
 | `--target NAME` | A named target from the config file, resolved to a `--cc` entry. Repeatable; appended to the matrix after `--cc` entries. |
 | `--config PATH` | Config file to use. Default search: `asmdiff.toml` next to `SOURCE.c`, then in the current directory, then `~/.config/`. First hit wins. |
-| `--compile-commands [PATH]` | Borrow each source's include/define flags from a `compile_commands.json`; with no `PATH`, search `./`, `./build`, `../`, `../build`. See [below](#borrowing-includes-from-compile_commandsjson). |
+| `--compile-commands [PATH]` | Borrow each source's include/define flags from a `compile_commands.json`; with no `PATH`, walk up from the CWD checking each directory and its `build/` until the repository root. See [below](#borrowing-includes-from-compile_commandsjson). |
+| `-v`, `--verbose` | On compile failure, print the full compiler command and complete error output. Default shows only the compiler, the source, and the first error lines. |
 | `-- FLAGS...` | Everything after a bare `--` is appended to *every* compiler invocation. |
 
 With no `--cc` and no `--target`, the config file's top-level
@@ -189,7 +190,8 @@ compile_commands = "$HOME/myproject/build/compile_commands.json"
 Now `asmdiff.py $HOME/myproject/components/dsp/biquad.c --target esp32s3-idf`
 finds that file's entry in the database and adds the include/define flags
 it recorded — `-I`, `-isystem`, `-iquote`, `-idirafter`, `-include`,
-`-imacros`, `-D`, `-U` — to this target's command. Everything else the
+`-imacros`, `-D`, `-U`, plus the header-environment driver flags `-specs`
+and `--sysroot` — to this target's command. Everything else the
 database records (its own compiler, `-O`/`-std`/`-W` flags, `-c`, `-o`, the
 source) is ignored: **you** own the compiler and optimisation flags via
 `cc`/`flags`; only the header environment is borrowed. That split is the
@@ -201,6 +203,12 @@ Details that make it robust:
 - **Paths are made absolute** against each entry's `directory`, so a
   database full of build-relative `-I../include` flags still resolves when
   asmdiff runs from anywhere.
+- **`@file` response files are expanded.** Build systems park flags in
+  them — ESP-IDF v6 hides `-specs=picolibc.specs` in
+  `build/toolchain/cflags`, and without it every libc header breaks —
+  so the flag scan reads them (nested ones too) instead of skipping the
+  token. A bare specs name is left for the compiler's own search
+  directories; a specs path resolves like any other recorded path.
 - **Per source file.** The lookup keys on the source you pass (matched by
   resolved absolute path), so two files in an `--across`/summary run each
   get their own recorded flags.
@@ -228,12 +236,15 @@ asmdiff.py biquad.c --compile-commands            # same, for any matrix
 asmdiff.py biquad.c --compile-commands path/to/compile_commands.json
 ```
 
-Both search `./`, `./build`, `../`, `../build` — first hit wins — which
-covers running from a project root or from one directory below it (a
-component dir), with the database where CMake/idf.py leaves it. Finding
-nothing is an error: discovery is opt-in, so if you asked for it, silence
-would be a lie. It is never on by default — a target without
-`compile_commands` and no `--compile-commands` flag borrows nothing.
+Both walk up from the current directory, checking each level for
+`compile_commands.json` and then `build/compile_commands.json` (where
+CMake and idf.py leave it) — first hit wins. The walk stops at the
+repository root (the first directory with a `.git`), so running from any
+depth of component directory finds the project database, but an unrelated
+one further up the filesystem is never picked up. Finding nothing is an
+error: discovery is opt-in, so if you asked for it, silence would be a
+lie. It is never on by default — a target without `compile_commands` and
+no `--compile-commands` flag borrows nothing.
 
 The precedence is what you'd hope: a target that names its own
 `compile_commands` path always keeps it; `--compile-commands` (with or
@@ -273,6 +284,12 @@ The TOTAL row is a coarse sanity check — did this refactor move the file's
 weight, did a call appear that shouldn't have? It sums parsed function
 bodies only (no literal pools, data, or alignment), so it is not a size
 measurement, and per-function rows are where the real information is.
+
+Only labels the assembler types as functions are listed — global data
+(string constants, state structs, lookup tables) gets column-0 labels too
+but is not code. A `calls` list longer than 8 symbols is truncated to
+`..., +N more`; real firmware dispatch functions call dozens of distinct
+symbols and would otherwise make rows thousands of characters wide.
 
 ## Comparing the same function across two builds (`--across`)
 

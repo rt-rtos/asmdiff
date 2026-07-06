@@ -388,6 +388,77 @@ class TestIncludeFlags(unittest.TestCase):
                          ["-isystem", "/s"])
 
 
+class TestSpecsAndSysroot(unittest.TestCase):
+    """Driver flags that change the header environment (-specs, --sysroot)."""
+
+    def test_specs_glued_bare_name_not_resolved(self):
+        # A bare specs name (no path separator) is found in the compiler's
+        # own search dirs; gluing a directory onto it would break it.
+        self.assertEqual(
+            asmdiff.include_flags(["-specs=picolibc.specs"], "/build"),
+            ["-specs=picolibc.specs"])
+
+    def test_specs_with_path_resolved_against_directory(self):
+        self.assertEqual(
+            asmdiff.include_flags(["-specs=./custom/my.specs"], "/build"),
+            ["-specs=/build/custom/my.specs"])
+
+    def test_specs_split_and_double_dash(self):
+        self.assertEqual(
+            asmdiff.include_flags(["-specs", "nano.specs",
+                                   "--specs=nosys.specs"], "/b"),
+            ["-specs=nano.specs", "--specs=nosys.specs"])
+
+    def test_sysroot_glued_and_split(self):
+        self.assertEqual(
+            asmdiff.include_flags(["--sysroot=sr", "--sysroot", "/abs"],
+                                  "/b"),
+            ["--sysroot=/b/sr", "--sysroot=/abs"])
+
+
+class TestResponseFiles(unittest.TestCase):
+    """GCC @file response files inside compile_commands entries."""
+
+    def test_flags_inside_response_file_are_borrowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rsp = Path(tmp) / "toolchain" / "cflags"
+            rsp.parent.mkdir()
+            rsp.write_text("-mlongcalls\n-specs=picolibc.specs\n-Irspinc\n")
+            src = Path(tmp) / "a.c"
+            src.touch()
+            db = Path(tmp) / "compile_commands.json"
+            db.write_text(json.dumps([{
+                "directory": tmp, "file": str(src),
+                "command": f"cc -Iinc @{rsp} -c a.c"}]))
+            asmdiff._DB_CACHE.clear()
+            self.assertEqual(
+                asmdiff.compile_commands_flags(str(db), str(src)),
+                ["-I", f"{tmp}/inc", "-specs=picolibc.specs",
+                 "-I", f"{tmp}/rspinc"])
+
+    def test_relative_response_file_resolves_against_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cflags").write_text("-DFROMRSP")
+            self.assertEqual(
+                asmdiff._expand_response_files(["@cflags"], tmp),
+                ["-DFROMRSP"])
+
+    def test_nested_response_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "outer").write_text("@inner -DOUTER")
+            (Path(tmp) / "inner").write_text("-DINNER")
+            self.assertEqual(
+                asmdiff._expand_response_files(["@outer"], tmp),
+                ["-DINNER", "-DOUTER"])
+
+    def test_missing_response_file_warns_and_continues(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = asmdiff._expand_response_files(["-DKEEP", "@/nope/x"], "/b")
+        self.assertEqual(out, ["-DKEEP"])
+        self.assertIn("/nope/x", err.getvalue())
+
+
 class TestCompileCommandsFlags(unittest.TestCase):
     def _db(self, tmp, entries):
         path = Path(tmp) / "compile_commands.json"
@@ -477,15 +548,22 @@ def _inside(directory):
 
 
 class TestFindCompileCommands(unittest.TestCase):
-    """Auto-discovery of compile_commands.json near the current directory."""
+    """Auto-discovery of compile_commands.json by walking up from the CWD."""
 
     def _touch_db(self, directory):
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "compile_commands.json").write_text("[]")
 
-    def test_search_order_cwd_build_parent_parentbuild(self):
+    def _repo(self, tmp):
+        """A fake repo root: .git bounds the walk so tests never escape
+        the tempdir and pick up a stray database further up."""
+        root = Path(tmp)
+        (root / ".git").mkdir()
+        return root
+
+    def test_nearer_hits_win(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = self._repo(tmp)
             cwd = root / "sub"
             cwd.mkdir()
             for where, expect in [(root / "build", root / "build"),
@@ -497,12 +575,125 @@ class TestFindCompileCommands(unittest.TestCase):
                     self.assertEqual(asmdiff.find_compile_commands(),
                                      str(expect / "compile_commands.json"))
 
+    def test_walks_up_from_nested_component_dir(self):
+        # components/amy/src is three levels below the project root where
+        # idf.py leaves build/compile_commands.json.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            self._touch_db(root / "build")
+            cwd = root / "components" / "amy" / "src"
+            cwd.mkdir(parents=True)
+            with _inside(cwd):
+                self.assertEqual(asmdiff.find_compile_commands(),
+                                 str(root / "build" / "compile_commands.json"))
+
+    def test_stops_at_repository_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._touch_db(Path(tmp))          # db ABOVE the repo root
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / ".git").write_text("gitdir: elsewhere")  # worktree form
+            cwd = repo / "src"
+            cwd.mkdir()
+            with _inside(cwd):
+                self.assertIsNone(asmdiff.find_compile_commands())
+
     def test_nothing_found_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cwd = Path(tmp) / "a" / "b"
+            root = self._repo(tmp)
+            cwd = root / "a" / "b"
             cwd.mkdir(parents=True)
             with _inside(cwd):
                 self.assertIsNone(asmdiff.find_compile_commands())
+
+
+class TestObjectLabels(unittest.TestCase):
+    """Data labels must not be reported as functions."""
+
+    ASM = """\
+\t.type\tscale, @function
+scale:
+\tentry\tsp, 32
+\tretw.n
+\t.size\tscale, .-scale
+\t.type\t__func__$1, @object
+\t.size\t__func__$1, 9
+__func__$1:
+\t.string\t"app_main"
+\t.local\ts_queue
+\t.comm\ts_queue,4,4
+\t.lcomm\ts_tmp,8
+"""
+
+    def test_object_labels_skipped(self):
+        funcs = asmdiff.extract_functions(self.ASM)
+        self.assertEqual(list(funcs), ["scale"])
+
+    def test_arm_percent_function_type_still_reported(self):
+        asm = "\t.type\tf, %function\nf:\n\tbx\tlr\n\t.size\tf, .-f\n"
+        self.assertEqual(list(asmdiff.extract_functions(asm)), ["f"])
+
+    def test_untyped_label_still_treated_as_function(self):
+        # Hand-written asm often has no .type at all.
+        asm = "myfunc:\n\tret\n"
+        self.assertEqual(list(asmdiff.extract_functions(asm)), ["myfunc"])
+
+    def test_local_comm_literal_lines_not_counted(self):
+        asm = ("f:\n\tmov.n\ta2, a3\n\t.literal_position\n"
+               "\t.literal .LC1, 4096\n\t.local\tx\n\t.comm\tx,4,4\n"
+               "\tretw.n\n")
+        funcs = asmdiff.extract_functions(asm)
+        insns, _ = asmdiff.analyze(funcs["f"])
+        self.assertEqual(insns, 2)
+
+
+class TestCompileFailureOutput(unittest.TestCase):
+    CMD = ["xtensa-gcc", "-O2"] + [f"-I/inc{i}" for i in range(50)] + ["a.c"]
+    STDERR = "\n".join(f"err line {i}" for i in range(60))
+
+    def test_default_trims_flags_and_stderr(self):
+        asmdiff.VERBOSE = False
+        with self.assertRaises(SystemExit) as ctx:
+            asmdiff._compile_failure(self.CMD, self.STDERR)
+        msg = str(ctx.exception)
+        self.assertIn("xtensa-gcc failed on a.c", msg)
+        self.assertNotIn("-I/inc0", msg)                 # no flag dump
+        self.assertIn("err line 0", msg)
+        self.assertNotIn("err line 30", msg)             # stderr trimmed
+        self.assertIn("40 more stderr lines", msg)
+        self.assertIn("--verbose", msg)
+
+    def test_verbose_shows_everything(self):
+        asmdiff.VERBOSE = True
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                asmdiff._compile_failure(self.CMD, self.STDERR)
+        finally:
+            asmdiff.VERBOSE = False
+        msg = str(ctx.exception)
+        self.assertIn("-I/inc0", msg)
+        self.assertIn("err line 59", msg)
+
+    def test_short_stderr_not_annotated_with_more(self):
+        asmdiff.VERBOSE = False
+        with self.assertRaises(SystemExit) as ctx:
+            asmdiff._compile_failure(["gcc", "x.c"], "one error\n")
+        self.assertNotIn("more stderr", str(ctx.exception))
+
+
+class TestFormatCalls(unittest.TestCase):
+    def test_short_list_unchanged(self):
+        self.assertEqual(asmdiff.format_calls(["a", "b"]), "a, b")
+
+    def test_empty_is_dash(self):
+        self.assertEqual(asmdiff.format_calls([]), "-")
+
+    def test_long_list_capped(self):
+        calls = [f"fn{i}" for i in range(12)]
+        out = asmdiff.format_calls(calls)
+        self.assertTrue(out.endswith("+4 more"))
+        self.assertIn("fn7", out)
+        self.assertNotIn("fn8,", out)
 
 
 class TestDiscoveredCompileCommands(unittest.TestCase):
