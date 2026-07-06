@@ -12,7 +12,8 @@ Usage:
     tools/asmdiff/asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]...
                              [--across FUNC]... [--cc 'CC FLAGS']...
                              [--target NAME]... [--config PATH]
-                             [--compile-commands [PATH]] [-v]
+                             [--compile-commands [PATH]]
+                             [--flags-like PATH] [-v]
                              [-- EXTRA_FLAGS...]
 
 Three modes:
@@ -38,7 +39,9 @@ compile_commands = true in a target — or a bare --compile-commands on the
 command line — instead finds the database by checking each directory from
 the CWD up to the repository root, and its build/ subdirectory; a source
 absent from a database found that way is compiled without borrowed flags
-(with a note) rather than being an error.
+(with a note) rather than being an error.  --flags-like PATH lets such a
+source borrow the flags recorded for PATH, so a modified copy compares
+against its original under one header environment.
 """
 import argparse
 import glob
@@ -81,6 +84,12 @@ _CC_DB_PLAIN_FLAGS = ("-D", "-U")
 _CC_DB_EQ_FLAGS = ("-specs", "--specs", "--sysroot")
 _DB_CACHE = {}
 _MISS_NOTED = set()
+_BORROW_NOTED = set()
+# --flags-like PATH: a source with no database entry borrows the flags
+# recorded for PATH.  This is how a modified copy of a project source gets
+# the same header environment as its original, so an --across between them
+# compares codegen instead of header configurations.
+FLAGS_LIKE = None
 
 
 class Target(str):
@@ -257,9 +266,47 @@ def compile_commands_flags(db_path, source, missing_ok=False):
     and the message flags a same-name entry recorded under a different path.
     With ``missing_ok`` (auto-discovered databases) an absent source instead
     compiles without borrowed flags, after a one-time note per (db, source).
+    In either mode, --flags-like PATH satisfies an absent source with the
+    flags recorded for PATH — the modified-copy workflow.
     """
     entries = load_compile_commands(db_path)
     want = Path(source).resolve()
+    flags, name_seen = _lookup_entry(entries, want)
+    if flags is not None:
+        return flags
+    if FLAGS_LIKE:
+        like = Path(FLAGS_LIKE).resolve()
+        like_flags, _ = _lookup_entry(entries, like)
+        if like_flags is None:
+            sys.exit(f"error: --flags-like {FLAGS_LIKE} "
+                     f"not found in {db_path}")
+        key = (db_path, str(want))
+        if key not in _BORROW_NOTED:
+            _BORROW_NOTED.add(key)
+            print(f"note: {source} not in {db_path}; borrowing the flags "
+                  f"recorded for {FLAGS_LIKE}", file=sys.stderr)
+        return like_flags
+    suggest = ("; --flags-like PATH can borrow another entry's flags"
+               if name_seen else "")
+    if missing_ok:
+        key = (db_path, str(want))
+        if key not in _MISS_NOTED:
+            _MISS_NOTED.add(key)
+            print(f"note: {source} not in {db_path}; compiling without "
+                  f"its include/define flags{suggest}", file=sys.stderr)
+        return []
+    hint = (f"; an entry named {want.name} exists under a different path — "
+            "pass the source as it appears in the database, or borrow its "
+            "flags with --flags-like") if name_seen else ""
+    sys.exit(f"error: {source} not found in {db_path}{hint}")
+
+
+def _lookup_entry(entries, want):
+    """Flags for the entry whose file resolves to ``want``, or None.
+
+    The second result reports whether some entry shares ``want``'s
+    basename — the raw material for the miss hints above.
+    """
     name_seen = False
     for entry in entries:
         f = entry.get("file")
@@ -278,20 +325,10 @@ def compile_commands_flags(db_path, source, missing_ok=False):
             tokens = (list(args) if isinstance(args, list)
                       else shlex.split(entry.get("command", "")))
             tokens = _expand_response_files(tokens, directory)
-            return include_flags(tokens, directory)
+            return include_flags(tokens, directory), name_seen
         if Path(f).name == want.name:
             name_seen = True
-    if missing_ok:
-        key = (db_path, str(want))
-        if key not in _MISS_NOTED:
-            _MISS_NOTED.add(key)
-            print(f"note: {source} not in {db_path}; "
-                  "compiling without its include/define flags",
-                  file=sys.stderr)
-        return []
-    hint = (f"; an entry named {want.name} exists under a different path — "
-            "pass the source as it appears in the database") if name_seen else ""
-    sys.exit(f"error: {source} not found in {db_path}{hint}")
+    return None, name_seen
 
 # A label at column 0 that is not a local (.L*) label starts a function.
 FUNC_LABEL = re.compile(r"^([A-Za-z_][\w$.]*):")
@@ -640,6 +677,41 @@ def compile_to_asm(cc_cmd, extra_flags, harness, out_dir):
     return out_s.read_text()
 
 
+def mark_db_misses(cc_cmd, sources, tags):
+    """Column tags for a two-file comparison, marking a side that compiled
+    without borrowed flags while the other side had them.
+
+    That situation — one source in the database, its copy not — means the
+    columns differ in header configuration (defines, include paths), not
+    just in source, so byte-identical code can show different assembly.
+    The marked tag and a warning keep that from reading as a codegen
+    finding.  Both sides missing is a consistent environment: no warning.
+    """
+    db = getattr(cc_cmd, "compile_commands", None)
+    if not db:
+        return list(tags)
+    missed = [(db, str(Path(s).resolve())) in _MISS_NOTED for s in sources]
+    if not any(missed) or all(missed):
+        return list(tags)
+    print("warning: only one side got flags from the database — assembly "
+          "differences may reflect header configuration, not source "
+          "changes; --flags-like PATH gives the copy its original's flags",
+          file=sys.stderr)
+    return [t + " [no db entry]" if m else t for t, m in zip(tags, missed)]
+
+
+# C++ mangles old_scale(float) to _Z9old_scalef: the old_/new_ prefixes
+# survive inside the mangled name but no longer lead it, so auto-pairing
+# finds nothing and would fall back to the summary without explanation.
+MANGLED_PAIR = re.compile(r"_Z\d+(?:old|new)_")
+
+
+def mangled_pair_hint(names):
+    """True when the extracted names look like C++-mangled old_*/new_*
+    functions — the harness probably just needs extern \"C\"."""
+    return any(MANGLED_PAIR.match(n) for n in names)
+
+
 def side_by_side(left, right, ltitle, rtitle, width=44):
     """Two-column view of a pair's asm lines."""
     rows = [f"{ltitle:<{width}} | {rtitle}",
@@ -762,9 +834,10 @@ def run_across(sources, matrix, fn_names, extra_flags, tmp):
             if len(sides) < 2:
                 continue
             ran_any = True
+            tags = mark_db_misses(cc_cmd, sources,
+                                  file_tags(sources[0], sources[1]))
             print(f"\n== {cc_cmd} ==\n")
-            report_across(fn_names, sides[0], sides[1],
-                          *file_tags(sources[0], sources[1]))
+            report_across(fn_names, sides[0], sides[1], *tags)
         if not ran_any:
             sys.exit("error: no usable compiler in the matrix")
         return 0
@@ -802,8 +875,10 @@ def run_summary(sources, matrix, extra_flags, tmp):
         if len(sections) < len(sources):
             continue
         ran_any = True
+        shown = (mark_db_misses(cc_cmd, sources, tags)
+                 if len(sources) == 2 else tags)
         print(f"\n== {cc_cmd} ==")
-        for tag, funcs in zip(tags, sections):
+        for tag, funcs in zip(shown, sections):
             if len(sections) > 1:
                 print(f"\n-- {tag} --")
             print()
@@ -830,6 +905,10 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
         pairs = ([tuple(p.split(":", 1)) for p in pair_specs]
                  or auto_pairs(funcs))
         if not pairs:
+            if mangled_pair_hint(funcs):
+                print('note: C++ mangling defeats old_*/new_* auto-pairing; '
+                      'declare the pairs extern "C" or use --pair with the '
+                      'mangled names', file=sys.stderr)
             print(f"\n== {cc_cmd} ==\n")
             print(file_summary_table(funcs) if funcs
                   else "(no functions found)")
@@ -893,13 +972,20 @@ def main(argv=None):
                         help=f"config file; default search: {CONFIG_NAME} "
                              "next to SOURCE.c, in the current directory, "
                              "then in ~/.config/")
+    parser.add_argument("--flags-like", metavar="PATH",
+                        help="when a source has no compile_commands entry, "
+                             "borrow the include/define flags recorded for "
+                             "PATH — lets a modified copy of a project "
+                             "source compile (and compare) under its "
+                             "original's header environment")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="on compile failure, print the full compiler "
                              "command and complete error output instead of "
                              "the first lines")
     args = parser.parse_args(argv)
-    global VERBOSE
+    global VERBOSE, FLAGS_LIKE
     VERBOSE = args.verbose
+    FLAGS_LIKE = args.flags_like
 
     if len(args.sources) > 2:
         parser.error("at most two source files may be given")

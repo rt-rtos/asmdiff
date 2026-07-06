@@ -76,7 +76,8 @@ $ asmdiff.py asmdiff_example.c
 ```
 asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]... [--across FUNC]...
            [--cc 'CC FLAGS']... [--target NAME]... [--config PATH]
-           [--compile-commands [PATH]] [-v] [-- EXTRA_FLAGS...]
+           [--compile-commands [PATH]] [--flags-like PATH] [-v]
+           [-- EXTRA_FLAGS...]
 ```
 
 | Option | Meaning |
@@ -88,6 +89,7 @@ asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]... [--across FUNC]...
 | `--target NAME` | A named target from the config file, resolved to a `--cc` entry. Repeatable; appended to the matrix after `--cc` entries. |
 | `--config PATH` | Config file to use. Default search: `asmdiff.toml` next to `SOURCE.c`, then in the current directory, then `~/.config/`. First hit wins. |
 | `--compile-commands [PATH]` | Borrow each source's include/define flags from a `compile_commands.json`; with no `PATH`, walk up from the CWD checking each directory and its `build/` until the repository root. See [below](#borrowing-includes-from-compile_commandsjson). |
+| `--flags-like PATH` | A source with no `compile_commands` entry borrows the flags recorded for `PATH` — the way to compare a modified copy of a project source under its original's header environment. |
 | `-v`, `--verbose` | On compile failure, print the full compiler command and complete error output. Default shows only the compiler, the source, and the first error lines. |
 | `-- FLAGS...` | Everything after a bare `--` is appended to *every* compiler invocation. |
 
@@ -256,6 +258,29 @@ no entry is compiled without borrowed flags after a one-line stderr note,
 instead of being an error. That keeps standalone harness files working
 when a `build/` directory happens to sit nearby; an explicitly named
 database still treats an absent source as the error it is.
+
+If a two-file comparison ends up with borrowed flags on only *one* side,
+the mismatched column is tagged `[no db entry]` and a warning is printed:
+the two sides then differ in header configuration — defines, include
+paths — not just source, and byte-identical code can compile to visibly
+different assembly. Don't read codegen meaning into such a diff.
+
+### Comparing a modified copy of a project source
+
+The before/after workflow — copy `oscillators.c` to `osc_tweak.c`, change
+one thing, `--across` them — is exactly the situation above: the copy has
+no database entry. `--flags-like` names the entry the copy should borrow:
+
+```bash
+asmdiff.py src/oscillators.c src/osc_tweak.c --across render_lut \
+           --target s3 --flags-like src/oscillators.c
+```
+
+Both sides now compile under the same recorded header environment, so the
+diff is your edit and nothing else. This also covers a git-worktree
+baseline (`../baseline/src/oscillators.c`), which is the same file under a
+path the database has never heard of. The absent-source error and the
+soft-miss note both point at this flag when a same-name entry exists.
 
 ## Whole-file summary
 

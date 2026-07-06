@@ -647,6 +647,115 @@ __func__$1:
         self.assertEqual(insns, 2)
 
 
+class TestFlagsLike(unittest.TestCase):
+    """--flags-like: a source absent from the db borrows a named entry."""
+
+    def _db(self, tmp):
+        path = Path(tmp) / "compile_commands.json"
+        path.write_text(json.dumps([{
+            "directory": tmp, "file": f"{tmp}/real.c",
+            "command": "cc -Iinc -DESP_PLATFORM -c real.c"}]))
+        asmdiff._DB_CACHE.clear()
+        asmdiff._MISS_NOTED.clear()
+        return str(path)
+
+    def test_missing_source_borrows_named_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            asmdiff.FLAGS_LIKE = f"{tmp}/real.c"
+            try:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    flags = asmdiff.compile_commands_flags(
+                        db, f"{tmp}/copy.c", missing_ok=True)
+            finally:
+                asmdiff.FLAGS_LIKE = None
+            self.assertEqual(flags, ["-I", f"{tmp}/inc", "-DESP_PLATFORM"])
+            self.assertIn("real.c", err.getvalue())     # borrow is announced
+            # A satisfied borrow is not a miss: no apples-to-oranges state.
+            self.assertEqual(asmdiff._MISS_NOTED, set())
+
+    def test_applies_to_explicit_db_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            asmdiff.FLAGS_LIKE = f"{tmp}/real.c"
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    flags = asmdiff.compile_commands_flags(
+                        db, f"{tmp}/copy.c", missing_ok=False)
+            finally:
+                asmdiff.FLAGS_LIKE = None
+            self.assertEqual(flags[-1], "-DESP_PLATFORM")
+
+    def test_bad_flags_like_target_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            asmdiff.FLAGS_LIKE = f"{tmp}/nowhere.c"
+            try:
+                with self.assertRaises(SystemExit):
+                    asmdiff.compile_commands_flags(db, f"{tmp}/copy.c",
+                                                   missing_ok=True)
+            finally:
+                asmdiff.FLAGS_LIKE = None
+
+    def test_miss_messages_suggest_flags_like(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            with self.assertRaises(SystemExit) as ctx:   # hard error path
+                asmdiff.compile_commands_flags(db, f"{tmp}/other/real.c")
+            self.assertIn("--flags-like", str(ctx.exception))
+            err = io.StringIO()                          # soft-miss path
+            with contextlib.redirect_stderr(err):
+                asmdiff.compile_commands_flags(db, f"{tmp}/sub/real.c",
+                                               missing_ok=True)
+            self.assertIn("--flags-like", err.getvalue())
+
+
+class TestMarkDbMisses(unittest.TestCase):
+    """Two-file comparisons where only one side got borrowed flags."""
+
+    def _entry(self, db):
+        return asmdiff.Target("gcc -O2", db, db_discovered=True)
+
+    def test_one_sided_miss_tags_and_warns(self):
+        asmdiff._MISS_NOTED.clear()
+        asmdiff._MISS_NOTED.add(("/db.json", str(Path("b.c").resolve())))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            tags = asmdiff.mark_db_misses(self._entry("/db.json"),
+                                          ["a.c", "b.c"], ("a.c", "b.c"))
+        self.assertEqual(tags, ["a.c", "b.c [no db entry]"])
+        self.assertIn("header", err.getvalue())
+
+    def test_both_missed_means_same_env_no_warning(self):
+        asmdiff._MISS_NOTED.clear()
+        for s in ("a.c", "b.c"):
+            asmdiff._MISS_NOTED.add(("/db.json", str(Path(s).resolve())))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            tags = asmdiff.mark_db_misses(self._entry("/db.json"),
+                                          ["a.c", "b.c"], ("a.c", "b.c"))
+        self.assertEqual(tags, ["a.c", "b.c"])
+        self.assertEqual(err.getvalue(), "")
+
+    def test_no_db_entry_untouched(self):
+        tags = asmdiff.mark_db_misses("gcc -O2", ["a.c", "b.c"],
+                                      ("a.c", "b.c"))
+        self.assertEqual(tags, ["a.c", "b.c"])
+
+
+class TestMangledPairHint(unittest.TestCase):
+    def test_mangled_old_new_detected(self):
+        self.assertTrue(asmdiff.mangled_pair_hint(
+            ["_Z9old_scalef", "_Z9new_scalef"]))
+
+    def test_plain_c_names_no_hint(self):
+        self.assertFalse(asmdiff.mangled_pair_hint(["scale", "helper"]))
+
+    def test_mangled_but_not_old_new_no_hint(self):
+        self.assertFalse(asmdiff.mangled_pair_hint(["_Z6renderv"]))
+
+
 class TestCompileFailureOutput(unittest.TestCase):
     CMD = ["xtensa-gcc", "-O2"] + [f"-I/inc{i}" for i in range(50)] + ["a.c"]
     STDERR = "\n".join(f"err line {i}" for i in range(60))
