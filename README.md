@@ -5,20 +5,41 @@
 
 ### Try it yourself:
 
-`$ uvx asmdiff` / `$ pipx asmdiff`
+`$ uvx asmdiff` / `$ pipx run asmdiff`
 --- 
 
-`asmdiff.py` answers one question fast: **when I rewrite a C construct, what
+`asmdiff` answers one question fast: **when I rewrite a C construct, what
 does the compiler actually emit - before and after?** It compiles a small
 harness file across a matrix of compilers, extracts each variant function's
 assembly, and prints side-by-side listings plus a summary of instruction
 counts, outbound calls, and loop spans.
 
 Compilers and flags are configured per project through named targets in an
-`asmdiff.toml` file  and parses any GNU-as ELF assembly.
+`asmdiff.toml` file, and any GNU-as ELF assembly is parsed.
   
 Whether something constant folds or turns into a libcall is a distinction that is
 invisible in source review and decisive on hot paths.
+
+## Install
+
+Any of the standard Python tool installers puts an `asmdiff` command on
+your PATH - the package has no dependencies outside the standard library:
+
+```bash
+uv tool install asmdiff        # uv
+pipx install asmdiff           # pipx
+pip install --user asmdiff     # plain pip
+```
+
+For a one-off run without installing anything, `uvx asmdiff HARNESS.c`
+or `pipx run asmdiff HARNESS.c`.
+
+From a checkout of this repo, `pip install -e .` installs the command in
+editable mode, tracking your working tree. Or skip installation entirely -
+the tool is a single stdlib-only file: `python3 asmdiff.py HARNESS.c`.
+
+Requires Python >= 3.8; `asmdiff.toml` config files need >= 3.11
+(stdlib `tomllib`).
 
 ## Quick start
 
@@ -34,7 +55,7 @@ float new_scale(float x) { return ldexpf(x, -5); }
 Run:
 
 ```
-$ asmdiff.py myharness.c
+$ asmdiff myharness.c
 ```
 
 Output (gcc section shown, one per compiler):
@@ -68,7 +89,7 @@ A worked example is included — `asmdiff_example.c` reproduces the
 exp2f/ldexpf analysis for both constant and runtime shift amounts:
 
 ```
-$ asmdiff.py asmdiff_example.c
+$ asmdiff asmdiff_example.c
 ```
 
 ## Quick inspect: one function, no comparison
@@ -76,7 +97,7 @@ $ asmdiff.py asmdiff_example.c
 To just look at what a compiler emits for one function, name it after
 the file - no harness, no pairing:
 
-    $ asmdiff.py src/oscillators.c render_lut
+    $ asmdiff src/oscillators.c render_lut
 
 With one usable compiler you get the function's listing and a stats
 row; with exactly two (the default gcc + clang matrix) the listings
@@ -92,7 +113,7 @@ for as a symbol.
 ## Command reference
 
 ```
-asmdiff.py SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
+asmdiff SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
            [--cc 'CC FLAGS']... [--target NAME]... [--config PATH]
            [--compile-commands [PATH]] [--flags-like PATH]
            [--layout list|side-by-side] [-v] [-- EXTRA_FLAGS...]
@@ -121,14 +142,14 @@ Examples:
 
 ```bash
 # Explicit pairs, default compilers
-asmdiff.py h.c --pair biquad_v1:biquad_v2 --pair svf_v1:svf_v2
+asmdiff h.c --pair biquad_v1:biquad_v2 --pair svf_v1:svf_v2
 
 # Cross-compilers: quote command and flags together
-asmdiff.py h.c --cc 'xtensa-esp32s3-elf-gcc -O2 -mlongcalls' \
+asmdiff h.c --cc 'xtensa-esp32s3-elf-gcc -O2 -mlongcalls' \
                --cc 'riscv32-esp-elf-gcc -O2'
 
 # Try a flag variant across the whole default matrix
-asmdiff.py h.c -- -fno-math-errno
+asmdiff h.c -- -fno-math-errno
 ```
 
 Compilers missing from `PATH` are skipped with a warning; the run fails only
@@ -172,9 +193,9 @@ A target is exactly a saved `--cc` entry — nothing else changes. Useful
 shapes:
 
 ```bash
-asmdiff.py h.c                                  # config default target(s)
-asmdiff.py h.c --target esp32s3 --target host      # two-target matrix
-asmdiff.py h.c --across f --target esp32s3 --cc 'gcc -O2'  # mix freely
+asmdiff h.c                                  # config default target(s)
+asmdiff h.c --target esp32s3 --target host      # two-target matrix
+asmdiff h.c --across f --target esp32s3 --cc 'gcc -O2'  # mix freely
 ```
 
 A config placed next to your harness files travels with them: any invocation
@@ -190,7 +211,7 @@ A real project source rarely compiles with a handful of `-I` flags. An
 ESP-IDF component pulls in `freertos/FreeRTOS.h`, `esp_*` headers, and a
 *generated* `sdkconfig.h`, reachable only through the dozens of `-I`/`-D`
 flags the build system computes — none of which live in the source file.
-That is why `asmdiff.py component.c` fails with `freertos/FreeRTOS.h: No
+That is why `asmdiff component.c` fails with `freertos/FreeRTOS.h: No
 such file or directory`: not a wrong compiler (the xtensa toolchain ships
 no FreeRTOS either), just missing include paths. Transcribing them by hand
 is miserable.
@@ -208,7 +229,7 @@ compile_commands = "$HOME/myproject/build/compile_commands.json"
 
 ```
 
-Now `asmdiff.py $HOME/myproject/components/dsp/biquad.c --target esp32s3-idf`
+Now `asmdiff $HOME/myproject/components/dsp/biquad.c --target esp32s3-idf`
 finds that file's entry in the database and adds the include/define flags
 it recorded — `-I`, `-isystem`, `-iquote`, `-idirafter`, `-include`,
 `-imacros`, `-D`, `-U`, plus the header-environment driver flags `-specs`
@@ -253,8 +274,8 @@ compile_commands = true      # search instead of naming a path
 ```
 
 ```bash
-asmdiff.py biquad.c --compile-commands            # same, for any matrix
-asmdiff.py biquad.c --compile-commands path/to/compile_commands.json
+asmdiff biquad.c --compile-commands            # same, for any matrix
+asmdiff biquad.c --compile-commands path/to/compile_commands.json
 ```
 
 Both walk up from the current directory, checking each level for
@@ -291,7 +312,7 @@ one thing, `--across` them — is exactly the situation above: the copy has
 no database entry. `--flags-like` names the entry the copy should borrow:
 
 ```bash
-asmdiff.py src/oscillators.c src/osc_tweak.c --across render_lut \
+asmdiff src/oscillators.c src/osc_tweak.c --across render_lut \
            --target s3 --flags-like src/oscillators.c
 ```
 
@@ -308,7 +329,7 @@ auto-pair, the tool prints what it parsed instead of erroring: every
 function's counts plus a file total. With two files, one block per file:
 
 ```
-$ asmdiff.py old/delay.c new/delay.c
+$ asmdiff old/delay.c new/delay.c
 
 == xtensa-esp32s3-elf-gcc -O2 ... ==
 
@@ -347,17 +368,17 @@ entry is the baseline; each later entry is compared against it:
 
 ```bash
 # Did dropping fixed-point change the biquad's codegen?
-asmdiff.py src/filters.c --across dsps_biquad_f32_ansi \
+asmdiff src/filters.c --across dsps_biquad_f32_ansi \
     --cc 'gcc -O3 -DMY_FIXED_CONFIG' --cc 'gcc -O3'
 
 # gcc vs clang on the same function
-asmdiff.py src/filters.c --across dsps_biquad_f32_ansi \
+asmdiff src/filters.c --across dsps_biquad_f32_ansi \
     --cc 'gcc -O3' --cc 'clang -O3'
 ```
 ```bash
 # Size vs Performance Optimizations
-asmdiff.py src/filters.c --across dsps_biquad_f32_ansi \
-    --cc 'gcc -Os' --cc 'gcc -O2'
+asmdiff src/filters.c --across dsps_biquad_f32_ansi \
+    --cc 'gcc -Os' --cc 'gcc -O3'
 
 ```
 
@@ -467,7 +488,7 @@ dsps_biquad_f32_ansi [cc#1]  baseline   59     SMULR6  .L27:32
 dsps_biquad_f32_ansi [cc#2]  candidate  89     -       .L26:54
 ```
 
-(The columns describe, they don't rank: here `-O2` is bigger by every
+(The columns describe, they don't rank: here `-O3` is bigger by every
 count, and only the listing shows why — `SMULR6` inlined into the loop
 body, vector setup around it. Whether that trade is good is your call.)
 
@@ -476,7 +497,7 @@ invocations, then one section per baseline/candidate pairing. Runnable
 against the bundled example file:
 
 ```
-$ asmdiff.py asmdiff_example.c --across new_rt --cc 'gcc -O0' --cc 'gcc -O3'
+$ asmdiff asmdiff_example.c --across new_rt --cc 'gcc -O0' --cc 'gcc -O3'
 
 cc#1: gcc -O0
 cc#2: gcc -O3
@@ -510,7 +531,7 @@ gets its own section:
 
 ```bash
 git worktree add ../baseline main
-asmdiff.py ../baseline/src/filters.c src/filters.c \
+asmdiff ../baseline/src/filters.c src/filters.c \
     --across dsps_biquad_f32_ansi
 ```
 
@@ -543,7 +564,7 @@ git worktree add ../amy-baseline HEAD
 #      #define SHIFTL(s, b) ldexpf((s), (b))
 
 # 4. Compare real functions containing both kinds of shift site:
-asmdiff.py ../amy-baseline/src/log2_exp2.c src/log2_exp2.c \
+asmdiff ../amy-baseline/src/log2_exp2.c src/log2_exp2.c \
     --across exp2_lut --across log2_lut --cc 'gcc -O3 -Wall'
 
 # 5. Clean up
@@ -678,10 +699,9 @@ standard library, and contains no project-specific constants. To port:
   name. Unrolled or versioned loops (common at `-O3`) appear as several
   spans or as one large span; the tool reports what it sees and does not
   reassemble them into a source-level loop.
-  read the raw `-S` output by hand
 
   ---
-## pretend FAQ
+## Comparison with alternatives
 ### Why not just run objdump by hand?
 
 The two commands above (steps 4–5) replace a manual workflow with real
@@ -766,7 +786,7 @@ the manual version is roughly: 2 compiles (with hand-retyped flags) → 4
 `objdump`/relocation-lookup passes → noise-stripped by hand on 4 files →
 2 `diff -y` runs that don't survive drift → manual instruction counts and
 call classification on 4 files → a hand-assembled summary table. The
-`asmdiff.py` version is the one command already shown above. Neither
+`asmdiff` version is the one command already shown above. Neither
 workflow can skip understanding *why* the two functions differ — that part
 is still your judgment — but everything upstream of that judgment, where a
 dropped flag or a misread relocation silently invalidates the comparison,
@@ -870,4 +890,40 @@ remaining pipeline is `extract_functions()`, `analyze()`,
 `side_by_side()`, and `summary_table()` in `asmdiff.py` — written once,
 instead of re-derived by hand every time someone wants to answer "did this
 still fold?"
+
+### Why not use Godbolt / Compiler Explorer?
+
+For a self-contained snippet, [Compiler Explorer](https://godbolt.org/) is
+simply the better tool, and asmdiff is not trying to compete with it:
+instant feedback as you type, a huge hosted matrix of compilers and
+versions, source-to-asm line highlighting, shareable links. "What does
+this construct compile to, across compilers?" is a Compiler Explorer
+question - answer it there.
+
+asmdiff exists for the questions that stop fitting a browser textbox:
+
+- **Real project sources.** An ESP-IDF component includes
+  `freertos/FreeRTOS.h` and a *generated* `sdkconfig.h`, reachable only
+  through dozens of build-computed `-I`/`-D` flags. Pasting such a file
+  into Compiler Explorer means hand-inlining that whole header
+  environment; asmdiff borrows it from `compile_commands.json`
+  (see above).
+- **Your exact toolchain.** Codegen conclusions only hold at the compiler
+  build and flags the project actually ships with - the pinned cross-gcc
+  under `~/.espressif`, its specs file, your project's configuration
+  headers - not the nearest version a website happens to host.
+- **Comparisons across revisions.** `--across` over a git worktree diffs
+  one function between two states of a tree, each side resolving its own
+  headers. There is no textbox equivalent of "this function, before and
+  after this commit".
+- **Terminal-native and offline.** A one-line command next to the code,
+  scriptable and repeatable in CI, with nothing uploaded anywhere - which
+  also matters for source you can't paste into a public website.
+
+So the intended scope is the awkward middle ground: more automation than
+driving `objdump` or `-S` by hand (the two sections above), more
+project-awareness than a snippet playground. For exploring what compilers
+do to an isolated construct, keep using Compiler Explorer; when the
+question involves your tree, your toolchain, and your flags, that is what
+asmdiff is for.
 
