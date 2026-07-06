@@ -76,7 +76,7 @@ $ asmdiff.py asmdiff_example.c
 ```
 asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]... [--across FUNC]...
            [--cc 'CC FLAGS']... [--target NAME]... [--config PATH]
-           [-- EXTRA_FLAGS...]
+           [--compile-commands [PATH]] [-- EXTRA_FLAGS...]
 ```
 
 | Option | Meaning |
@@ -87,6 +87,7 @@ asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]... [--across FUNC]...
 | `--cc 'CC FLAGS'` | One compiler invocation, command and flags in a single quoted string. Repeatable to build a matrix. |
 | `--target NAME` | A named target from the config file, resolved to a `--cc` entry. Repeatable; appended to the matrix after `--cc` entries. |
 | `--config PATH` | Config file to use. Default search: `asmdiff.toml` next to `SOURCE.c`, then in the current directory, then `~/.config/`. First hit wins. |
+| `--compile-commands [PATH]` | Borrow each source's include/define flags from a `compile_commands.json`; with no `PATH`, search `./`, `./build`, `../`, `../build`. See [below](#borrowing-includes-from-compile_commandsjson). |
 | `-- FLAGS...` | Everything after a bare `--` is appended to *every* compiler invocation. |
 
 With no `--cc` and no `--target`, the config file's top-level
@@ -121,19 +122,19 @@ each compiler+flags combination once:
 
 ```toml
 # asmdiff.toml — next to your harnesses, in CWD, or in ~/.config/
-default = "s3-amy"          # target(s) used when no --cc/--target is given
+default = "esp32s3"         # target(s) used when no --cc/--target is given
 
-[s3-amy]                     # production-like ESP32-S3 codegen
+[esp32s3]                    # production-like ESP32-S3 codegen
 cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
 flags = [
-  "-O2", "-DAMY_USE_FIXEDPOINT", "-DNDEBUG",
+  "-O2", "-DMY_FIXEDPOINT", "-DNDEBUG",
   "-Wno-strict-aliasing", "-mlongcalls",
-  "-I$HOME/project/components/amy/src",
+  "-I$HOME/project/components/dsp/include",
 ]
 
-[host-fixed]                 # same defines on host gcc
+[host]                       # same defines on host gcc
 cc = "gcc"
-flags = ["-O2", "-DAMY_USE_FIXEDPOINT", "-I$HOME/amy/src"]
+flags = ["-O2", "-DMY_FIXEDPOINT", "-I$HOME/project/components/dsp/include"]
 ```
 
 `cc` values expand `~` and `$VARS` and may be glob patterns, so a config
@@ -150,8 +151,8 @@ shapes:
 
 ```bash
 asmdiff.py h.c                                  # config default target(s)
-asmdiff.py h.c --target s3-amy --target host-fixed   # two-target matrix
-asmdiff.py h.c --across f --target s3-amy --cc 'gcc -O2'  # mix freely
+asmdiff.py h.c --target esp32s3 --target host      # two-target matrix
+asmdiff.py h.c --across f --target esp32s3 --cc 'gcc -O2'  # mix freely
 ```
 
 A config placed next to your harness files travels with them: any invocation
@@ -178,13 +179,13 @@ recording the exact flags for every source it builds (ESP-IDF writes one to
 `build/compile_commands.json` on every `idf.py build`). Point a target at it:
 
 ```toml
-[s3-idf]
+[esp32s3-idf]
 cc = "xtensa-esp32s3-elf-gcc"
 flags = ["-O2", "-mlongcalls"]
 compile_commands = "$HOME/myproject/build/compile_commands.json"
 ```
 
-Now `asmdiff.py $HOME/myproject/components/dsp/biquad.c --target s3-idf`
+Now `asmdiff.py $HOME/myproject/components/dsp/biquad.c --target esp32s3-idf`
 finds that file's entry in the database and adds the include/define flags
 it recorded — `-I`, `-isystem`, `-iquote`, `-idirafter`, `-include`,
 `-imacros`, `-D`, `-U` — to this target's command. Everything else the
@@ -208,6 +209,41 @@ Details that make it robust:
 - **`compile_commands` expands `~` and `$VARS`.** The `==` header always
   prints the resolved compiler command; run with `-- -v` if you want to see
   every include path the compiler actually received.
+
+### Auto-discovering the database
+
+When you run asmdiff from inside the project anyway, the path is
+redundant. Two opt-ins skip it:
+
+```toml
+[esp32s3-idf]
+cc = "xtensa-esp32s3-elf-gcc"
+flags = ["-O2", "-mlongcalls"]
+compile_commands = true      # search instead of naming a path
+```
+
+```bash
+asmdiff.py biquad.c --compile-commands            # same, for any matrix
+asmdiff.py biquad.c --compile-commands path/to/compile_commands.json
+```
+
+Both search `./`, `./build`, `../`, `../build` — first hit wins — which
+covers running from a project root or from one directory below it (a
+component dir), with the database where CMake/idf.py leaves it. Finding
+nothing is an error: discovery is opt-in, so if you asked for it, silence
+would be a lie. It is never on by default — a target without
+`compile_commands` and no `--compile-commands` flag borrows nothing.
+
+The precedence is what you'd hope: a target that names its own
+`compile_commands` path always keeps it; `--compile-commands` (with or
+without a path) fills in every other matrix entry, including `--cc`
+strings and the built-in gcc/clang fallback.
+
+One behavioral difference: with a *discovered* database, a source that has
+no entry is compiled without borrowed flags after a one-line stderr note,
+instead of being an error. That keeps standalone harness files working
+when a `build/` directory happens to sit nearby; an explicitly named
+database still treats an absent source as the error it is.
 
 ## Whole-file summary
 

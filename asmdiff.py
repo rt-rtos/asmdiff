@@ -12,6 +12,7 @@ Usage:
     tools/asmdiff/asmdiff.py SOURCE.c [SOURCE2.c] [--pair OLD:NEW]...
                              [--across FUNC]... [--cc 'CC FLAGS']...
                              [--target NAME]... [--config PATH]
+                             [--compile-commands [PATH]]
                              [-- EXTRA_FLAGS...]
 
 Three modes:
@@ -33,6 +34,10 @@ A config target may name a compile_commands.json (compile_commands = PATH):
 the include/define flags recorded there for the source being compiled are
 added to that target's command, so a real project source resolves its
 headers the way its own build system does (e.g. an ESP-IDF component).
+compile_commands = true in a target — or a bare --compile-commands on the
+command line — instead searches ./, ./build, ../, ../build for the
+database; a source absent from a database found that way is compiled
+without borrowed flags (with a note) rather than being an error.
 """
 import argparse
 import glob
@@ -69,6 +74,7 @@ _CC_DB_PATH_FLAGS = ("-I", "-iquote", "-isystem", "-idirafter",
                      "-include", "-imacros", "-isysroot")
 _CC_DB_PLAIN_FLAGS = ("-D", "-U")
 _DB_CACHE = {}
+_MISS_NOTED = set()
 
 
 class Target(str):
@@ -76,11 +82,17 @@ class Target(str):
     optional compile_commands.json whose per-source include/define flags are
     appended at compile time.  Subclassing str means it prints, compares, and
     shlex-splits as the bare command everywhere the matrix is consumed, so
-    only compile_to_asm needs to know about the extra attribute."""
+    only compile_to_asm needs to know about the extra attributes.
 
-    def __new__(cls, cmd, compile_commands=None):
+    ``db_discovered`` marks a database that was found by searching near the
+    CWD rather than named explicitly; a source absent from a discovered
+    database is tolerated (compiled without borrowed flags, with a note),
+    where an explicit database makes that an error."""
+
+    def __new__(cls, cmd, compile_commands=None, db_discovered=False):
         self = super().__new__(cls, cmd)
         self.compile_commands = compile_commands
+        self.db_discovered = db_discovered
         return self
 
 
@@ -125,6 +137,33 @@ def include_flags(tokens, directory):
     return flags
 
 
+def find_compile_commands():
+    """Locate a compile_commands.json near the current directory.
+
+    Searched in order: ./, ./build, ../, ../build — first hit wins.  This
+    covers running asmdiff from a project root or from one directory below
+    it (a component dir), with the database where CMake/idf.py leaves it.
+    Returns None when nothing is found.
+    """
+    cwd = Path.cwd()
+    for d in (cwd, cwd / "build", cwd.parent, cwd.parent / "build"):
+        candidate = d / "compile_commands.json"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _discovered_db(who):
+    """find_compile_commands() for a caller that opted in (compile_commands
+    = true, or a bare --compile-commands): finding nothing is then an error,
+    not a silent no-op."""
+    found = find_compile_commands()
+    if found is None:
+        sys.exit(f"error: {who}: no compile_commands.json found in "
+                 "./, ./build, ../, or ../build")
+    return found
+
+
 def load_compile_commands(path):
     """Parse a compile_commands.json into its list of entries (cached, since
     one database is queried once per source per compiler in the matrix)."""
@@ -142,7 +181,7 @@ def load_compile_commands(path):
     return data
 
 
-def compile_commands_flags(db_path, source):
+def compile_commands_flags(db_path, source, missing_ok=False):
     """Header/define flags for ``source`` taken from a compile_commands.json.
 
     The entry whose ``file`` resolves to the same path as ``source`` supplies
@@ -151,6 +190,8 @@ def compile_commands_flags(db_path, source):
     is used as-is.  A source absent from the database is an error — compiling
     it would otherwise fail on the very header this feature exists to supply —
     and the message flags a same-name entry recorded under a different path.
+    With ``missing_ok`` (auto-discovered databases) an absent source instead
+    compiles without borrowed flags, after a one-time note per (db, source).
     """
     entries = load_compile_commands(db_path)
     want = Path(source).resolve()
@@ -174,6 +215,14 @@ def compile_commands_flags(db_path, source):
             return include_flags(tokens, directory)
         if Path(f).name == want.name:
             name_seen = True
+    if missing_ok:
+        key = (db_path, str(want))
+        if key not in _MISS_NOTED:
+            _MISS_NOTED.add(key)
+            print(f"note: {source} not in {db_path}; "
+                  "compiling without its include/define flags",
+                  file=sys.stderr)
+        return []
     hint = (f"; an entry named {want.name} exists under a different path — "
             "pass the source as it appears in the database") if name_seen else ""
     sys.exit(f"error: {source} not found in {db_path}{hint}")
@@ -395,31 +444,51 @@ def target_command(config, name, config_path):
         sys.exit(f"error: target [{name}]: flags must be an array of strings")
     flags = [os.path.expandvars(f) for f in flags]
     db = entry.get("compile_commands")
-    if db is not None:
+    discovered = False
+    if db is True:                       # opt in to CWD-based discovery
+        db, discovered = _discovered_db(f"target [{name}]"), True
+    elif db is False:
+        db = None
+    elif db is not None:
         if not isinstance(db, str):
             sys.exit(f"error: target [{name}]: compile_commands must be a "
-                     "path to a compile_commands.json")
+                     "path to a compile_commands.json, or true to search "
+                     "./, ./build, ../, ../build")
         db = os.path.expandvars(os.path.expanduser(db))
-    return Target(shlex.join([resolve_cc(cc, name), *flags]), db)
+    return Target(shlex.join([resolve_cc(cc, name), *flags]), db, discovered)
 
 
-def build_matrix(cc_args, target_args, config, config_path):
+def build_matrix(cc_args, target_args, config, config_path, db_arg=None):
     """Resolve the compiler matrix.
 
     --cc strings verbatim, then --target entries, in that order.  With
     neither, the config's `default` (a target name or list of names);
     with no config or no default, plain gcc/clang at -O3.
+
+    ``db_arg`` is the --compile-commands value: a PATH applies that
+    database to every entry, True discovers one near the CWD.  A target
+    whose config names its own compile_commands keeps it.
     """
     entries = list(cc_args)
     entries += [target_command(config, name, config_path)
                 for name in target_args]
-    if entries:
-        return entries
-    default = (config or {}).get("default")
-    if default:
-        names = [default] if isinstance(default, str) else list(default)
-        return [target_command(config, name, config_path) for name in names]
-    return [f"{cc} {FALLBACK_FLAGS}" for cc in DEFAULT_COMPILERS]
+    if not entries:
+        default = (config or {}).get("default")
+        if default:
+            names = [default] if isinstance(default, str) else list(default)
+            entries = [target_command(config, name, config_path)
+                       for name in names]
+        else:
+            entries = [f"{cc} {FALLBACK_FLAGS}" for cc in DEFAULT_COMPILERS]
+    if db_arg is not None:
+        if db_arg is True:
+            db, discovered = _discovered_db("--compile-commands"), True
+        else:
+            db = os.path.expandvars(os.path.expanduser(db_arg))
+            discovered = False
+        entries = [e if getattr(e, "compile_commands", None) is not None
+                   else Target(e, db, discovered) for e in entries]
+    return entries
 
 
 def asm_output_name(cc_cmd, harness):
@@ -449,7 +518,10 @@ def compile_to_asm(cc_cmd, extra_flags, harness, out_dir):
               file=sys.stderr)
         return None
     db = getattr(cc_cmd, "compile_commands", None)
-    db_flags = compile_commands_flags(db, harness) if db else []
+    db_flags = (compile_commands_flags(
+                    db, harness,
+                    missing_ok=getattr(cc_cmd, "db_discovered", False))
+                if db else [])
     out_s = Path(out_dir) / asm_output_name(shlex.join(argv + db_flags), harness)
     cmd = (argv + db_flags + list(extra_flags)
            + ["-S", "-o", str(out_s), str(harness)])
@@ -687,6 +759,12 @@ def main(argv=None):
                         help="named [table] from the config file, resolved "
                              "to a --cc entry (repeatable; appended to the "
                              "matrix after --cc entries)")
+    parser.add_argument("--compile-commands", nargs="?", const=True,
+                        default=None, metavar="PATH",
+                        help="borrow each source's include/define flags from "
+                             "a compile_commands.json; with no PATH, search "
+                             "./, ./build, ../, ../build.  A target whose "
+                             "config names its own compile_commands keeps it")
     parser.add_argument("--config", metavar="PATH",
                         help=f"config file; default search: {CONFIG_NAME} "
                              "next to SOURCE.c, in the current directory, "
@@ -702,7 +780,8 @@ def main(argv=None):
                      "use --across FUNC for two files")
     config_path = find_config(args.config, args.sources)
     config = load_config(config_path) if config_path else None
-    matrix = build_matrix(args.cc, args.target, config, config_path)
+    matrix = build_matrix(args.cc, args.target, config, config_path,
+                          args.compile_commands)
     if args.across and len(args.sources) == 1 and len(matrix) < 2:
         parser.error("--across on one file needs at least two --cc entries")
     for spec in args.pair:

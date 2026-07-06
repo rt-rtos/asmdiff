@@ -8,32 +8,31 @@
 #
 # Each [table] is a target usable as `--target NAME`; the optional
 # top-level `default` names the target(s) used when no --cc/--target
-# is given.  Compile at the flags your project ships with — that is
-# the whole point of the tool.
+# is given (a list runs several: default = ["gcc", "clang"]).
+# Compile at the flags your project ships with — that is the whole
+# point of the tool.
 
-default = "amy-host"
+default = "gcc"
 
-[amy-host]
+[gcc]
 cc = "gcc"
 flags = [
-  "-O3", "-Wall", "-Wno-strict-aliasing", "-Wextra",
-  "-Wno-unused-parameter", "-Wpointer-arith", "-Wno-float-conversion",
-  "-Wno-missing-declarations", "-DAMY_WAVETABLE",
-  # For harnesses that #include "amy.h", point at the AMY sources:
-  # "-I/path/to/amy/src",
+  "-O3", "-Wall", "-Wextra",
+  # Project-specific include paths and defines go here:
+  # "-I/path/to/project/src", "-DMY_FEATURE",
 ]
+
+[clang]
+cc = "clang"
+flags = ["-O3", "-Wall", "-Wextra"]
 
 # cc values may use ~, $VARS, and glob patterns.  A glob that matches
 # several installed toolchains resolves to the highest version-sorted
 # one (announced on stderr); pin the exact esp-NN directory instead if
 # reproducibility across sessions matters more than convenience.
-[s3-amy]
+[esp32s3]
 cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
-flags = [
-  "-O2", "-DAMY_USE_FIXEDPOINT", "-DNDEBUG",
-  "-Wno-strict-aliasing", "-Wno-float-conversion",
-  "-mlongcalls", "-Wpointer-arith",
-]
+flags = ["-O2", "-mlongcalls", "-DNDEBUG"]
 
 # A project source that pulls in framework headers (ESP-IDF's freertos/*,
 # esp_*, a generated sdkconfig.h, ...) needs the dozens of -I/-D flags its
@@ -41,9 +40,11 @@ flags = [
 # emits (idf.py leaves build/compile_commands.json), and asmdiff copies the
 # include/define flags recorded there for the file being compiled — so you
 # never transcribe include paths by hand.  The compiler and -O/-m flags
-# still come from cc/flags below; only the header environment is borrowed.
-# The value expands ~ and $VARS.
-[s3-idf]
+# still come from cc/flags; only the header environment is borrowed.
+# A path expands ~ and $VARS; `compile_commands = true` instead searches
+# ./, ./build, ../, ../build at run time (a source missing from a database
+# found that way is compiled without borrowed flags, with a note).
+[esp32s3-idf]
 cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
 flags = ["-O2", "-mlongcalls"]
-compile_commands = "$HOME/myproject/build/compile_commands.json"
+compile_commands = true

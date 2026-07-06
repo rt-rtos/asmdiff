@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "asmdiff"
-version = "0.1.0"
+version = "0.1.1"
 description = "Compare per-function assembly between paired C implementations"
 readme = "README.md"
 license = "MIT"
@@ -13,7 +13,11 @@ requires-python = ">=3.8"
 authors = [
     { name = "Rasmus Tikkanen" },
 ]
-keywords = ["assembly", "compiler", "gcc", "clang", "codegen", "disassembly"]
+keywords = [
+    "assembly", "compiler", "gcc", "clang", "disassembly", "codegen",
+    "diff", "static-analysis", "embedded", "firmware", "dsp",
+    "xtensa", "arm", "riscv", "cli", "devtools", "loop-analysis", "cfg"
+]
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",

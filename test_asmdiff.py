@@ -465,6 +465,124 @@ class TestTargetCompileCommands(unittest.TestCase):
         self.assertIsNone(getattr(matrix[0], "compile_commands", None))
 
 
+@contextlib.contextmanager
+def _inside(directory):
+    """Run a block with CWD set to ``directory`` (discovery is CWD-based)."""
+    prev = os.getcwd()
+    os.chdir(directory)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
+
+
+class TestFindCompileCommands(unittest.TestCase):
+    """Auto-discovery of compile_commands.json near the current directory."""
+
+    def _touch_db(self, directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "compile_commands.json").write_text("[]")
+
+    def test_search_order_cwd_build_parent_parentbuild(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "sub"
+            cwd.mkdir()
+            for where, expect in [(root / "build", root / "build"),
+                                  (root, root),
+                                  (cwd / "build", cwd / "build"),
+                                  (cwd, cwd)]:
+                self._touch_db(where)
+                with _inside(cwd):
+                    self.assertEqual(asmdiff.find_compile_commands(),
+                                     str(expect / "compile_commands.json"))
+
+    def test_nothing_found_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp) / "a" / "b"
+            cwd.mkdir(parents=True)
+            with _inside(cwd):
+                self.assertIsNone(asmdiff.find_compile_commands())
+
+
+class TestDiscoveredCompileCommands(unittest.TestCase):
+    """compile_commands = true in a target / bare --compile-commands."""
+
+    def test_target_true_discovers_and_is_soft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "build" / "compile_commands.json"
+            db.parent.mkdir()
+            db.write_text("[]")
+            cfg = {"t": {"cc": "gcc", "compile_commands": True}}
+            with _inside(tmp):
+                matrix = asmdiff.build_matrix([], ["t"], cfg, "c")
+            self.assertEqual(matrix[0].compile_commands, str(db))
+            self.assertTrue(matrix[0].db_discovered)
+
+    def test_target_true_with_no_db_anywhere_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp) / "a" / "b"
+            cwd.mkdir(parents=True)
+            cfg = {"t": {"cc": "gcc", "compile_commands": True}}
+            with _inside(cwd), self.assertRaises(SystemExit) as ctx:
+                asmdiff.build_matrix([], ["t"], cfg, "c")
+            self.assertIn("compile_commands.json", str(ctx.exception))
+
+    def test_target_false_means_off(self):
+        cfg = {"t": {"cc": "gcc", "compile_commands": False}}
+        matrix = asmdiff.build_matrix([], ["t"], cfg, "c")
+        self.assertIsNone(matrix[0].compile_commands)
+
+    def test_explicit_path_stays_hard(self):
+        cfg = {"t": {"cc": "gcc", "compile_commands": "/x/cc.json"}}
+        matrix = asmdiff.build_matrix([], ["t"], cfg, "c")
+        self.assertEqual(matrix[0].compile_commands, "/x/cc.json")
+        self.assertFalse(matrix[0].db_discovered)
+
+    def test_cli_bare_flag_fills_cc_and_default_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "compile_commands.json"
+            db.write_text("[]")
+            with _inside(tmp):
+                matrix = asmdiff.build_matrix(["gcc -O3"], [], None, None,
+                                              db_arg=True)
+                fallback = asmdiff.build_matrix([], [], None, None,
+                                                db_arg=True)
+        for entry in [matrix[0]] + list(fallback):
+            self.assertEqual(entry.compile_commands, str(db))
+            self.assertTrue(entry.db_discovered)
+
+    def test_cli_path_is_explicit_and_expanded(self):
+        os.environ["ASMDIFF_TEST_DB2"] = "/proj"
+        try:
+            matrix = asmdiff.build_matrix(["gcc -O3"], [], None, None,
+                                          db_arg="$ASMDIFF_TEST_DB2/cc.json")
+        finally:
+            del os.environ["ASMDIFF_TEST_DB2"]
+        self.assertEqual(matrix[0].compile_commands, "/proj/cc.json")
+        self.assertFalse(matrix[0].db_discovered)
+
+    def test_target_own_path_beats_cli(self):
+        cfg = {"t": {"cc": "gcc", "compile_commands": "/own/cc.json"}}
+        matrix = asmdiff.build_matrix([], ["t"], cfg, "c",
+                                      db_arg="/cli/cc.json")
+        self.assertEqual(matrix[0].compile_commands, "/own/cc.json")
+
+    def test_missing_source_soft_skips_with_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "compile_commands.json"
+            path.write_text(json.dumps([{"directory": tmp,
+                                         "file": f"{tmp}/a.c",
+                                         "command": "cc -Iinc -c a.c"}]))
+            asmdiff._DB_CACHE.clear()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                flags = asmdiff.compile_commands_flags(
+                    str(path), f"{tmp}/b.c", missing_ok=True)
+            self.assertEqual(flags, [])
+            self.assertIn("b.c", err.getvalue())
+
+
 class TestResolveCc(unittest.TestCase):
     def test_home_and_env_vars_expand(self):
         resolved = asmdiff.resolve_cc("~/bin/mycc", "t")
