@@ -92,6 +92,63 @@ exp2f/ldexpf analysis for both constant and runtime shift amounts:
 $ asmdiff asmdiff_example.c
 ```
 
+## Example: catching a silent software divide
+
+Timestamps on embedded targets are 64-bit microsecond counts, and a
+32-bit MCU has no 64-bit divide instruction: divide before narrowing and
+the compiler emits a call to a software divide routine; narrow before
+dividing and a constant divisor becomes an inline multiply-high. The two
+functions below differ only in which side of the division the cast sits
+on. Both compile clean under `-Wall -Wextra -Wconversion`: no compiler
+diagnostic reports that one of them contains a runtime library call.
+The `calls` column does:
+
+```c
+/* elapsed.c — timestamps are 64-bit µs; the delta fits in 32 bits */
+#include <stdint.h>
+uint32_t old_elapsed_ms(uint64_t now, uint64_t then) {
+    return (uint32_t)((now - then) / 1000);
+}
+uint32_t new_elapsed_ms(uint64_t now, uint64_t then) {
+    return (uint32_t)(now - then) / 1000;
+}
+```
+
+```
+$ asmdiff elapsed.c --cc 'xtensa-esp32s3-elf-gcc -O2 -mlongcalls'
+
+== xtensa-esp32s3-elf-gcc -O2 -mlongcalls ==
+
+old_elapsed_ms                               | new_elapsed_ms
+---------------------------------------------+---------------------------------------------
+entry   sp, 32                               | entry   sp, 32
+saltu   a11, a2, a4                          | l32r    a8, .LC0
+sub     a3, a3, a5                           | sub     a2, a2, a4
+sub     a10, a2, a4                          | muluh   a2, a2, a8
+movi    a12, 0x3e8                           | srli    a2, a2, 6
+movi.n  a13, 0                               | retw.n
+sub     a11, a3, a11                         |
+call8   __udivdi3                            |
+mov.n   a2, a10                              |
+retw.n                                       |
+
+function        role       insns  calls      loop spans
+old_elapsed_ms  baseline   10     __udivdi3  -
+new_elapsed_ms  candidate  6      -          -
+```
+
+The candidate is six inline instructions ending in a multiply-high by
+the reciprocal constant in `.LC0`. The baseline hands the division to
+`__udivdi3` - a software divide loop whose cost the visible 10
+instructions do not include. (The narrowing must of course be valid;
+here the delta is known to fit 32 bits.)
+
+Run the same file through host gcc and both columns are call-free, 8 vs
+5 instructions: x86-64 divides 64-bit integers in hardware, so the host
+matrix reports nothing worth fixing. The mistake only exists at the
+target. That is why the built-in gcc/clang matrix is only a fallback,
+and why named cross-compiler targets (below) exist.
+
 ## Quick inspect: one function, no comparison
 
 To just look at what a compiler emits for one function, name it after
@@ -109,6 +166,39 @@ A bare name is inspected as a function; an argument that exists on
 disk is a second source file, and a path-looking argument that does
 not exist is an error - a mistyped filename is never silently searched
 for as a symbol.
+
+With a single cross-compiler, inspecting a buffer-scaling loop looks
+like this:
+
+```
+$ asmdiff dsp_util.c apply_gain --cc 'xtensa-esp32s3-elf-gcc -O2 -mlongcalls'
+
+apply_gain:
+        entry   sp, 32
+        wfr     f1, a4
+        blti    a3, 1, .L1
+        slli    a8, a3, 2
+        addi    a8, a8, -4
+        srli    a8, a8, 2
+        addi.n  a8, a8, 1
+        loop    a8, .L3_LEND
+.L3:
+        lsi     f0, a2, 0
+        mul.s   f0, f0, f1
+        ssi     f0, a2, 0
+        addi.n  a2, a2, 4
+.L3_LEND:
+.L1:
+        retw.n
+
+function    insns  calls  loop spans
+apply_gain  13     -      .L3_LEND:4
+```
+
+The span `.L3_LEND:4` is the four-instruction body of the Xtensa
+zero-overhead loop (`loop a8, .L3_LEND`: hardware repetition, no branch;
+see [How a span is found](#how-a-span-is-found)): the part that runs per
+element, as opposed to the whole-function count of 13.
 
 ## Command reference
 
@@ -395,16 +485,7 @@ movl    (%r8), %r11d                         | movdqu  (%r8), %xmm0
 movl    8(%r8), %r10d                        | pushq   %r13
 pushq   %r15                                 | pushq   %r12
 xorl    %r9d, %r9d                           | pshufd  $255, %xmm0, %xmm1
-pushq   %r14                                 | pushq   %rbp
-movl    4(%r8), %r15d                        | movd    %xmm1, %ebp
-pushq   %r13                                 | movdqa  %xmm0, %xmm1
-movl    12(%r8), %r13d                       | pushq   %rbx
-pushq   %r12                                 | punpckhdq       %xmm0, %xmm1
-movl    %edx, %r12d                          | movd    %xmm1, %r10d
-pushq   %rbp                                 | pshufd  $85, %xmm0, %xmm1
-movq    %rsi, %rbp                           | testl   %edx, %edx
-pushq   %rbx                                 | jle     .L24
-movq    %rdi, %rbx                           | movslq  %edx, %rdx
+  [... 10 rows omitted ...]
 .L27:                                        | movd    %xmm1, %r12d
 cmpl    %r9d, %r12d                          | movd    %xmm0, %r11d
 jle     .L30                                 | movq    %rsi, %r9
@@ -422,75 +503,17 @@ movl    %r11d, %r15d                         | addl    $1024, %ebp
 addl    %eax, %edx                           | sarl    $11, %r12d
 movl    %r14d, %r11d                         | sarl    $11, %ebp
 call    SMULR6                               | leal    1024(%rax), %edx
-movl    12(%rcx), %edi                       | leal    1024(%r11), %eax
-movl    %r10d, %esi                          | sarl    $11, %eax
-addl    %eax, %edx                           | sarl    $11, %edx
-call    SMULR6                               | leal    1024(%rdi), %r13d
-movl    16(%rcx), %edi                       | imull   %eax, %edx
-movl    %r13d, %esi                          | movl    (%rcx), %eax
-movl    %r10d, %r13d                         | sarl    $11, %r13d
-subl    %eax, %edx                           | addl    $1024, %eax
-call    SMULR6                               | sarl    $11, %eax
-movl    %eax, %esi                           | addl    $1, %edx
-movl    %edx, %eax                           | imull   %r13d, %eax
-subl    %esi, %eax                           | sarl    %edx
-movl    %eax, 0(%rbp,%r9,4)                  | addl    $1, %eax
-movl    %eax, %r10d                          | sarl    %eax
-incq    %r9                                  | addl    %eax, %edx
-jmp     .L27                                 | movl    8(%rcx), %eax
-.L30:                                        | addl    $1024, %eax
-popq    %rbx                                 | sarl    $11, %eax
-movl    %r15d, 4(%r8)                        | imull   %r12d, %eax
-xorl    %eax, %eax                           | leal    1024(%r10), %r12d
-popq    %rbp                                 | sarl    $11, %r12d
-popq    %r12                                 | addl    $1, %eax
-movl    %r13d, 12(%r8)                       | sarl    %eax
-movl    %r11d, (%r8)                         | addl    %edx, %eax
-popq    %r13                                 | movl    12(%rcx), %edx
-movl    %r10d, 8(%r8)                        | addl    $1024, %edx
-popq    %r14                                 | sarl    $11, %edx
-popq    %r15                                 | imull   %r12d, %edx
-ret                                          | movl    %r11d, %r12d
-                                             | addl    $1, %edx
-                                             | sarl    %edx
-                                             | subl    %edx, %eax
-                                             | movl    16(%rcx), %edx
-                                             | addl    $1024, %edx
-                                             | sarl    $11, %edx
-                                             | imull   %ebp, %edx
-                                             | movl    %r10d, %ebp
-                                             | addl    $1, %edx
-                                             | addq    $4, %rsi
-                                             | addq    $4, %r9
-                                             | sarl    %edx
-                                             | subl    %edx, %eax
-                                             | movl    %eax, -4(%r9)
-                                             | cmpq    %rsi, %rbx
-                                             | jne     .L26
-                                             | movd    %eax, %xmm1
-                                             | movd    %r10d, %xmm2
-                                             | movd    %edi, %xmm0
-                                             | movd    %r11d, %xmm3
-                                             | punpckldq       %xmm2, %xmm1
-                                             | punpckldq       %xmm3, %xmm0
-                                             | punpcklqdq      %xmm1, %xmm0
-                                             | .L24:
-                                             | popq    %rbx
-                                             | xorl    %eax, %eax
-                                             | popq    %rbp
-                                             | movups  %xmm0, (%r8)
-                                             | popq    %r12
-                                             | popq    %r13
-                                             | ret
+  [... 60 rows omitted ...]
 
 function                     role       insns  calls   loop spans
 dsps_biquad_f32_ansi [cc#1]  baseline   59     SMULR6  .L27:32
 dsps_biquad_f32_ansi [cc#2]  candidate  89     -       .L26:54
 ```
 
-(The columns describe, they don't rank: here `-O3` is bigger by every
-count, and only the listing shows why — `SMULR6` inlined into the loop
-body, vector setup around it. Whether that trade is good is your call.)
+(The listing is abridged here; the tool prints all 92 rows. The columns
+describe, they don't rank: here `-O3` is bigger by every count, and only
+the listing shows why — `SMULR6` inlined into the loop body, vector setup
+around it. Whether that trade is good is your call.)
 
 The output prints a legend mapping `cc#N` tags to the full compiler
 invocations, then one section per baseline/candidate pairing. Runnable
