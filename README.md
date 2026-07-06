@@ -127,14 +127,14 @@ default = "esp32s3"         # target(s) used when no --cc/--target is given
 [esp32s3]                    # production-like ESP32-S3 codegen
 cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
 flags = [
-  "-O2", "-DMY_FIXEDPOINT", "-DNDEBUG",
+  "-O2", "-DMY_FEATURE", "-DNDEBUG",
   "-Wno-strict-aliasing", "-mlongcalls",
   "-I$HOME/project/components/dsp/include",
 ]
 
 [host]                       # same defines on host gcc
 cc = "gcc"
-flags = ["-O2", "-DMY_FIXEDPOINT", "-I$HOME/project/components/dsp/include"]
+flags = ["-O2", "-DMY_FEATURE", "-I$HOME/project/components/dsp/include"]
 ```
 
 `cc` values expand `~` and `$VARS` and may be glob patterns, so a config
@@ -183,6 +183,7 @@ recording the exact flags for every source it builds (ESP-IDF writes one to
 cc = "xtensa-esp32s3-elf-gcc"
 flags = ["-O2", "-mlongcalls"]
 compile_commands = "$HOME/myproject/build/compile_commands.json"
+
 ```
 
 Now `asmdiff.py $HOME/myproject/components/dsp/biquad.c --target esp32s3-idf`
