@@ -34,3 +34,16 @@ flags = [
   "-Wno-strict-aliasing", "-Wno-float-conversion",
   "-mlongcalls", "-Wpointer-arith",
 ]
+
+# A project source that pulls in framework headers (ESP-IDF's freertos/*,
+# esp_*, a generated sdkconfig.h, ...) needs the dozens of -I/-D flags its
+# build system passes.  Point `compile_commands` at the database that build
+# emits (idf.py leaves build/compile_commands.json), and asmdiff copies the
+# include/define flags recorded there for the file being compiled — so you
+# never transcribe include paths by hand.  The compiler and -O/-m flags
+# still come from cc/flags below; only the header environment is borrowed.
+# The value expands ~ and $VARS.
+[s3-idf]
+cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+flags = ["-O2", "-mlongcalls"]
+compile_commands = "$HOME/myproject/build/compile_commands.json"

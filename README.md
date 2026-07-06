@@ -161,6 +161,54 @@ included `asmdiff.example.toml` is a starting point. If a flag or include
 path must vary per machine, that's what per-machine config files are for —
 nothing lives in the tool.
 
+### Borrowing includes from `compile_commands.json`
+
+A real project source rarely compiles with a handful of `-I` flags. An
+ESP-IDF component pulls in `freertos/FreeRTOS.h`, `esp_*` headers, and a
+*generated* `sdkconfig.h`, reachable only through the dozens of `-I`/`-D`
+flags the build system computes — none of which live in the source file.
+That is why `asmdiff.py component.c` fails with `freertos/FreeRTOS.h: No
+such file or directory`: not a wrong compiler (the xtensa toolchain ships
+no FreeRTOS either), just missing include paths. Transcribing them by hand
+is miserable.
+
+So don't. Any build that uses CMake or Ninja can emit a
+[`compile_commands.json`](https://clang.llvm.org/docs/JSONCompilationDatabase.html)
+recording the exact flags for every source it builds (ESP-IDF writes one to
+`build/compile_commands.json` on every `idf.py build`). Point a target at it:
+
+```toml
+[s3-idf]
+cc = "xtensa-esp32s3-elf-gcc"
+flags = ["-O2", "-mlongcalls"]
+compile_commands = "$HOME/myproject/build/compile_commands.json"
+```
+
+Now `asmdiff.py $HOME/myproject/components/dsp/biquad.c --target s3-idf`
+finds that file's entry in the database and adds the include/define flags
+it recorded — `-I`, `-isystem`, `-iquote`, `-idirafter`, `-include`,
+`-imacros`, `-D`, `-U` — to this target's command. Everything else the
+database records (its own compiler, `-O`/`-std`/`-W` flags, `-c`, `-o`, the
+source) is ignored: **you** own the compiler and optimisation flags via
+`cc`/`flags`; only the header environment is borrowed. That split is the
+point — you can now sweep *your* `-O`/`-m` variations over a source that
+only ever compiled one way under the build system.
+
+Details that make it robust:
+
+- **Paths are made absolute** against each entry's `directory`, so a
+  database full of build-relative `-I../include` flags still resolves when
+  asmdiff runs from anywhere.
+- **Per source file.** The lookup keys on the source you pass (matched by
+  resolved absolute path), so two files in an `--across`/summary run each
+  get their own recorded flags.
+- **Absent source is an error**, not a silent empty flag set — otherwise
+  you'd just hit the missing-header failure this feature exists to prevent.
+  The message flags a same-basename entry recorded under a different path.
+- **`compile_commands` expands `~` and `$VARS`.** The `==` header always
+  prints the resolved compiler command; run with `-- -v` if you want to see
+  every include path the compiler actually received.
+
 ## Whole-file summary
 
 With no `--pair`, no `--across`, and no `old_*`/`new_*` functions to

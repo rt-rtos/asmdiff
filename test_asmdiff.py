@@ -2,6 +2,7 @@
 """Unit tests for asmdiff.py.  Run: python3 tools/asmdiff/test_asmdiff.py -v"""
 import contextlib
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -344,6 +345,124 @@ class TestBuildMatrix(unittest.TestCase):
         cfg = {"bad": {"flags": ["-O3"]}}
         with self.assertRaises(SystemExit):
             asmdiff.build_matrix([], ["bad"], cfg, "cfg.toml")
+
+
+class TestIncludeFlags(unittest.TestCase):
+    """Lifting include/define flags out of one recorded compile command."""
+
+    def test_glued_and_split_include_paths(self):
+        toks = ["cc", "-Iinc", "-I", "inc2", "-c", "a.c"]
+        self.assertEqual(asmdiff.include_flags(toks, "/build"),
+                         ["-I", "/build/inc", "-I", "/build/inc2"])
+
+    def test_absolute_paths_left_alone(self):
+        self.assertEqual(asmdiff.include_flags(["-I/abs/inc"], "/build"),
+                         ["-I", "/abs/inc"])
+
+    def test_defines_glued_and_split(self):
+        self.assertEqual(
+            asmdiff.include_flags(["-DFOO=1", "-D", "BAR", "-UNDEBUG"], "/b"),
+            ["-DFOO=1", "-DBAR", "-UNDEBUG"])
+
+    def test_system_and_forced_include_families(self):
+        toks = ["-isystem", "sys", "-iquote", "q", "-idirafter", "d",
+                "-include", "cfg.h", "-imacros", "m.h"]
+        self.assertEqual(
+            asmdiff.include_flags(toks, "/build"),
+            ["-isystem", "/build/sys", "-iquote", "/build/q",
+             "-idirafter", "/build/d", "-include", "/build/cfg.h",
+             "-imacros", "/build/m.h"])
+
+    def test_non_include_flags_and_source_dropped(self):
+        toks = ["gcc", "-O2", "-std=c11", "-Wall", "-g", "-c", "a.c",
+                "-o", "a.o", "-Iinc"]
+        self.assertEqual(asmdiff.include_flags(toks, "/b"), ["-I", "/b/inc"])
+
+    def test_dangling_flag_at_end_ignored(self):
+        self.assertEqual(asmdiff.include_flags(["-Iinc", "-I"], "/b"),
+                         ["-I", "/b/inc"])
+
+    def test_lowercase_isystem_not_split_as_capital_I(self):
+        # -isystem must not be read as -I + "system".
+        self.assertEqual(asmdiff.include_flags(["-isystem", "/s"], ""),
+                         ["-isystem", "/s"])
+
+
+class TestCompileCommandsFlags(unittest.TestCase):
+    def _db(self, tmp, entries):
+        path = Path(tmp) / "compile_commands.json"
+        path.write_text(json.dumps(entries))
+        asmdiff._DB_CACHE.clear()
+        return str(path)
+
+    def test_matches_by_resolved_path_command_string(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src" / "foo.c"
+            src.parent.mkdir()
+            src.touch()
+            db = self._db(tmp, [{
+                "directory": tmp, "file": str(src),
+                "command": f"cc -Iinc -DX=1 -c {src} -o foo.o"}])
+            self.assertEqual(asmdiff.compile_commands_flags(db, str(src)),
+                             ["-I", f"{tmp}/inc", "-DX=1"])
+
+    def test_matches_relative_file_and_arguments_array(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "foo.c"
+            src.touch()
+            db = self._db(tmp, [{
+                "directory": tmp, "file": "foo.c",
+                "arguments": ["cc", "-Iinc", "-c", "foo.c"]}])
+            self.assertEqual(asmdiff.compile_commands_flags(db, str(src)),
+                             ["-I", f"{tmp}/inc"])
+
+    def test_missing_source_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp, [{"directory": tmp, "file": f"{tmp}/a.c",
+                                 "command": "cc -c a.c"}])
+            with self.assertRaises(SystemExit) as ctx:
+                asmdiff.compile_commands_flags(db, f"{tmp}/b.c")
+            self.assertIn("not found", str(ctx.exception))
+
+    def test_same_name_different_path_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp, [{"directory": tmp,
+                                 "file": f"{tmp}/other/foo.c",
+                                 "command": "cc -c foo.c"}])
+            with self.assertRaises(SystemExit) as ctx:
+                asmdiff.compile_commands_flags(db, f"{tmp}/foo.c")
+            self.assertIn("different path", str(ctx.exception))
+
+    def test_bad_json_shape_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cc.json"
+            path.write_text('{"not": "a list"}')
+            asmdiff._DB_CACHE.clear()
+            with self.assertRaises(SystemExit):
+                asmdiff.compile_commands_flags(str(path), "x.c")
+
+
+class TestTargetCompileCommands(unittest.TestCase):
+    def test_target_carries_expanded_db_path(self):
+        os.environ["ASMDIFF_TEST_DB"] = "/proj/build"
+        try:
+            cfg = {"t": {"cc": "gcc", "flags": ["-O2"],
+                         "compile_commands": "$ASMDIFF_TEST_DB/cc.json"}}
+            matrix = asmdiff.build_matrix([], ["t"], cfg, "c")
+            self.assertEqual(matrix, ["gcc -O2"])          # str value unchanged
+            self.assertEqual(matrix[0].compile_commands,
+                             "/proj/build/cc.json")         # attribute carried
+        finally:
+            del os.environ["ASMDIFF_TEST_DB"]
+
+    def test_compile_commands_must_be_a_string(self):
+        cfg = {"t": {"cc": "gcc", "flags": [], "compile_commands": ["x"]}}
+        with self.assertRaises(SystemExit):
+            asmdiff.build_matrix([], ["t"], cfg, "c")
+
+    def test_cc_entries_have_no_db_attribute(self):
+        matrix = asmdiff.build_matrix(["gcc -O3"], [], None, None)
+        self.assertIsNone(getattr(matrix[0], "compile_commands", None))
 
 
 class TestResolveCc(unittest.TestCase):

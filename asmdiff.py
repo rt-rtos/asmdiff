@@ -28,10 +28,16 @@ Compilers come from --cc strings, from named targets in an asmdiff.toml
 config file (--target NAME), from the config's `default` entry, or —
 failing all of those — plain `gcc -O3` and `clang -O3`.
 Flags after a bare `--` are appended to every compiler invocation.
+
+A config target may name a compile_commands.json (compile_commands = PATH):
+the include/define flags recorded there for the source being compiled are
+added to that target's command, so a real project source resolves its
+headers the way its own build system does (e.g. an ESP-IDF component).
 """
 import argparse
 import glob
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -50,6 +56,127 @@ except ModuleNotFoundError:
 DEFAULT_COMPILERS = ["gcc", "clang"]
 FALLBACK_FLAGS = "-O3"
 CONFIG_NAME = "asmdiff.toml"
+
+# Preprocessor flags lifted from a compile_commands.json entry so a project
+# source compiles the way its build system compiles it: header search paths,
+# forced includes, and defines.  Everything else the entry records (the
+# compiler, -O/-std/-W flags, -c, -o OUT, the source itself) is ignored —
+# asmdiff supplies the compiler and optimisation flags from the target.
+# Path-bearing flags may be glued (-Ipath) or split (-I path); defines too
+# (-DFOO / -D FOO).  None of the path flags is a prefix of another and -I is
+# case-distinct from -i*, so a single left-to-right scan is unambiguous.
+_CC_DB_PATH_FLAGS = ("-I", "-iquote", "-isystem", "-idirafter",
+                     "-include", "-imacros", "-isysroot")
+_CC_DB_PLAIN_FLAGS = ("-D", "-U")
+_DB_CACHE = {}
+
+
+class Target(str):
+    """A compiler-matrix entry: the ``CC FLAGS`` command string, plus an
+    optional compile_commands.json whose per-source include/define flags are
+    appended at compile time.  Subclassing str means it prints, compares, and
+    shlex-splits as the bare command everywhere the matrix is consumed, so
+    only compile_to_asm needs to know about the extra attribute."""
+
+    def __new__(cls, cmd, compile_commands=None):
+        self = super().__new__(cls, cmd)
+        self.compile_commands = compile_commands
+        return self
+
+
+def _abs_against(directory, value):
+    """Resolve a path recorded in a compile_commands entry against that
+    entry's ``directory``, so a relative -I still works from asmdiff's CWD."""
+    p = Path(value)
+    if directory and not p.is_absolute():
+        p = Path(directory) / p
+    return str(p)
+
+
+def include_flags(tokens, directory):
+    """Pick header-search, forced-include, and define flags out of one
+    recorded compile command; make relative paths absolute against
+    ``directory``.  Glued and split spellings are both recognised; path
+    flags are re-emitted in split form (-I path), which every driver accepts.
+    """
+    flags = []
+    i, n = 0, len(tokens)
+    while i < n:
+        tok, extra, matched = tokens[i], 0, False
+        for f in _CC_DB_PATH_FLAGS:
+            if tok == f and i + 1 < n:                    # -I path
+                flags += [f, _abs_against(directory, tokens[i + 1])]
+                extra, matched = 1, True
+                break
+            if tok.startswith(f) and len(tok) > len(f):   # -Ipath
+                flags += [f, _abs_against(directory, tok[len(f):])]
+                matched = True
+                break
+        if not matched:
+            for f in _CC_DB_PLAIN_FLAGS:
+                if tok == f and i + 1 < n:                # -D FOO
+                    flags.append(f + tokens[i + 1])
+                    extra = 1
+                    break
+                if tok.startswith(f) and len(tok) > len(f):  # -DFOO
+                    flags.append(tok)
+                    break
+        i += 1 + extra
+    return flags
+
+
+def load_compile_commands(path):
+    """Parse a compile_commands.json into its list of entries (cached, since
+    one database is queried once per source per compiler in the matrix)."""
+    if path in _DB_CACHE:
+        return _DB_CACHE[path]
+    try:
+        data = json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        sys.exit(f"error: compile_commands.json not found: {path}")
+    except (json.JSONDecodeError, OSError) as exc:
+        sys.exit(f"error: {path}: {exc}")
+    if not isinstance(data, list):
+        sys.exit(f"error: {path}: expected a JSON array of compile entries")
+    _DB_CACHE[path] = data
+    return data
+
+
+def compile_commands_flags(db_path, source):
+    """Header/define flags for ``source`` taken from a compile_commands.json.
+
+    The entry whose ``file`` resolves to the same path as ``source`` supplies
+    its include/define flags (relative paths made absolute against the entry's
+    ``directory``).  A ``command`` string is tokenised; an ``arguments`` array
+    is used as-is.  A source absent from the database is an error — compiling
+    it would otherwise fail on the very header this feature exists to supply —
+    and the message flags a same-name entry recorded under a different path.
+    """
+    entries = load_compile_commands(db_path)
+    want = Path(source).resolve()
+    name_seen = False
+    for entry in entries:
+        f = entry.get("file")
+        if not f:
+            continue
+        directory = entry.get("directory", "")
+        fp = Path(f)
+        if not fp.is_absolute():
+            fp = Path(directory) / fp
+        try:
+            same = fp.resolve() == want
+        except OSError:
+            same = False
+        if same:
+            args = entry.get("arguments")
+            tokens = (list(args) if isinstance(args, list)
+                      else shlex.split(entry.get("command", "")))
+            return include_flags(tokens, directory)
+        if Path(f).name == want.name:
+            name_seen = True
+    hint = (f"; an entry named {want.name} exists under a different path — "
+            "pass the source as it appears in the database") if name_seen else ""
+    sys.exit(f"error: {source} not found in {db_path}{hint}")
 
 # A label at column 0 that is not a local (.L*) label starts a function.
 FUNC_LABEL = re.compile(r"^([A-Za-z_][\w$.]*):")
@@ -267,7 +394,13 @@ def target_command(config, name, config_path):
     if isinstance(flags, str) or not all(isinstance(f, str) for f in flags):
         sys.exit(f"error: target [{name}]: flags must be an array of strings")
     flags = [os.path.expandvars(f) for f in flags]
-    return shlex.join([resolve_cc(cc, name), *flags])
+    db = entry.get("compile_commands")
+    if db is not None:
+        if not isinstance(db, str):
+            sys.exit(f"error: target [{name}]: compile_commands must be a "
+                     "path to a compile_commands.json")
+        db = os.path.expandvars(os.path.expanduser(db))
+    return Target(shlex.join([resolve_cc(cc, name), *flags]), db)
 
 
 def build_matrix(cc_args, target_args, config, config_path):
@@ -305,7 +438,9 @@ def asm_output_name(cc_cmd, harness):
 def compile_to_asm(cc_cmd, extra_flags, harness, out_dir):
     """Run one compiler to -S; return the asm text.
 
-    Returns None (with a warning) if the compiler is not on PATH.
+    If the matrix entry names a compile_commands.json, this source's
+    include/define flags from that database are inserted before any bare-``--``
+    flags.  Returns None (with a warning) if the compiler is not on PATH.
     Exits with the compiler's stderr on a compile failure.
     """
     argv = shlex.split(cc_cmd)
@@ -313,8 +448,11 @@ def compile_to_asm(cc_cmd, extra_flags, harness, out_dir):
         print(f"warning: {argv[0]} not found on PATH, skipping",
               file=sys.stderr)
         return None
-    out_s = Path(out_dir) / asm_output_name(cc_cmd, harness)
-    cmd = argv + list(extra_flags) + ["-S", "-o", str(out_s), str(harness)]
+    db = getattr(cc_cmd, "compile_commands", None)
+    db_flags = compile_commands_flags(db, harness) if db else []
+    out_s = Path(out_dir) / asm_output_name(shlex.join(argv + db_flags), harness)
+    cmd = (argv + db_flags + list(extra_flags)
+           + ["-S", "-o", str(out_s), str(harness)])
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         sys.exit(f"error: compile failed: {' '.join(cmd)}\n{proc.stderr}")
