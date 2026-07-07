@@ -1189,9 +1189,70 @@ class TestFormatCalls(unittest.TestCase):
     def test_long_list_capped(self):
         calls = [f"fn{i}" for i in range(12)]
         out = asmdiff.format_calls(calls)
-        self.assertTrue(out.endswith("+4 more"))
+        self.assertTrue(out.endswith("Total Calls:12"))
         self.assertIn("fn7", out)
         self.assertNotIn("fn8,", out)
+
+
+class TestTableMaxWidth(unittest.TestCase):
+    """render_table(max_width=) fits rows to the terminal by trimming
+    the last column only, whole callees at a time, replacing the tail
+    with (or preserving) a Total Calls:N summary."""
+
+    def test_no_max_width_keeps_long_cells(self):
+        rows = [("function", "calls"),
+                ("f", "alpha, bravo, charlie, delta")]
+        out = asmdiff.render_table(rows)
+        self.assertIn("alpha, bravo, charlie, delta", out)
+
+    def test_trims_to_fit_with_total_summary(self):
+        rows = [("function", "insns", "calls"),
+                ("f", "5", "alpha, bravo, charlie, delta")]
+        out = asmdiff.render_table(rows, max_width=37)
+        self.assertIn("alpha, Total Calls:4", out)
+        self.assertNotIn("bravo", out)
+        self.assertTrue(all(len(l) <= 37 for l in out.splitlines()))
+
+    def test_fitting_cell_left_alone(self):
+        rows = [("function", "calls"), ("f", "alpha, bravo")]
+        out = asmdiff.render_table(rows, max_width=80)
+        self.assertIn("alpha, bravo", out)
+        self.assertNotIn("Total Calls", out)
+
+    def test_merges_existing_total_summary(self):
+        rows = [("fn", "calls"), ("f", "a, b, c, Total Calls:12")]
+        out = asmdiff.render_table(rows, max_width=21)
+        self.assertIn("a, Total Calls:12", out)
+        self.assertNotIn("b", out.splitlines()[1])
+
+    def test_single_callee_never_dropped(self):
+        rows = [("fn", "calls"), ("f", "very_long_single_symbol_name")]
+        out = asmdiff.render_table(rows, max_width=10)
+        self.assertIn("very_long_single_symbol_name", out)
+
+    def test_dash_cell_untouched(self):
+        rows = [("function_with_a_very_long_header", "calls"), ("f", "-")]
+        out = asmdiff.render_table(rows, max_width=10)
+        self.assertRegex(out.splitlines()[1], r"f\s+-")
+
+    def test_inspect_table_passes_max_width(self):
+        funcs = {"f": ["call\talpha", "call\tbravo",
+                       "call\tcharlie", "call\tdelta", "ret"]}
+        out = asmdiff.inspect_table(["f"], funcs, max_width=49)
+        self.assertIn("alpha, Total Calls:4", out)
+        self.assertNotIn("bravo", out)
+
+    def test_table_width_is_terminal_width_on_tty(self):
+        with mock.patch.object(asmdiff.sys.stdout, "isatty",
+                               return_value=True), \
+             mock.patch.object(asmdiff.shutil, "get_terminal_size",
+                               return_value=os.terminal_size((100, 24))):
+            self.assertEqual(asmdiff.table_width(), 100)
+
+    def test_table_width_is_none_when_piped(self):
+        with mock.patch.object(asmdiff.sys.stdout, "isatty",
+                               return_value=False):
+            self.assertIsNone(asmdiff.table_width())
 
 
 class TestDiscoveredCompileCommands(unittest.TestCase):
@@ -1341,15 +1402,16 @@ class TestRendering(unittest.TestCase):
         lines = out.splitlines()
         self.assertIn("function", lines[0])
         self.assertIn("loop spans", lines[0])
+        self.assertTrue(lines[0].endswith("calls"))
         self.assertRegex(lines[1], r"old_c\s+baseline\s+2\s+-\s+-")
-        self.assertRegex(lines[2], r"new_c\s+candidate\s+1\s+ldexpf\s+-")
+        self.assertRegex(lines[2], r"new_c\s+candidate\s+1\s+-\s+ldexpf")
 
     def test_summary_table_loop_spans_column(self):
         funcs = {"a": [".L2:", "addl\t$1, %eax", "jne\t.L2"],
                  "b": ["ret"]}
         out = asmdiff.summary_table([("a", "b")], funcs)
         lines = out.splitlines()
-        self.assertRegex(lines[1], r"a\s+baseline\s+2\s+-\s+\.L2:2")
+        self.assertRegex(lines[1], r"a\s+baseline\s+2\s+\.L2:2\s+-")
         self.assertRegex(lines[2], r"b\s+candidate\s+1\s+-\s+-")
 
     def test_file_summary_totals_and_call_union(self):
@@ -1358,10 +1420,10 @@ class TestRendering(unittest.TestCase):
                        "call\tmalloc", "call\tfree", "ret"]}
         out = asmdiff.file_summary_table(funcs)
         lines = out.splitlines()
-        self.assertRegex(lines[1], r"f\s+2\s+malloc\s+-")
-        self.assertRegex(lines[2], r"g\s+5\s+malloc, free\s+\.L2:2")
+        self.assertRegex(lines[1], r"f\s+2\s+-\s+malloc")
+        self.assertRegex(lines[2], r"g\s+5\s+\.L2:2\s+malloc, free")
         self.assertRegex(lines[3],
-                         r"TOTAL \(2 functions\)\s+7\s+malloc, free\s+-")
+                         r"TOTAL \(2 functions\)\s+7\s+-\s+malloc, free")
 
 
 class TestInspectRendering(unittest.TestCase):
@@ -1379,13 +1441,13 @@ class TestInspectRendering(unittest.TestCase):
         lines = out.splitlines()
         self.assertIn("function", lines[0])
         self.assertEqual(len(lines), 2)      # header + the one function
-        self.assertRegex(lines[1], r"new_const\s+2\s+ldexpf\s+-")
+        self.assertRegex(lines[1], r"new_const\s+2\s+-\s+ldexpf")
         self.assertNotIn("TOTAL", out)
 
     def test_inspect_table_loop_spans(self):
         funcs = asmdiff.extract_functions(LOOP_ASM)
         out = asmdiff.inspect_table(["looper"], funcs)
-        self.assertRegex(out.splitlines()[1], r"looper\s+5\s+-\s+\.L2:3")
+        self.assertRegex(out.splitlines()[1], r"looper\s+5\s+\.L2:3\s+-")
 
 
 class TestRunInspect(unittest.TestCase):

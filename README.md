@@ -12,7 +12,7 @@
 does the compiler actually emit - before and after?** It compiles a small
 harness file across a matrix of compilers, extracts each variant function's
 assembly, and prints side-by-side listings plus a summary of instruction
-counts, outbound calls, and loop spans.
+counts, loop spans, and outbound calls.
 
 Compilers and flags are configured per project through named targets in an
 `asmdiff.toml` file, and any GNU-as ELF assembly is parsed.
@@ -76,9 +76,9 @@ endbr64                                      | endbr64
 mulss   .LC0(%rip), %xmm0                    | movl    $-5, %edi
 ret                                          | jmp     ldexpf@PLT
 
-function   role       insns  calls   loop spans
-old_scale  baseline   3      -       -
-new_scale  candidate  3      ldexpf  -
+function   role       insns  loop spans  calls
+old_scale  baseline   3      -           -
+new_scale  candidate  3      -           ldexpf
 ```
 
 Read the `calls` column first: `-` means the construct lowered to inline
@@ -139,9 +139,9 @@ call8   __udivdi3                            |
 mov.n   a2, a10                              |
 retw.n                                       |
 
-function        role       insns  calls      loop spans
-old_elapsed_ms  baseline   10     __udivdi3  -
-new_elapsed_ms  candidate  6      -          -
+function        role       insns  loop spans  calls
+old_elapsed_ms  baseline   10     -           __udivdi3
+new_elapsed_ms  candidate  6      -           -
 ```
 
 The candidate is six inline instructions ending in a multiply-high by
@@ -198,8 +198,8 @@ apply_gain:
 .L1:
         retw.n
 
-function    insns  calls  loop spans
-apply_gain  13     -      .L3_LEND:4
+function    insns  loop spans  calls
+apply_gain  13     .L3_LEND:4  -
 ```
 
 The span `.L3_LEND:4` is the four-instruction body of the Xtensa
@@ -228,11 +228,11 @@ $ asmdiff build/S3-Amysynth.elf --filter '^render_' # stats table only
 ```
 
 ```
-function                    insns  calls               loop spans
-render_lut_cub              98     -                   .L32:74
-render_lut                  51     -                   .L7e_LEND:32
-render_external_audio_in    32     -                   .L52_LEND:10
-render_partial              112    exp2f, __divsf3, ...  .L66:31
+function                    insns  loop spans    calls
+render_lut_cub              98     .L32:74       -
+render_lut                  51     .L7e_LEND:32  -
+render_external_audio_in    32     .L52_LEND:10  -
+render_partial              112    .L66:31       exp2f, __divsf3, ...
 ```
 
 (Four of the eleven matched rows shown.) The columns are the same as
@@ -262,10 +262,10 @@ one row scan.
 ```
 $ asmdiff build/S3-Amysynth.elf --filter 'sequencer_(process_tick|recompute|timer_callback)'
 
-function                             insns  calls                                                           loop spans
-sequencer_timer_callback$lto_priv$0  77     __divsf3, __udivdi3                                             .L21:41
-sequencer_recompute                  46     __extendsfdf2, __divdf3, __muldf3, __fixunsdfsi, __divsf3       -
-sequencer_process_tick$lto_priv$0    117    xQueueSemaphoreTake, xQueueGenericSend, add_delta_to_queue, a8  .L2e:96 .L48:85 .L8d:6
+function                             insns  loop spans              calls
+sequencer_timer_callback$lto_priv$0  77     .L21:41                 __divsf3, __udivdi3
+sequencer_recompute                  46     -                       __extendsfdf2, __divdf3, __muldf3, __fixunsdfsi, __divsf3
+sequencer_process_tick$lto_priv$0    117    .L2e:96 .L48:85 .L8d:6  xQueueSemaphoreTake, xQueueGenericSend, add_delta_to_queue, a8
 ```
 
 A timer callback pays a software float divide *and* a 64-bit
@@ -607,14 +607,14 @@ $ asmdiff old/delay.c new/delay.c
 
 -- old/delay.c --
 
-function         insns  calls        loop spans
-stereo_reverb    437    -            .L108:327
+function         insns  loop spans  calls
+stereo_reverb    437    .L108:327   -
 ...
-TOTAL (13 functions)  956   malloc_caps, free, ...  -
+TOTAL (13 functions)  956   -   malloc_caps, free, ...
 
 -- new/delay.c --
 ...
-TOTAL (13 functions)  1028  malloc_caps, free, ...  -
+TOTAL (13 functions)  1028  -   malloc_caps, free, ...
 ```
 
 The TOTAL row is a coarse sanity check — did this refactor move the file's
@@ -625,8 +625,13 @@ measurement, and per-function rows are where the real information is.
 Only labels the assembler types as functions are listed — global data
 (string constants, state structs, lookup tables) gets column-0 labels too
 but is not code. A `calls` list longer than 8 symbols is truncated to
-`..., +N more`; real firmware dispatch functions call dozens of distinct
-symbols and would otherwise make rows thousands of characters wide.
+`..., Total Calls:N`; real firmware dispatch functions call dozens of
+distinct symbols and would otherwise make rows thousands of characters
+wide. When stdout is a terminal, rows are additionally trimmed to the
+terminal width: callees are dropped from the end of the `calls` column
+(never the first one) behind the same `Total Calls:N` summary, so every
+row stays on one line. Piped or redirected output skips the width trim
+and keeps the full capped list, so it stays stable and greppable.
 
 ## Comparing the same function across two builds (`--across`)
 
@@ -687,9 +692,9 @@ movl    %r14d, %r11d                         | sarl    $11, %ebp
 call    SMULR6                               | leal    1024(%rax), %edx
   [... 60 rows omitted ...]
 
-function                     role       insns  calls   loop spans
-dsps_biquad_f32_ansi [cc#1]  baseline   59     SMULR6  .L27:32
-dsps_biquad_f32_ansi [cc#2]  candidate  89     -       .L26:54
+function                     role       insns  loop spans  calls
+dsps_biquad_f32_ansi [cc#1]  baseline   59     .L27:32     SMULR6
+dsps_biquad_f32_ansi [cc#2]  candidate  89     .L26:54     -
 ```
 
 (The listing is abridged here; the tool prints all 92 rows. The columns
@@ -725,9 +730,9 @@ call    ldexpf@PLT                           |
 leave                                        |
 ret                                          |
 
-function       role       insns  calls   loop spans
-new_rt [cc#1]  baseline   13     ldexpf  -
-new_rt [cc#2]  candidate  2      ldexpf  -
+function       role       insns  loop spans  calls
+new_rt [cc#1]  baseline   13     -           ldexpf
+new_rt [cc#2]  candidate  2      -           ldexpf
 ```
 
 **Two files** — before/after versions of a source file (e.g. from a git

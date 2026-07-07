@@ -3,8 +3,8 @@
 
 Compiles a harness C file across a matrix of compilers, extracts each
 variant function's assembly from the -S output, and prints side-by-side
-listings plus a summary of instruction counts, outbound calls, and loop
-spans (instructions between a local label and its last backward branch).
+listings plus a summary of instruction counts, loop spans (instructions
+between a local label and its last backward branch), and outbound calls.
 Automates fold-vs-libcall analysis when evaluating micro-optimisations
 (e.g. "does this still compile to one instruction, or is it a libcall?").
 
@@ -1050,12 +1050,52 @@ def side_by_side(left, right, ltitle, rtitle, width=44):
     return "\n".join(rows)
 
 
-def render_table(rows):
-    """Column-aligned text for a list of equal-length string tuples."""
+TOTAL_CALLS_RE = re.compile(r"Total Calls:\d+")
+
+
+def _fit_calls(cell, budget):
+    """Trim a comma-joined callee cell to at most budget columns by
+    dropping whole callees from the end, closing with a Total Calls:N
+    summary (N is always the full callee count, preserved from an
+    existing summary when the cell was already capped). The first
+    callee is never dropped; a cell that still overflows just wraps."""
+    if len(cell) <= budget:
+        return cell
+    items = cell.split(", ")
+    if TOTAL_CALLS_RE.fullmatch(items[-1]):
+        items, summary = items[:-1], items[-1]
+    else:
+        summary = f"Total Calls:{len(items)}"
+    if len(items) < 2:
+        return cell
+    for keep in range(len(items) - 1, 0, -1):
+        cand = ", ".join(items[:keep]) + ", " + summary
+        if len(cand) <= budget:
+            return cand
+    return items[0] + ", " + summary
+
+
+def render_table(rows, max_width=None):
+    """Column-aligned text for a list of equal-length string tuples.
+
+    max_width (terminal columns) keeps each row on one line by
+    trimming the last column's cells (see _fit_calls); the other
+    columns are never touched. None renders untrimmed."""
+    if max_width is not None:
+        fixed = [max(len(row[i]) for row in rows)
+                 for i in range(len(rows[0]) - 1)]
+        budget = max_width - sum(fixed) - 2 * len(fixed)
+        rows = [row[:-1] + (_fit_calls(row[-1], budget),) for row in rows]
     widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
     return "\n".join(
         "  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip()
         for row in rows)
+
+
+def table_width():
+    """Width budget for summary tables: the terminal width when stdout
+    is a tty, else None so piped output keeps every callee greppable."""
+    return shutil.get_terminal_size().columns if sys.stdout.isatty() else None
 
 
 def format_spans(spans):
@@ -1068,27 +1108,31 @@ MAX_CALLS_SHOWN = 8
 
 
 def format_calls(calls):
-    """Comma-joined callee list, capped at MAX_CALLS_SHOWN for readability."""
+    """Comma-joined callee list; longer lists keep the first
+    MAX_CALLS_SHOWN callees and close with a Total Calls:N summary."""
     if not calls:
         return "-"
     if len(calls) > MAX_CALLS_SHOWN:
         return (", ".join(calls[:MAX_CALLS_SHOWN])
-                + f", +{len(calls) - MAX_CALLS_SHOWN} more")
+                + f", Total Calls:{len(calls)}")
     return ", ".join(calls)
 
 
-def summary_table(pairs, funcs):
-    """Instruction counts, outbound calls, and loop spans per pair member."""
-    rows = [("function", "role", "insns", "calls", "loop spans")]
+def summary_table(pairs, funcs, max_width=None):
+    """Instruction counts, loop spans, and outbound calls per pair
+    member. Calls come last: the one unbounded column stays ragged
+    right so the counts and spans keep their alignment."""
+    rows = [("function", "role", "insns", "loop spans", "calls")]
     for old, new in pairs:
         for name, role in ((old, "baseline"), (new, "candidate")):
             insns, calls = analyze(funcs[name])
-            rows.append((name, role, str(insns), format_calls(calls),
-                         format_spans(loop_spans(funcs[name]))))
-    return render_table(rows)
+            rows.append((name, role, str(insns),
+                         format_spans(loop_spans(funcs[name])),
+                         format_calls(calls)))
+    return render_table(rows, max_width)
 
 
-def file_summary_table(funcs):
+def file_summary_table(funcs, max_width=None):
     """Per-function counts plus a whole-file total row.
 
     The total sums instruction counts over every function parsed from
@@ -1096,7 +1140,7 @@ def file_summary_table(funcs):
     check, not a code-size measurement (literal pools, data, and
     alignment are not included).
     """
-    rows = [("function", "insns", "calls", "loop spans")]
+    rows = [("function", "insns", "loop spans", "calls")]
     total_insns, all_calls = 0, []
     for name, lines in funcs.items():
         insns, calls = analyze(lines)
@@ -1104,11 +1148,11 @@ def file_summary_table(funcs):
         for sym in calls:
             if sym not in all_calls:
                 all_calls.append(sym)
-        rows.append((name, str(insns), format_calls(calls),
-                     format_spans(loop_spans(lines))))
+        rows.append((name, str(insns),
+                     format_spans(loop_spans(lines)), format_calls(calls)))
     rows.append((f"TOTAL ({len(funcs)} functions)", str(total_insns),
-                 format_calls(all_calls), "-"))
-    return render_table(rows)
+                 "-", format_calls(all_calls)))
+    return render_table(rows, max_width)
 
 
 def listing(name, lines):
@@ -1119,15 +1163,16 @@ def listing(name, lines):
     return "\n".join([f"{name}:"] + body)
 
 
-def inspect_table(fn_names, funcs):
+def inspect_table(fn_names, funcs, max_width=None):
     """Stats rows for the inspected functions only - no pair roles and
     no whole-file total, unlike summary_table/file_summary_table."""
-    rows = [("function", "insns", "calls", "loop spans")]
+    rows = [("function", "insns", "loop spans", "calls")]
     for name in fn_names:
         insns, calls = analyze(funcs[name])
-        rows.append((name, str(insns), format_calls(calls),
-                     format_spans(loop_spans(funcs[name]))))
-    return render_table(rows)
+        rows.append((name, str(insns),
+                     format_spans(loop_spans(funcs[name])),
+                     format_calls(calls)))
+    return render_table(rows, max_width)
 
 
 def file_tags(a, b):
@@ -1158,7 +1203,7 @@ def report_across(fn_names, left_funcs, right_funcs, left_tag, right_tag):
     for lt, rt in pairs:
         print(side_by_side(decorated[lt], decorated[rt], lt, rt))
         print()
-    print(summary_table(pairs, decorated))
+    print(summary_table(pairs, decorated, table_width()))
 
 
 def run_across(sources, matrix, fn_names, extra_flags, tmp):
@@ -1228,7 +1273,7 @@ def run_summary(sources, matrix, extra_flags, tmp):
             if len(sections) > 1:
                 print(f"\n-- {tag} --")
             print()
-            print(file_summary_table(funcs) if funcs
+            print(file_summary_table(funcs, table_width()) if funcs
                   else "(no functions found)")
     if not ran_any:
         sys.exit("error: no usable compiler in the matrix")
@@ -1256,7 +1301,7 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
                       'declare the pairs extern "C" or use --pair with the '
                       'mangled names', file=sys.stderr)
             print(f"\n== {cc_cmd} ==\n")
-            print(file_summary_table(funcs) if funcs
+            print(file_summary_table(funcs, table_width()) if funcs
                   else "(no functions found)")
             continue
         missing = sorted({n for p in pairs for n in p if n not in funcs})
@@ -1268,7 +1313,7 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
         for old, new in pairs:
             print(side_by_side(funcs[old], funcs[new], old, new))
             print()
-        print(summary_table(pairs, funcs))
+        print(summary_table(pairs, funcs, table_width()))
     if not ran_any:
         sys.exit("error: no usable compiler in the matrix")
     return 0
@@ -1316,7 +1361,7 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp):
             print()
             print(listing(name, funcs[name]))
         print()
-        print(inspect_table(fn_names, funcs))
+        print(inspect_table(fn_names, funcs, table_width()))
     return 0
 
 
@@ -1379,7 +1424,7 @@ def run_elf(elf, fn_names, filter_regex, objdump):
         print()
         print(listing(name, funcs[name]))
     print()
-    print(inspect_table(selected, funcs))
+    print(inspect_table(selected, funcs, table_width()))
     return 0
 
 
