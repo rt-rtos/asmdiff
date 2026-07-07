@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "asmdiff"
-version = "0.1.6"
+version = "0.1.7"
 description = "Compare per-function assembly between paired C implementations"
 readme = "README.md"
 license = "MIT"
