@@ -16,6 +16,7 @@ Usage:
                              [--flags-like PATH]
                              [--layout list|side-by-side] [-v]
                              [-- EXTRA_FLAGS...]
+    tools/asmdiff/asmdiff.py --edit-config | --example-config
 
 Four modes:
   SOURCE.c FUNC   inspect: print the named function's assembly, no
@@ -36,6 +37,9 @@ Compilers come from --cc strings, from named targets in an asmdiff.toml
 config file (--target NAME), from the config's `default` entry, or —
 failing all of those — plain `gcc -O3` and `clang -O3`.
 Flags after a bare `--` are appended to every compiler invocation.
+--edit-config opens the config (--config PATH, else ~/.config/
+asmdiff.toml) in $VISUAL/$EDITOR, creating it from the built-in example
+when missing; --example-config prints that example to stdout.
 
 A config target may name a compile_commands.json (compile_commands = PATH):
 the include/define flags recorded there for the source being compiled are
@@ -71,6 +75,112 @@ except ModuleNotFoundError:
 DEFAULT_COMPILERS = ["gcc", "clang"]
 FALLBACK_FLAGS = "-O3"
 CONFIG_NAME = "asmdiff.toml"
+
+# Mirror of asmdiff.example.toml, embedded because the wheel ships only
+# this module: --example-config prints it and --edit-config seeds a new
+# config from it.  A unit test keeps it byte-identical to the repo file.
+EXAMPLE_CONFIG = """\
+# asmdiff config — named compiler+flags targets.
+#
+# Copy to one of the locations asmdiff searches (first hit wins):
+#   1. the path given with --config
+#   2. asmdiff.toml next to the SOURCE.c being compiled
+#   3. asmdiff.toml in the current directory
+#   4. ~/.config/asmdiff.toml
+#
+# Each [table] is a target usable as `--target NAME`; the optional
+# top-level `default` names the target(s) used when no --cc/--target
+# is given (a list runs several: default = ["gcc", "clang"]).
+# Compile at the flags your project ships with — that is the whole
+# point of the tool.
+
+default = "gcc"
+
+[gcc]
+cc = "gcc"
+flags = [
+  "-O3", "-Wall", "-Wextra",
+  # Project-specific include paths and defines go here:
+  # "-I/path/to/project/src", "-DMY_FEATURE",
+]
+
+[clang]
+cc = "clang"
+flags = ["-O3", "-Wall", "-Wextra"]
+
+# cc values may use ~, $VARS, and glob patterns.  A glob that matches
+# several installed toolchains resolves to the highest version-sorted
+# one (announced on stderr); pin the exact esp-NN directory instead if
+# reproducibility across sessions matters more than convenience.
+# On native Windows HOME is usually unset - use $USERPROFILE (or
+# %USERPROFILE%) in the patterns below instead.
+#
+# The ESP profiles below keep flags minimal (-O2 plus arch selection);
+# append what your project ships with (-DNDEBUG, -Os, -I..., ...).
+# A source that pulls in framework headers (ESP-IDF's freertos/*, a
+# generated sdkconfig.h, ...) additionally needs the build's -I/-D
+# flags: add `compile_commands = true` (or a path) to any target to
+# borrow them from the build's compile_commands.json - see README.
+
+# --- Profile: riscv32-esp (ESP32-C3 / C6 / H2 / P4) -------------------
+# All RISC-V ESP chips share one riscv32-esp-elf-gcc binary; the
+# targets differ only in -march/-mabi.  Uncomment to run the whole
+# profile as the default matrix:
+# default = ["esp32c3", "esp32c6", "esp32h2", "esp32p4"]
+
+[esp32c3]
+cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+flags = ["-O2", "-march=rv32imc_zicsr_zifencei", "-mabi=ilp32"]
+
+[esp32c6]
+cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+flags = ["-O2", "-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"]
+
+[esp32h2]
+cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+flags = ["-O2", "-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"]
+
+# ESP32-P4 is the only ESP RISC-V chip with an FPU, hence the
+# hard-float ABI.
+[esp32p4]
+cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+flags = ["-O2", "-march=rv32imafc_zicsr_zifencei", "-mabi=ilp32f"]
+
+# --- Profile: xtensa-esp (ESP32 / S2 / S3) ----------------------------
+# The unified xtensa-esp-elf toolchain ships one gcc binary per chip.
+# default = ["esp32", "esp32s2", "esp32s3"]
+
+[esp32]
+cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc"
+flags = ["-O2", "-mlongcalls"]
+
+[esp32s2]
+cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s2-elf-gcc"
+flags = ["-O2", "-mlongcalls"]
+
+[esp32s3]
+cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+flags = ["-O2", "-mlongcalls"]
+
+# --- Profile: other embedded (STM32 / RP2350) -------------------------
+# Unlike the ESP toolchains these have no single well-known install
+# path: the compilers must be on PATH, or edit cc to a full path.
+
+# Any Cortex-M STM32; adjust -mcpu to your family (cortex-m0plus,
+# cortex-m3, cortex-m7, cortex-m33, ...) and add -mfloat-abi/-mfpu
+# flags if your project uses the FPU.
+[stm32]
+cc = "arm-none-eabi-gcc"
+flags = ["-O2", "-mcpu=cortex-m4", "-mthumb"]
+
+# RP2350 Hazard3 cores in RISC-V mode; riscv64-unknown-elf-gcc is
+# multilib, -march/-mabi select rv32.  Hazard3 also implements the
+# Zba/Zbb/Zbs/Zbkb extensions (append to -march on gcc >= 13, as
+# pico-sdk does).
+[rp2350]
+cc = "riscv64-unknown-elf-gcc"
+flags = ["-O2", "-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"]
+"""
 
 # Preprocessor flags lifted from a compile_commands.json entry so a project
 # source compiles the way its build system compiles it: header search paths,
@@ -550,6 +660,42 @@ def load_config(path):
             return tomllib.load(fh)
     except tomllib.TOMLDecodeError as exc:
         sys.exit(f"error: {path}: {exc}")
+
+
+def resolve_editor(env=None):
+    """$VISUAL, then $EDITOR, split so values like 'code -w' work; on
+    Windows fall back to notepad (neither variable is normally set
+    there), elsewhere an unset editor is an error, never a guess."""
+    env = os.environ if env is None else env
+    editor = env.get("VISUAL") or env.get("EDITOR")
+    if editor:
+        return shlex.split(editor)
+    if os.name == "nt":
+        return ["notepad"]
+    sys.exit("error: set $VISUAL or $EDITOR to edit the config")
+
+
+def edit_config(explicit):
+    """Open the config in the user's editor, creating it first from
+    EXAMPLE_CONFIG when missing (a pip/uvx install has no example file
+    on disk).  With --config PATH that file is edited; otherwise the
+    global fallback location find_config searches last.  The TOML check
+    afterwards is warn-only: a half-finished edit should not eat the
+    editor's exit status."""
+    path = (Path(explicit) if explicit
+            else Path.home() / ".config" / CONFIG_NAME)
+    if not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(EXAMPLE_CONFIG)
+        print(f"created {path}", file=sys.stderr)
+    status = subprocess.call(resolve_editor() + [str(path)])
+    if tomllib is not None:
+        try:
+            with open(path, "rb") as fh:
+                tomllib.load(fh)
+        except tomllib.TOMLDecodeError as exc:
+            print(f"warning: {path}: {exc}", file=sys.stderr)
+    return status
 
 
 def _version_key(path):
@@ -1037,7 +1183,7 @@ def main(argv=None):
         description=(__doc__ or "").partition("\n")[0],
         epilog="Flags after a bare -- are appended to every compiler "
                "invocation, e.g.: asmdiff.py h.c -- -fno-math-errno")
-    parser.add_argument("sources", nargs="+", metavar="SOURCE.c",
+    parser.add_argument("sources", nargs="*", metavar="SOURCE.c",
                         help="C file to compile; follow it with bare "
                              "function names to inspect their assembly, "
                              "or give two files with --across to compare "
@@ -1082,6 +1228,15 @@ def main(argv=None):
                              "PATH — lets a modified copy of a project "
                              "source compile (and compare) under its "
                              "original's header environment")
+    parser.add_argument("--edit-config", action="store_true",
+                        help="open the config in $VISUAL/$EDITOR (the "
+                             "--config file, else ~/.config/asmdiff.toml), "
+                             "creating it from the built-in example first "
+                             "if missing")
+    parser.add_argument("--example-config", action="store_true",
+                        help="print the built-in example config (the "
+                             "repository's asmdiff.example.toml) to stdout, "
+                             "ready to redirect into a config file")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="on compile failure, print the full compiler "
                              "command and complete error output instead of "
@@ -1090,6 +1245,14 @@ def main(argv=None):
     global VERBOSE, FLAGS_LIKE
     VERBOSE = args.verbose
     FLAGS_LIKE = args.flags_like
+
+    if args.example_config:
+        sys.stdout.write(EXAMPLE_CONFIG)
+        return 0
+    if args.edit_config:
+        return edit_config(args.config)
+    if not args.sources:
+        parser.error("SOURCE.c required")
 
     sources, fn_names = split_positionals(args.sources)
     if len(sources) > 2:

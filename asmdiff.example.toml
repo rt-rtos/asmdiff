@@ -30,6 +30,8 @@ flags = ["-O3", "-Wall", "-Wextra"]
 # several installed toolchains resolves to the highest version-sorted
 # one (announced on stderr); pin the exact esp-NN directory instead if
 # reproducibility across sessions matters more than convenience.
+# On native Windows HOME is usually unset - use $USERPROFILE (or
+# %USERPROFILE%) in the patterns below instead.
 #
 # The ESP profiles below keep flags minimal (-O2 plus arch selection);
 # append what your project ships with (-DNDEBUG, -Os, -I..., ...).

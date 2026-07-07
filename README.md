@@ -41,6 +41,13 @@ the tool is a single stdlib-only file: `python3 asmdiff.py HARNESS.c`.
 Requires Python >= 3.8; `asmdiff.toml` config files need >= 3.11
 (stdlib `tomllib`).
 
+**Portability:** pure-stdlib Python with nothing intentionally
+platform-specific, developed and tested on Linux. On native Windows,
+`HOME` is usually unset, so replace `$HOME` with `$USERPROFILE` (or
+`%USERPROFILE%`) in config `cc` patterns; forward slashes are fine. A
+toolchain that doesn't resolve fails with a clean per-target error, and
+matrix runs skip unusable compilers rather than aborting.
+
 ## Quick start
 
 Write a harness with your two versions as `old_*` / `new_*` function pairs:
@@ -336,6 +343,31 @@ family) and `rp2350` (`riscv64-unknown-elf-gcc` targeting the Hazard3
 cores in RISC-V mode). These toolchains have no single well-known
 install location, so the bundled entries use bare binary names: the
 compiler must be on `PATH`, or edit `cc` to a full path.
+
+### Creating and editing a config from the command line
+
+The example config is embedded in the tool itself, so a pip/uvx install
+never needs this repository:
+
+```bash
+asmdiff --edit-config       # open the global config in $VISUAL/$EDITOR
+asmdiff --example-config    # print the example config to stdout
+```
+
+`--edit-config` opens `~/.config/asmdiff.toml` — or the file named with
+`--config PATH` — in `$VISUAL`, then `$EDITOR` (`notepad` as the last
+resort on Windows). A missing file is first created from the embedded
+example, so a fresh global config starts fully documented, ESP profiles
+included. After the editor exits, the result is checked as TOML and a
+parse error is reported as a warning, without failing the command.
+
+`--example-config` prints the same content for redirection or
+cherry-picking targets into an existing config:
+
+```bash
+uvx asmdiff --example-config > ~/.config/asmdiff.toml   # bootstrap
+uvx asmdiff --example-config | less                     # copy a table
+```
 
 ### Borrowing includes from `compile_commands.json`
 
