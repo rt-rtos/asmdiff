@@ -16,14 +16,25 @@ Usage:
                              [--flags-like PATH]
                              [--layout list|side-by-side] [-v]
                              [-- EXTRA_FLAGS...]
+    tools/asmdiff/asmdiff.py FIRMWARE.elf [FUNC...] [--filter REGEX]
+                             [--objdump PATH]
     tools/asmdiff/asmdiff.py --edit-config | --example-config
 
-Four modes:
+Five modes:
   SOURCE.c FUNC   inspect: print the named function's assembly, no
                   comparison.  One usable compiler prints a listing
                   plus a stats row, exactly two print side by side,
                   more print one block per compiler; --layout forces
                   list or side-by-side.
+  FIRMWARE.elf    ELF input (detected by magic bytes): disassemble a
+                  linked binary through the toolchain's objdump and
+                  run named and/or --filter REGEX matched functions
+                  through the same analyzers - post-LTO/link reality
+                  instead of single-TU codegen.  objdump comes from
+                  --objdump PATH or the first gcc in the matrix
+                  (trailing gcc swapped for objdump); Xtensa
+                  -mlongcalls call sequences are resolved to their
+                  real callees when the disassembly names them.
   --pair OLD:NEW  compares two different functions within one compilation
                   (with no --pair, old_X/new_X names auto-pair).
   --across FUNC   compares the SAME function across two compilations:
@@ -54,6 +65,7 @@ source borrow the flags recorded for PATH, so a modified copy compares
 against its original under one header environment.
 """
 import argparse
+import difflib
 import glob
 import hashlib
 import json
@@ -516,6 +528,125 @@ def extract_functions(asm_text):
     return funcs
 
 
+# `objdump -d` function header: "40370400 <render_lut>:".
+OBJDUMP_HEADER = re.compile(r"^([0-9a-f]+) <([^>]+)>:\s*$")
+# `objdump -d` instruction line: address, one byte-dump field (hex digits
+# and spaces; "004136" is the encoding, not the mnemonic), then the
+# mnemonic and operands.
+OBJDUMP_INSN = re.compile(
+    r"^\s*([0-9a-f]+):\t[0-9a-f ]+\t\s*(\S+)[ \t]*(.*?)\s*$")
+# An "addr <annotation>" operand: branch, loop or call target.
+OBJDUMP_TARGET = re.compile(r"\b([0-9a-f]+) <([^>]+)>")
+
+
+def extract_functions_objdump(dump_text):
+    """Map function name -> cleaned asm lines from `objdump -d` output.
+
+    Produces the shape extract_functions() yields for -S output, so
+    analyze() and loop_spans() work unchanged: one mnemonic + operands
+    per line, labels ending with ':'.  A linked ELF has addresses where
+    -S output has labels, so in-function branch targets are rewritten to
+    synthetic local labels (.L<hex-offset>) inserted at the target
+    instruction; an Xtensa zero-overhead loop's end address becomes
+    .L<off>_LEND, keeping the ZOL-vs-branch naming convention -S output
+    has.  Targets outside the function keep their symbol annotation, so
+    calls still name their callee.  Offset-form headers
+    (``<sym+0x..>``/``<sym-0x..>``: literal pools and other symbol-less
+    gaps that disassemble as garbage) and ``...`` filler are skipped.
+    """
+    funcs = {}
+    current = None
+    for raw in dump_text.splitlines():
+        h = OBJDUMP_HEADER.match(raw)
+        if h:
+            name = h.group(2)
+            if re.search(r"[+-]0x[0-9a-f]+$", name):
+                current = None          # symbol-less gap, not a function
+            else:
+                current = []
+                funcs[name] = (int(h.group(1), 16), current)
+            continue
+        if current is None:
+            continue
+        m = OBJDUMP_INSN.match(raw)
+        if m:
+            current.append((int(m.group(1), 16), m.group(2), m.group(3)))
+    return {name: _relabel_objdump(start, _resolve_longcalls(insns))
+            for name, (start, insns) in funcs.items()}
+
+
+# The value annotation objdump appends to an l32r whose literal resolves
+# to a bare symbol: "l32r a8, <lit> (40002274 <__divsf3>)".  An offset
+# form (<_etext+0x100>) is a constant that happens to fall near a
+# symbol, not a callee, so it deliberately does not match.
+L32R_VALUE = re.compile(r"\([0-9a-f]+ <([A-Za-z_][\w$.]*)>\)$")
+
+# Xtensa integer stores: the only mnemonics whose first a-register
+# operand is read, not written.  Everything else writing its first
+# operand (l32i, mov.n, arithmetic) clobbers a loaded call target.
+XTENSA_STORES = {"s8i", "s16i", "s32i", "s32i.n", "s32e"}
+
+
+def _resolve_longcalls(insns):
+    """Name the callees of Xtensa -mlongcalls sequences.
+
+    -mlongcalls emits every call as "l32r aN, <lit>" + "callx8 aN"; the
+    linker relaxes in-range pairs back to call8, so the ones left in an
+    ELF are real out-of-range calls (typically flash to ROM).  When the
+    l32r's value annotation names a symbol, rewrite the callx operand to
+    it so CALL_RE reports the callee.  The nearest write to the call's
+    register within the previous 8 instructions decides: an annotated
+    l32r resolves, anything else (an unannotated l32r, or a non-store
+    overwriting the register - e.g. l32i fetching a function pointer
+    out of a just-loaded struct) leaves the call indirect.  A wrong
+    callee would be worse than a register name.
+    """
+    out = list(insns)
+    for i, (addr, mnem, ops) in enumerate(insns):
+        if not (re.fullmatch(r"callx\d+", mnem)
+                and re.fullmatch(r"a\d+", ops)):
+            continue
+        for j in range(i - 1, max(i - 9, -1), -1):
+            _, mid_mnem, mid_ops = insns[j]
+            if not mid_ops.startswith(ops + ","):
+                continue
+            if mid_mnem == "l32r":
+                value = L32R_VALUE.search(mid_ops)
+                if value:
+                    out[i] = (addr, mnem, value.group(1))
+                break
+            if mid_mnem not in XTENSA_STORES:
+                break                     # register rewritten in between
+    return out
+
+
+def _relabel_objdump(start, insns):
+    """Turn one function's (addr, mnemonic, operands) rows into cleaned
+    lines, synthesizing local labels for in-function targets."""
+    addrs = {addr for addr, _, _ in insns}
+    labels = {}
+    for _, mnem, ops in insns:
+        for m in OBJDUMP_TARGET.finditer(ops):
+            taddr = int(m.group(1), 16)
+            if taddr not in addrs:
+                continue
+            if mnem.startswith("loop"):     # ZOL references its END
+                labels[taddr] = ".L%x_LEND" % (taddr - start)
+            elif taddr not in labels:
+                labels[taddr] = ".L%x" % (taddr - start)
+
+    def target_name(m):
+        return labels.get(int(m.group(1), 16), m.group(2))
+
+    lines = []
+    for addr, mnem, ops in insns:
+        if addr in labels:
+            lines.append(labels[addr] + ":")
+        ops = OBJDUMP_TARGET.sub(target_name, ops)
+        lines.append(mnem + "\t" + ops if ops else mnem)
+    return lines
+
+
 # Direct-call / tail-call mnemonics across x86 (call, jmp), ARM (bl, blx),
 # RISC-V (call, tail, jal), and Xtensa (call0/4/8/12, callx*, j).  Longest
 # alternatives first so e.g. "callx8" is not consumed as "call".  The
@@ -629,6 +760,17 @@ def split_positionals(positionals):
     return sources, fn_names
 
 
+def is_elf(path):
+    """True when path is an ELF binary - by magic bytes, not extension,
+    so a stripped-suffix or oddly named firmware image still routes to
+    ELF mode and a text file named *.elf does not."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
 def find_config(explicit, sources):
     """Locate the config file; first hit wins, no merging.
 
@@ -726,8 +868,13 @@ def resolve_cc(cc, name):
     return matches[-1]
 
 
-def target_command(config, name, config_path):
-    """Resolve a named [target] table to one 'CC FLAGS' matrix entry."""
+def target_command(config, name, config_path, want_db=True):
+    """Resolve a named [target] table to one 'CC FLAGS' matrix entry.
+
+    want_db=False skips the compile_commands lookup (including the
+    discovery walk a `compile_commands = true` entry asks for) - ELF
+    mode resolves targets only to find their toolchain.
+    """
     entry = (config or {}).get(name)
     if not isinstance(entry, dict):
         known = sorted(k for k, v in (config or {}).items()
@@ -743,7 +890,7 @@ def target_command(config, name, config_path):
     if isinstance(flags, str) or not all(isinstance(f, str) for f in flags):
         sys.exit(f"error: target [{name}]: flags must be an array of strings")
     flags = [os.path.expandvars(f) for f in flags]
-    db = entry.get("compile_commands")
+    db = entry.get("compile_commands") if want_db else None
     discovered = False
     if db is True:                       # opt in to CWD-based discovery
         db, discovered = _discovered_db(f"target [{name}]"), True
@@ -758,7 +905,8 @@ def target_command(config, name, config_path):
     return Target(shlex.join([resolve_cc(cc, name), *flags]), db, discovered)
 
 
-def build_matrix(cc_args, target_args, config, config_path, db_arg=None):
+def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
+                 want_db=True):
     """Resolve the compiler matrix.
 
     --cc strings verbatim, then --target entries, in that order.  With
@@ -770,13 +918,13 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None):
     whose config names its own compile_commands keeps it.
     """
     entries = list(cc_args)
-    entries += [target_command(config, name, config_path)
+    entries += [target_command(config, name, config_path, want_db)
                 for name in target_args]
     if not entries:
         default = (config or {}).get("default")
         if default:
             names = [default] if isinstance(default, str) else list(default)
-            entries = [target_command(config, name, config_path)
+            entries = [target_command(config, name, config_path, want_db)
                        for name in names]
         else:
             entries = [f"{cc} {FALLBACK_FLAGS}" for cc in DEFAULT_COMPILERS]
@@ -1172,6 +1320,69 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp):
     return 0
 
 
+def derive_objdump(matrix):
+    """Objdump belonging to the first gcc in the matrix: the toolchain
+    prefix stays, the tool name swaps (xtensa-esp32s3-elf-gcc ->
+    xtensa-esp32s3-elf-objdump).  None when no entry is gcc-based;
+    clang has no paired cross-objdump to guess at."""
+    for cc_cmd in matrix:
+        cc = shlex.split(cc_cmd)[0]
+        if cc == "gcc" or cc.endswith(("-gcc", "/gcc")):
+            return cc[:-3] + "objdump"
+    return None
+
+
+def run_objdump(objdump, elf):
+    """`objdump -d` an ELF, exiting with the tool's stderr on failure
+    (a host objdump given a cross ELF says "file format not recognized"
+    here - the cue to pass --objdump or a matching --target)."""
+    try:
+        proc = subprocess.run([objdump, "-d", elf],
+                              capture_output=True, text=True)
+    except OSError as exc:
+        sys.exit(f"error: cannot run {objdump}: {exc}")
+    if proc.returncode != 0:
+        sys.exit(f"error: {objdump} -d {elf} failed: "
+                 + (proc.stderr.strip() or f"exit {proc.returncode}"))
+    return proc.stdout
+
+
+def run_elf(elf, fn_names, filter_regex, objdump):
+    """ELF mode: disassemble one linked binary and run the selected
+    functions through the same analyzers as -S output.
+
+    This answers what actually shipped: LTO can inline a function out
+    of existence, and only the linked ELF shows whether its loops
+    survived as zero-overhead loops inside the caller.  Named functions
+    are listed in full; --filter matches are summarized in the stats
+    table only, since a match can cover hundreds of functions.
+    """
+    funcs = extract_functions_objdump(run_objdump(objdump, elf))
+    missing = [f for f in fn_names if f not in funcs]
+    if missing:
+        hints = sorted({m for f in missing
+                        for m in difflib.get_close_matches(f, funcs)})
+        sys.exit(f"error: function(s) not in {elf}: " + ", ".join(missing)
+                 + ("; close matches: " + ", ".join(hints) if hints else ""))
+    selected = list(fn_names)
+    if filter_regex:
+        try:
+            pattern = re.compile(filter_regex)
+        except re.error as exc:
+            sys.exit(f"error: bad --filter regex: {exc}")
+        selected += [n for n in funcs
+                     if pattern.search(n) and n not in fn_names]
+        if not selected:
+            sys.exit(f"error: --filter {filter_regex!r} matched no function "
+                     f"among the {len(funcs)} in {elf}")
+    for name in fn_names:
+        print()
+        print(listing(name, funcs[name]))
+    print()
+    print(inspect_table(selected, funcs))
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     extra_flags = []
@@ -1201,6 +1412,15 @@ def main(argv=None):
                         help="force the inspect presentation instead of "
                              "adapting to the matrix (1 usable compiler "
                              "lists, 2 go side by side, more list)")
+    parser.add_argument("--filter", metavar="REGEX",
+                        help="ELF input only: also analyze every function "
+                             "whose name matches REGEX (re.search) - the "
+                             "way to sweep a whole subsystem without "
+                             "naming each function")
+    parser.add_argument("--objdump", metavar="PATH",
+                        help="disassembler for ELF input; default: derived "
+                             "from the first gcc in the matrix by swapping "
+                             "the trailing gcc for objdump")
     parser.add_argument("--cc", action="append", default=[],
                         metavar="'CC FLAGS'",
                         help="compiler and flags as one string (repeatable); "
@@ -1255,6 +1475,31 @@ def main(argv=None):
         parser.error("SOURCE.c required")
 
     sources, fn_names = split_positionals(args.sources)
+    if is_elf(sources[0]):
+        if len(sources) > 1:
+            parser.error("ELF input analyzes one binary; a second file "
+                         "cannot be combined with it")
+        if args.pair or args.across or args.layout:
+            parser.error("--pair/--across/--layout compare compilations; "
+                         "an ELF is disassembled, not compiled")
+        if not fn_names and not args.filter:
+            parser.error("a whole ELF has too many functions to table; "
+                         "name functions after the file or select them "
+                         "with --filter REGEX")
+        objdump = args.objdump
+        if objdump is None:
+            config_path = find_config(args.config, sources)
+            config = load_config(config_path) if config_path else None
+            matrix = build_matrix(args.cc, args.target, config, config_path,
+                                  want_db=False)
+            objdump = derive_objdump(matrix)
+            if objdump is None:
+                sys.exit("error: no gcc in the matrix to derive an objdump "
+                         "from (" + "; ".join(matrix) + "); pass --objdump "
+                         "PATH or a gcc-based --cc/--target")
+        return run_elf(sources[0], fn_names, args.filter, objdump)
+    if args.filter or args.objdump:
+        parser.error("--filter/--objdump apply to ELF input only")
     if len(sources) > 2:
         parser.error("at most two source files may be given")
     if fn_names and len(sources) == 2:

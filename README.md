@@ -207,6 +207,111 @@ zero-overhead loop (`loop a8, .L3_LEND`: hardware repetition, no branch;
 see [How a span is found](#how-a-span-is-found)): the part that runs per
 element, as opposed to the whole-function count of 13.
 
+## ELF input: what actually shipped after LTO
+
+Everything above compiles one translation unit and reads its `-S`
+output. That answers "what does the compiler do to this function" - but
+under `-flto` it cannot answer "what did the *linked firmware* do to
+it". LTO happily inlines a whole FX pipeline into its caller: the
+functions still exist in your source, but the binary has no symbols for
+them, and their loops live - transformed - inside someone else's body.
+Whether a loop actually shipped as an Xtensa zero-overhead loop is a
+property of the ELF, not of any single `.c` file.
+
+So an ELF positional (detected by magic bytes, not file name) switches
+to disassembly: no compiling, no matrix - the binary is the finished
+answer. Name functions after it, or sweep by regex:
+
+```
+$ asmdiff build/S3-Amysynth.elf render_lut          # listing + stats
+$ asmdiff build/S3-Amysynth.elf --filter '^render_' # stats table only
+```
+
+```
+function                    insns  calls               loop spans
+render_lut_cub              98     -                   .L32:74
+render_lut                  51     -                   .L7e_LEND:32
+render_external_audio_in    32     -                   .L52_LEND:10
+render_partial              112    exp2f, __divsf3, ...  .L66:31
+```
+
+(Four of the eleven matched rows shown.) The columns are the same as
+everywhere else; two things are ELF-specific:
+
+- **Labels are synthesized from addresses.** A linked binary has branch
+  targets, not labels, so in-function targets are rewritten to
+  `.L<hex-offset>` labels (the offset from the function start - stable
+  across rebuilds of an unchanged function, unlike link addresses). An
+  Xtensa zero-overhead loop's end address becomes `.L<off>_LEND`, so a
+  hardware loop is distinguishable from a branch loop in the `loop
+  spans` column at a glance: `render_lut` shipped its 32-instruction
+  body as a ZOL, `render_lut_cub` fell back to a 74-instruction
+  branch loop.
+- **`-mlongcalls` calls are resolved.** An out-of-range call survives
+  linking as `l32r a8, <lit>` + `callx8 a8`, which would otherwise
+  report a call to "a8". When the disassembly annotates the literal
+  with its value (`l32r a8, ... (40002274 <__divsf3>)`), the real
+  callee is reported instead. Calls stay register-named when the
+  evidence is missing or the register is overwritten in between -
+  a genuine function-pointer dispatch still reads as indirect.
+
+What this looks like on real firmware: the same binary's sequencer
+core (project code, not a synth library) surfaces three findings in
+one row scan.
+
+```
+$ asmdiff build/S3-Amysynth.elf --filter 'sequencer_(process_tick|recompute|timer_callback)'
+
+function                             insns  calls                                                           loop spans
+sequencer_timer_callback$lto_priv$0  77     __divsf3, __udivdi3                                             .L21:41
+sequencer_recompute                  46     __extendsfdf2, __divdf3, __muldf3, __fixunsdfsi, __divsf3       -
+sequencer_process_tick$lto_priv$0    117    xQueueSemaphoreTake, xQueueGenericSend, add_delta_to_queue, a8  .L2e:96 .L48:85 .L8d:6
+```
+
+A timer callback pays a software float divide *and* a 64-bit
+`__udivdi3` inside its 41-instruction loop - the
+[silent software divide](#example-catching-a-silent-software-divide)
+pattern, caught in shipped firmware instead of a harness.
+`sequencer_recompute`'s `__extendsfdf2 -> __divdf3 -> __muldf3` chain
+is the double-promotion smell (typically an unsuffixed `60.0`-style
+literal) on a chip whose FPU is single-precision only. And the
+`$lto_priv$0` suffixes show LTO renaming the survivors, which is why
+`--filter` matters: you can't name symbols you don't know exist. The
+lone `a8` is a genuine function-pointer dispatch, reported as the
+register rather than guessed at.
+
+Functions LTO inlined away don't table at all, and the error says so
+usefully:
+
+```
+$ asmdiff build/S3-Amysynth.elf arp_collect_down
+error: function(s) not in build/S3-Amysynth.elf: arp_collect_down; close matches: arp_collect_up$lto_priv$0, arp_core_init, heap_bubble_down
+```
+
+`arp_collect_down` still exists in source; the binary holds its body
+inlined inside its one caller.
+
+The disassembler is the toolchain's own `objdump`, derived from the
+first gcc in the matrix by swapping the trailing `gcc` for `objdump` -
+so `--target esp32s3` (or a config `default`) finds
+`xtensa-esp32s3-elf-objdump` exactly the way it finds the compiler,
+glob patterns included. `--objdump PATH` overrides. A host `objdump`
+handed a cross ELF fails with `file format not recognized`; that's the
+cue to pass a matching target.
+
+A whole firmware has over a thousand functions, so a bare ELF with no
+function names and no `--filter` is an error, not a thousand-row table.
+
+If the question behind the sweep is "did my hot loops ship as
+zero-overhead loops", the empirical rules (verified on esp-gcc 15.2,
+`-O2`) are worth knowing before blaming the compiler:
+
+- One call surviving to codegen *anywhere* in the loop body kills ZOL -
+  even behind a runtime condition that never fires.
+- An early `break` kills it.
+- A spilled loop counter (register pressure) kills it.
+- Nested loops: only the innermost can be a ZOL.
+
 ## Command reference
 
 ```
@@ -214,14 +319,17 @@ asmdiff SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
            [--cc 'CC FLAGS']... [--target NAME]... [--config PATH]
            [--compile-commands [PATH]] [--flags-like PATH]
            [--layout list|side-by-side] [-v] [-- EXTRA_FLAGS...]
+asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
 ```
 
 | Option | Meaning |
 |---|---|
-| `SOURCE.c` | C file to compile — a purpose-built harness or a real project source. A second file may be given: with `--across` to compare a function, without it for a whole-file A/B summary. Bare names after the file are functions to inspect (see [Quick inspect](#quick-inspect-one-function-no-comparison)). |
+| `SOURCE.c` | C file to compile — a purpose-built harness or a real project source. A second file may be given: with `--across` to compare a function, without it for a whole-file A/B summary. Bare names after the file are functions to inspect (see [Quick inspect](#quick-inspect-one-function-no-comparison)). An ELF binary (any name — detected by magic bytes) switches to [ELF input](#elf-input-what-actually-shipped-after-lto) instead of compiling. |
 | `-p, --pair OLD:NEW` | Compare two *different* functions within one compilation. Repeatable. Default: every `old_X` is auto-paired with its `new_X`; with no pairs at all, the whole-file summary is printed instead. |
 | `-a, --across FUNC` | Compare the *same* function across two compilations (see below). Repeatable. Mutually exclusive with `--pair`. |
 | `-l, --layout list\|side-by-side` | Force the inspect-mode presentation instead of the adaptive default (1 usable compiler lists, 2 go side by side, more list). Inspect mode only. |
+| `--filter REGEX` | ELF input only: also analyze every function whose name matches `REGEX` (`re.search`) — sweep a subsystem without naming each function. Matches appear in the stats table but are not listed in full. |
+| `--objdump PATH` | Disassembler for ELF input. Default: derived from the first gcc in the matrix by swapping the trailing `gcc` for `objdump`, so `--target`/config globs locate it like they locate the compiler. |
 | `--cc 'CC FLAGS'` | One compiler invocation, command and flags in a single quoted string. Repeatable to build a matrix. |
 | `--target NAME` | A named target from the config file, resolved to a `--cc` entry. Repeatable; appended to the matrix after `--cc` entries. |
 | `--config PATH` | Config file to use. Default search: `asmdiff.toml` next to `SOURCE.c`, then in the current directory, then `~/.config/`. First hit wins. |
@@ -822,7 +930,10 @@ standard library, and contains no project-specific constants. To port:
 - Call detection is a mnemonic heuristic. Register-indirect calls through a
   loaded address (other than x86 `jmp *reg`) can be reported as a call to
   the register's name (e.g. Xtensa `callx8 a10`), which errs toward
-  visibility rather than silence.
+  visibility rather than silence. ELF input narrows this: `-mlongcalls`
+  sequences are resolved to their real callee when objdump's literal
+  annotation names one; genuine function-pointer dispatch still reads
+  as a register.
 - Columns truncate long instruction lines to keep pairs aligned; when a
   line matters, widen it via the `width` parameter of `side_by_side()` or
   read the raw `-S` output by hand.
@@ -886,6 +997,12 @@ g:
 That's why asmdiff compiles with `-S` instead of going through `objdump` on
 a linked object — the thing you're looking for (is this a libcall, and to
 what) is already text, not a relocation entry you have to decode.
+
+(When the question is about the *linked* binary — did LTO inline this,
+did the loop ship as a ZOL — `-S` can't answer it, and driving objdump
+by hand is this same pipeline with more steps. That case is what
+[ELF input](#elf-input-what-actually-shipped-after-lto) automates:
+address-to-label rewriting, longcall resolution, the same analyzers.)
 
 **3. Strip the noise objdump adds that `-S` doesn't.** Every instruction
 line carries a leading address and (unless `--no-show-raw-insn` is passed)
