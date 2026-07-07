@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "asmdiff"
-version = "0.1.5"
+version = "0.1.6"
 description = "Compare per-function assembly between paired C implementations"
 readme = "README.md"
 license = "MIT"
@@ -16,7 +16,7 @@ authors = [
 keywords = [
     "assembly", "compiler", "gcc", "clang", "disassembly", "codegen",
     "diff", "static-analysis", "embedded", "firmware", "dsp",
-    "xtensa", "arm", "riscv", "cli", "devtools", "loop-analysis", "cfg"
+    "xtensa", "arm", "riscv", "cli", "devtools", "loop-analysis", "cfg", "objdump"
 ]
 classifiers = [
     "Environment :: Console",

@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import asmdiff
 
@@ -146,6 +147,98 @@ tbl:
 \t.size\ttbl, .-tbl
 """
 
+# Trimmed but structurally faithful `xtensa-esp32s3-elf-objdump -d` output:
+# a ZOL loop, a backward branch, a cross-function call, a symbol-less data
+# gap (offset-form header) with a `...` filler, and a $-mangled symbol.
+OBJDUMP_ASM = """\
+firmware.elf:     file format elf32-xtensa-le
+
+
+Disassembly of section .flash.text:
+
+40370400 <render_lut>:
+40370400:\t004136        \tentry\ta1, 32
+40370403:\t0c0a          \tmovi.n\ta10, 0
+40370405:\ta48c76        \tloop\ta4, 40370411 <render_lut+0x11>
+40370408:\t3a2a          \tadd.n\ta2, a10, a3
+4037040a:\t020222        \tl32i\ta0, a2, 0
+4037040d:\t0a1a          \tadd.n\ta10, a10, a0
+4037040f:\tf03d          \tnop.n
+40370411:\tf01d          \tretw.n
+
+40370414 <fx_mix>:
+40370414:\t004136        \tentry\ta1, 32
+40370417:\te5fffe        \tcall8\t40370400 <render_lut>
+4037041a:\t0c0a          \tmovi.n\ta10, 0
+4037041c:\t1baa          \taddi.n\ta10, a10, 1
+4037041e:\t56faff        \tbnez\ta10, 4037041c <fx_mix+0x8>
+40370421:\te50c00        \tcall8\t40380000 <memset>
+40370424:\tf01d          \tretw.n
+
+40370428 <render_lpf_lut$constprop$0-0x1130>:
+40370428:\t00000000      \till
+\t...
+
+40371558 <render_lpf_lut$constprop$0>:
+40371558:\t004136        \tentry\ta1, 32
+4037155b:\tf01d          \tretw.n
+"""
+
+# `-mlongcalls` call sequences as objdump renders them: the linker left
+# these out of range, so each is "l32r aN, <lit> (VALUE <sym>)" feeding
+# "callx8 aN".  Covers: adjacent load, load a few insns back, a literal
+# that is a constant (offset-form annotation), no load at all, a load
+# with no value annotation, and a load beyond the 8-insn window.
+OBJDUMP_LONGCALL_ASM = """\
+firmware.elf:     file format elf32-xtensa-le
+
+
+Disassembly of section .flash.text:
+
+40380000 <render_partial>:
+40380000:\t004136        \tentry\ta1, 32
+40380003:\tc0d681        \tl32r\ta8, 40370100 <_stext+0x100> (40002274 <__divsf3>)
+40380006:\t0008e0        \tcallx8\ta8
+40380009:\tc19ea1        \tl32r\ta9, 40370104 <_stext+0x104> (473b8000 <_etext+0x100>)
+4038000c:\tc0cf81        \tl32r\ta8, 40370100 <_stext+0x100> (40002274 <__divsf3>)
+4038000f:\t05bd          \tmov.n\ta11, a5
+40380011:\t51b8          \tl32i.n\ta11, a1, 20
+40380013:\t0008e0        \tcallx8\ta8
+40380016:\t0009e0        \tcallx8\ta9
+40380019:\t000ae0        \tcallx8\ta10
+4038001c:\tf01d          \tretw.n
+
+40380020 <far_call>:
+40380020:\tc0d681        \tl32r\ta8, 40370100 <_stext+0x100> (40002274 <__divsf3>)
+40380023:\tf03d          \tnop.n
+40380025:\tf03d          \tnop.n
+40380027:\tf03d          \tnop.n
+40380029:\tf03d          \tnop.n
+4038002b:\tf03d          \tnop.n
+4038002d:\tf03d          \tnop.n
+4038002f:\tf03d          \tnop.n
+40380031:\tf03d          \tnop.n
+40380033:\t0008e0        \tcallx8\ta8
+40380036:\tf01d          \tretw.n
+
+40380040 <no_annot>:
+40380040:\tc0d681        \tl32r\ta8, 40370100
+40380043:\t0008e0        \tcallx8\ta8
+40380046:\tf01d          \tretw.n
+
+40380060 <memberptr>:
+40380060:\tc0d681        \tl32r\ta8, 40370108 <_stext+0x108> (3fc90000 <amy_global>)
+40380063:\t880848        \tl32i\ta8, a8, 32
+40380066:\t0008e0        \tcallx8\ta8
+40380069:\tf01d          \tretw.n
+
+40380070 <spilled>:
+40380070:\tc0d681        \tl32r\ta8, 40370100 <_stext+0x100> (40002274 <__divsf3>)
+40380073:\t6189          \ts32i.n\ta8, a1, 24
+40380075:\t0008e0        \tcallx8\ta8
+40380078:\tf01d          \tretw.n
+"""
+
 
 class TestExtractFunctions(unittest.TestCase):
     def test_gcc_functions_found(self):
@@ -274,6 +367,260 @@ class TestJumpTableData(unittest.TestCase):
         insns, _ = asmdiff.analyze(body)
         self.assertEqual(insns, 4)    # 8 before the fix (4 data entries)
         self.assertEqual(asmdiff.loop_spans(body), [])
+
+
+class TestObjdumpExtract(unittest.TestCase):
+    """extract_functions_objdump: linked-ELF `objdump -d` output becomes
+    the same cleaned-lines shape extract_functions produces, with branch
+    and loop target addresses rewritten to synthetic local labels so
+    analyze() and loop_spans() work unchanged."""
+
+    def setUp(self):
+        self.funcs = asmdiff.extract_functions_objdump(OBJDUMP_ASM)
+
+    def test_function_headers_found(self):
+        self.assertEqual(sorted(self.funcs),
+                         ["fx_mix", "render_lpf_lut$constprop$0",
+                          "render_lut"])
+
+    def test_data_region_headers_skipped(self):
+        # <sym-0x1130> marks a literal pool / symbol-less gap whose bytes
+        # disassemble as garbage; nothing from it may leak into a body.
+        for body in self.funcs.values():
+            self.assertFalse(any(ln.startswith("ill") for ln in body))
+
+    def test_filler_lines_skipped(self):
+        for body in self.funcs.values():
+            self.assertNotIn("...", body)
+
+    def test_insn_lines_cleaned(self):
+        self.assertEqual(self.funcs["render_lut"][0], "entry\ta1, 32")
+
+    def test_hex_bytes_column_dropped(self):
+        # The byte dump ("004136") is one token; it must never be read
+        # as the mnemonic or survive into the cleaned line.
+        for body in self.funcs.values():
+            for ln in body:
+                self.assertNotRegex(ln, r"^[0-9a-f]+\s")
+
+    def test_zol_end_label_synthesized(self):
+        body = self.funcs["render_lut"]
+        self.assertIn("loop\ta4, .L11_LEND", body)
+        self.assertEqual(body[-2:], [".L11_LEND:", "retw.n"])
+
+    def test_zol_span_via_loop_spans(self):
+        self.assertEqual(asmdiff.loop_spans(self.funcs["render_lut"]),
+                         [(".L11_LEND", 4)])
+
+    def test_backward_branch_label_synthesized(self):
+        body = self.funcs["fx_mix"]
+        self.assertIn(".L8:", body)
+        self.assertIn("bnez\ta10, .L8", body)
+
+    def test_backward_branch_span(self):
+        self.assertEqual(asmdiff.loop_spans(self.funcs["fx_mix"]),
+                         [(".L8", 2)])
+
+    def test_cross_function_target_uses_symbol(self):
+        body = self.funcs["fx_mix"]
+        self.assertIn("call8\trender_lut", body)
+        self.assertIn("call8\tmemset", body)
+
+    def test_calls_reported_by_analyze(self):
+        _, calls = asmdiff.analyze(self.funcs["fx_mix"])
+        self.assertEqual(calls, ["render_lut", "memset"])
+
+    def test_zol_body_is_call_free(self):
+        insns, calls = asmdiff.analyze(self.funcs["render_lut"])
+        self.assertEqual((insns, calls), (8, []))
+
+
+class TestLongcallResolver(unittest.TestCase):
+    """Xtensa -mlongcalls survivors: a callx8 fed by an "l32r aN, <lit>
+    (VALUE <sym>)" reports <sym> as the callee; without that evidence
+    the register is kept (genuinely indirect, or binutils format
+    drift)."""
+
+    def setUp(self):
+        self.funcs = asmdiff.extract_functions_objdump(OBJDUMP_LONGCALL_ASM)
+
+    def test_adjacent_load_resolved(self):
+        self.assertIn("callx8\t__divsf3", self.funcs["render_partial"])
+
+    def test_load_a_few_insns_back_resolved(self):
+        # Both __divsf3 sites resolve, including the one whose l32r is
+        # three instructions above the call.
+        body = self.funcs["render_partial"]
+        self.assertEqual(body.count("callx8\t__divsf3"), 2)
+
+    def test_constant_literal_not_a_callee(self):
+        # a9's literal annotation is <_etext+0x100> - a value, not a
+        # function symbol; the call must stay indirect.
+        self.assertIn("callx8\ta9", self.funcs["render_partial"])
+
+    def test_no_load_stays_indirect(self):
+        self.assertIn("callx8\ta10", self.funcs["render_partial"])
+
+    def test_calls_reported_by_analyze(self):
+        _, calls = asmdiff.analyze(self.funcs["render_partial"])
+        self.assertEqual(calls, ["__divsf3", "a9", "a10"])
+
+    def test_load_beyond_window_stays_indirect(self):
+        self.assertIn("callx8\ta8", self.funcs["far_call"])
+
+    def test_unannotated_load_stays_indirect(self):
+        self.assertIn("callx8\ta8", self.funcs["no_annot"])
+
+    def test_clobbered_register_stays_indirect(self):
+        # l32r loads a struct address (amy_global) but the l32i then
+        # replaces a8 with a member function pointer: reporting the
+        # struct as the callee would be wrong, so the call must stay
+        # indirect.
+        self.assertIn("callx8\ta8", self.funcs["memberptr"])
+        _, calls = asmdiff.analyze(self.funcs["memberptr"])
+        self.assertNotIn("amy_global", calls)
+
+    def test_intervening_store_does_not_block(self):
+        # s32i.n reads a8 (stores it to the stack) without writing it,
+        # so the loaded callee is still live at the call.
+        self.assertIn("callx8\t__divsf3", self.funcs["spilled"])
+
+
+class TestElfMode(unittest.TestCase):
+    """FIRMWARE.elf positional: disassemble a linked binary through the
+    toolchain's objdump instead of compiling, selecting functions by
+    name or --filter REGEX."""
+
+    def _elf(self, tmp):
+        p = Path(tmp) / "fw.elf"
+        p.write_bytes(b"\x7fELF" + b"\0" * 12)
+        return str(p)
+
+    def _run(self, argv):
+        real = asmdiff.run_objdump
+        asmdiff.run_objdump = lambda objdump, elf: OBJDUMP_ASM
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                status = asmdiff.main(argv)
+        finally:
+            asmdiff.run_objdump = real
+        return status, out.getvalue()
+
+    def _expect_error(self, argv, fragment):
+        real = asmdiff.run_objdump
+        asmdiff.run_objdump = lambda objdump, elf: OBJDUMP_ASM
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err), \
+                 self.assertRaises(SystemExit) as ctx:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    asmdiff.main(argv)
+        finally:
+            asmdiff.run_objdump = real
+        self.assertIn(fragment, err.getvalue() + str(ctx.exception))
+
+    def test_is_elf_magic_not_extension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(asmdiff.is_elf(self._elf(tmp)))
+            fake = Path(tmp) / "not-really.elf"
+            fake.write_text("int main;")
+            self.assertFalse(asmdiff.is_elf(str(fake)))
+            self.assertFalse(asmdiff.is_elf(str(Path(tmp) / "absent.elf")))
+
+    def test_derive_objdump_swaps_gcc(self):
+        self.assertEqual(
+            asmdiff.derive_objdump(
+                ["/tc/bin/xtensa-esp32s3-elf-gcc -O2 -mlongcalls"]),
+            "/tc/bin/xtensa-esp32s3-elf-objdump")
+        self.assertEqual(asmdiff.derive_objdump(["gcc -O3"]), "objdump")
+        self.assertIsNone(asmdiff.derive_objdump(["clang -O3"]))
+        self.assertEqual(asmdiff.derive_objdump(["clang -O3", "gcc -O2"]),
+                         "objdump")
+
+    def test_named_function_listing_and_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status, out = self._run([self._elf(tmp), "render_lut",
+                                     "--objdump", "od"])
+        self.assertEqual(status, 0)
+        self.assertIn("render_lut:", out)
+        self.assertIn("loop\ta4, .L11_LEND", out)
+        self.assertIn("function", out)           # stats table header
+
+    def test_filter_prints_table_without_listings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status, out = self._run([self._elf(tmp), "--filter", "render_",
+                                     "--objdump", "od"])
+        self.assertEqual(status, 0)
+        self.assertIn("render_lut", out)
+        self.assertIn("render_lpf_lut$constprop$0", out)
+        self.assertNotIn("fx_mix", out)
+        self.assertNotIn("entry\t", out)         # table only, no listings
+
+    def test_names_and_filter_combine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status, out = self._run([self._elf(tmp), "fx_mix",
+                                     "--filter", "render_lut$",
+                                     "--objdump", "od"])
+        self.assertEqual(status, 0)
+        self.assertIn("fx_mix:", out)            # named: listed
+        self.assertIn("render_lut", out)         # filtered: in the table
+
+    def test_unknown_function_suggests_close_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._expect_error([self._elf(tmp), "rendr_lut",
+                                "--objdump", "od"],
+                               "render_lut")
+
+    def test_bare_elf_needs_names_or_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._expect_error([self._elf(tmp), "--objdump", "od"],
+                               "--filter")
+
+    def test_filter_matching_nothing_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._expect_error([self._elf(tmp), "--filter", "zzz",
+                                "--objdump", "od"], "matched no function")
+
+    def test_bad_filter_regex_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._expect_error([self._elf(tmp), "--filter", "(",
+                                "--objdump", "od"], "bad --filter regex")
+
+    def test_compile_flags_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._expect_error([self._elf(tmp), "f", "--pair", "a:b",
+                                "--objdump", "od"], "disassembled")
+
+    def test_second_file_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            other = Path(tmp) / "b.c"
+            other.touch()
+            self._expect_error([self._elf(tmp), str(other),
+                                "--objdump", "od"], "one binary")
+
+    def test_filter_without_elf_rejected(self):
+        self._expect_error(["x.c", "f", "--filter", "r"], "ELF input")
+
+    def test_no_gcc_in_matrix_needs_objdump(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._expect_error([self._elf(tmp), "f", "--cc", "clang -O3"],
+                               "--objdump")
+
+    def test_target_db_discovery_not_triggered(self):
+        # ELF mode never compiles, so a target's compile_commands = true
+        # must not launch (and fail) database discovery while the target
+        # is only being used to locate its objdump.
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "asmdiff.toml"
+            cfg.write_text('[t]\ncc = "/tc/bin/xtensa-esp32s3-elf-gcc"\n'
+                           'compile_commands = true\n')
+            status, out = self._run([self._elf(tmp), "render_lut",
+                                     "--config", str(cfg), "--target", "t"])
+        self.assertEqual(status, 0)
+        self.assertIn("render_lut:", out)
 
 
 class TestAutoPairs(unittest.TestCase):
@@ -1249,6 +1596,114 @@ class TestShortAliases(unittest.TestCase):
             with _inside(cwd):
                 self._expect_error(["x.c", "f", "-db"],
                                    "no compile_commands.json")
+
+
+class TestConfigEditing(unittest.TestCase):
+    """--edit-config / --example-config and the embedded example."""
+
+    _example_path = (Path(asmdiff.__file__).resolve().parent
+                     / "asmdiff.example.toml")
+
+    def test_example_constant_parses(self):
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        asmdiff.tomllib.loads(asmdiff.EXAMPLE_CONFIG)
+
+    @unittest.skipUnless(_example_path.is_file(),
+                         "asmdiff.example.toml only exists in a repo checkout")
+    def test_example_constant_matches_repo_file(self):
+        self.assertEqual(asmdiff.EXAMPLE_CONFIG,
+                         self._example_path.read_text())
+
+    def test_visual_beats_editor(self):
+        self.assertEqual(
+            asmdiff.resolve_editor({"VISUAL": "vim", "EDITOR": "nano"}),
+            ["vim"])
+
+    def test_editor_value_is_split(self):
+        self.assertEqual(asmdiff.resolve_editor({"EDITOR": "code -w"}),
+                         ["code", "-w"])
+
+    def test_no_editor_is_an_error_on_posix(self):
+        if os.name == "nt":
+            self.skipTest("POSIX behaviour")
+        with self.assertRaises(SystemExit):
+            asmdiff.resolve_editor({})
+
+    def test_notepad_fallback_on_windows(self):
+        with mock.patch.object(asmdiff.os, "name", "nt"):
+            self.assertEqual(asmdiff.resolve_editor({}), ["notepad"])
+
+    def test_edit_creates_missing_config_from_example(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "sub" / "asmdiff.toml"
+            calls = []
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"VISUAL": "myedit"}), \
+                 mock.patch.object(asmdiff.subprocess, "call",
+                                   side_effect=lambda cmd:
+                                       calls.append(cmd) or 7), \
+                 contextlib.redirect_stderr(err):
+                status = asmdiff.edit_config(str(target))
+            self.assertEqual(status, 7)   # editor's status passes through
+            self.assertEqual(target.read_text(), asmdiff.EXAMPLE_CONFIG)
+            self.assertEqual(calls, [["myedit", str(target)]])
+            self.assertIn("created", err.getvalue())
+            self.assertNotIn("warning", err.getvalue())
+
+    def test_edit_keeps_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "asmdiff.toml"
+            target.write_text("default = 'gcc'\n")
+            with mock.patch.dict(os.environ, {"VISUAL": "e"}), \
+                 mock.patch.object(asmdiff.subprocess, "call",
+                                   return_value=0):
+                status = asmdiff.edit_config(str(target))
+            self.assertEqual(status, 0)
+            self.assertEqual(target.read_text(), "default = 'gcc'\n")
+
+    def test_edit_warns_on_unparsable_result(self):
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "asmdiff.toml"
+            target.write_text("not = valid = toml\n")
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"VISUAL": "e"}), \
+                 mock.patch.object(asmdiff.subprocess, "call",
+                                   return_value=0), \
+                 contextlib.redirect_stderr(err):
+                status = asmdiff.edit_config(str(target))
+            self.assertEqual(status, 0)   # warn-only, status untouched
+            self.assertIn("warning", err.getvalue())
+
+    def test_edit_defaults_to_global_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with mock.patch.object(asmdiff.Path, "home",
+                                   return_value=Path(tmp)), \
+                 mock.patch.dict(os.environ, {"VISUAL": "e"}), \
+                 mock.patch.object(asmdiff.subprocess, "call",
+                                   return_value=0), \
+                 contextlib.redirect_stderr(err):
+                asmdiff.edit_config(None)
+            self.assertTrue(
+                (Path(tmp) / ".config" / "asmdiff.toml").is_file())
+
+    def test_example_config_prints_constant(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = asmdiff.main(["--example-config"])
+        self.assertEqual(status, 0)
+        self.assertEqual(out.getvalue(), asmdiff.EXAMPLE_CONFIG)
+
+    def test_no_sources_is_still_an_error(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+             self.assertRaises(SystemExit) as ctx:
+            asmdiff.main([])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("SOURCE.c required", err.getvalue())
 
 
 if __name__ == "__main__":
