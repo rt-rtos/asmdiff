@@ -295,6 +295,48 @@ included `asmdiff.example.toml` is a starting point. If a flag or include
 path must vary per machine, that's what per-machine config files are for —
 nothing lives in the tool.
 
+### Bundled ESP profiles
+
+`asmdiff.example.toml` ships ready-made targets for the common ESP32
+devkits, grouped by toolchain family:
+
+- **riscv32-esp** — `esp32c3`, `esp32c6`, `esp32h2`, `esp32p4`. One shared
+  `riscv32-esp-elf-gcc` binary; the targets differ only in `-march`/`-mabi`
+  (P4 is the only one with an FPU, so it uses the hard-float ABI).
+- **xtensa-esp** — `esp32`, `esp32s2`, `esp32s3`. The unified
+  `xtensa-esp-elf` toolchain ships one gcc binary per chip.
+
+```toml
+[esp32c3]
+cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+flags = ["-O2", "-march=rv32imc_zicsr_zifencei", "-mabi=ilp32"]
+
+[esp32c6]
+cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+flags = ["-O2", "-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"]
+# ... esp32h2, esp32p4
+```
+
+A profile is nothing more than a curated group of targets — the `esp-*`
+glob finds the toolchains `idf_tools.py install` left in `~/.espressif`
+(the newest, by the version-sort rule above, when several are
+installed), and setting `default` to the group runs it as one matrix:
+
+```toml
+default = ["esp32c3", "esp32c6", "esp32h2", "esp32p4"]
+```
+
+The bundled flags are the minimal arch selection (`-O2` plus
+`-march`/`-mabi` or `-mlongcalls`); append whatever your project ships
+with (`-DNDEBUG`, `-Os`, include paths, ...).
+
+Two more basic profiles cover non-ESP boards: `stm32`
+(`arm-none-eabi-gcc`, Cortex-M4 by default — adjust `-mcpu` to your
+family) and `rp2350` (`riscv64-unknown-elf-gcc` targeting the Hazard3
+cores in RISC-V mode). These toolchains have no single well-known
+install location, so the bundled entries use bare binary names: the
+compiler must be on `PATH`, or edit `cc` to a full path.
+
 ### Borrowing includes from `compile_commands.json`
 
 A real project source rarely compiles with a handful of `-I` flags. An

@@ -30,22 +30,69 @@ flags = ["-O3", "-Wall", "-Wextra"]
 # several installed toolchains resolves to the highest version-sorted
 # one (announced on stderr); pin the exact esp-NN directory instead if
 # reproducibility across sessions matters more than convenience.
+#
+# The ESP profiles below keep flags minimal (-O2 plus arch selection);
+# append what your project ships with (-DNDEBUG, -Os, -I..., ...).
+# A source that pulls in framework headers (ESP-IDF's freertos/*, a
+# generated sdkconfig.h, ...) additionally needs the build's -I/-D
+# flags: add `compile_commands = true` (or a path) to any target to
+# borrow them from the build's compile_commands.json - see README.
+
+# --- Profile: riscv32-esp (ESP32-C3 / C6 / H2 / P4) -------------------
+# All RISC-V ESP chips share one riscv32-esp-elf-gcc binary; the
+# targets differ only in -march/-mabi.  Uncomment to run the whole
+# profile as the default matrix:
+# default = ["esp32c3", "esp32c6", "esp32h2", "esp32p4"]
+
+[esp32c3]
+cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+flags = ["-O2", "-march=rv32imc_zicsr_zifencei", "-mabi=ilp32"]
+
+[esp32c6]
+cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+flags = ["-O2", "-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"]
+
+[esp32h2]
+cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+flags = ["-O2", "-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"]
+
+# ESP32-P4 is the only ESP RISC-V chip with an FPU, hence the
+# hard-float ABI.
+[esp32p4]
+cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+flags = ["-O2", "-march=rv32imafc_zicsr_zifencei", "-mabi=ilp32f"]
+
+# --- Profile: xtensa-esp (ESP32 / S2 / S3) ----------------------------
+# The unified xtensa-esp-elf toolchain ships one gcc binary per chip.
+# default = ["esp32", "esp32s2", "esp32s3"]
+
+[esp32]
+cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc"
+flags = ["-O2", "-mlongcalls"]
+
+[esp32s2]
+cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s2-elf-gcc"
+flags = ["-O2", "-mlongcalls"]
+
 [esp32s3]
 cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
-flags = ["-O2", "-mlongcalls", "-DNDEBUG"]
-
-# A project source that pulls in framework headers (ESP-IDF's freertos/*,
-# esp_*, a generated sdkconfig.h, ...) needs the dozens of -I/-D flags its
-# build system passes.  Point `compile_commands` at the database that build
-# emits (idf.py leaves build/compile_commands.json), and asmdiff copies the
-# include/define flags recorded there for the file being compiled — so you
-# never transcribe include paths by hand.  The compiler and -O/-m flags
-# still come from cc/flags; only the header environment is borrowed.
-# A path expands ~ and $VARS; `compile_commands = true` instead searches
-# at run time: each directory from the CWD up to the repository root,
-# and its build/ subdirectory (a source missing from a database found
-# that way is compiled without borrowed flags, with a note).
-[esp32s3-idf]
-cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
 flags = ["-O2", "-mlongcalls"]
-compile_commands = true
+
+# --- Profile: other embedded (STM32 / RP2350) -------------------------
+# Unlike the ESP toolchains these have no single well-known install
+# path: the compilers must be on PATH, or edit cc to a full path.
+
+# Any Cortex-M STM32; adjust -mcpu to your family (cortex-m0plus,
+# cortex-m3, cortex-m7, cortex-m33, ...) and add -mfloat-abi/-mfpu
+# flags if your project uses the FPU.
+[stm32]
+cc = "arm-none-eabi-gcc"
+flags = ["-O2", "-mcpu=cortex-m4", "-mthumb"]
+
+# RP2350 Hazard3 cores in RISC-V mode; riscv64-unknown-elf-gcc is
+# multilib, -march/-mabi select rv32.  Hazard3 also implements the
+# Zba/Zbb/Zbs/Zbkb extensions (append to -march on gcc >= 13, as
+# pico-sdk does).
+[rp2350]
+cc = "riscv64-unknown-elf-gcc"
+flags = ["-O2", "-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"]
