@@ -1,8 +1,13 @@
 # [asmdiff](https://pypi.org/project/asmdiff/) 
 ## per-function assembly comparison for paired C implementations
 
-> asmdiff is a stdlib only command-line tool for comparing the generated assembly of individual C functions across implementations, compiler flags, compiler versions, and source revisions. It is intended for investigating compiler code generation rather than benchmarking runtime performance.
+> asmdiff is a stdlib only command-line tool for comparing the generated assembly of individual C functions across implementations, compiler flags, compiler versions, and source revisions. It is intended for
+investigating compiler code generation rather than benchmarking runtime performance.
 
+<details>
+	
+<summary>Quickstart Example</summary>
+	
 [![asmdiff comparing gcc and clang assembly for paired C functions, with a fold-vs-libcall summary](demo/quickstart.gif)](demo/quickstart.gif)
 
 *Each function appears twice - `old_*` and `new_*`, the same routine
@@ -10,6 +15,10 @@ before and after a rewrite - compiled across a gcc/clang matrix and diffed
 side by side. The summary's `insns` and `calls` columns are the payoff:
 `old_rt`'s 9-instruction `exp2f` call collapses to `new_rt`'s 2-instruction
 `ldexpf`. (Click to enlarge.)*
+
+---
+
+</details>
 
 ### Try it yourself:
 
@@ -549,21 +558,12 @@ Details that make it robust:
 
 ### Auto-discovering the database
 
-When you run asmdiff from inside the project anyway, the path is
-redundant. Two opt-ins skip it:
+<details>
 
-```toml
-[esp32s3-idf]
-cc = "xtensa-esp32s3-elf-gcc"
-flags = ["-O2", "-mlongcalls"]
-compile_commands = true      # search instead of naming a path
-```
+<summary>Real Project Example</summary>
 
-```bash
-asmdiff biquad.c --compile-commands            # same, for any matrix
-asmdiff biquad.c --compile-commands path/to/compile_commands.json
-```
-
+#### All Esp32 Xtensa toolchains in one call from the same compile_commands
+	
 Below, `-db` (short for `--compile-commands`) does this on a real ESP-IDF
 synth firmware: one `synth_core` effects source, compiled across the
 esp32 / esp32s2 / esp32s3 cross-toolchains in a single run, with each
@@ -582,6 +582,26 @@ never emit, so the same source is measurably heavier there:
 *One source, three real chip toolchains, build flags borrowed
 automatically - the kind of comparison that otherwise needs three separate
 build trees. (Click to enlarge.)*
+
+---
+
+</details>
+
+When you run asmdiff from inside the project anyway, the path is
+redundant. Two opt-ins skip it:
+
+```toml
+[esp32s3-idf]
+cc = "xtensa-esp32s3-elf-gcc"
+flags = ["-O2", "-mlongcalls"]
+compile_commands = true      # search instead of naming a path
+```
+
+```bash
+asmdiff biquad.c --compile-commands            # same, for any matrix
+asmdiff biquad.c --compile-commands path/to/compile_commands.json
+```
+
 
 Both walk up from the current directory, checking each level for
 `compile_commands.json` and then `build/compile_commands.json` (where
