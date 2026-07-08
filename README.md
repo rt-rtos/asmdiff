@@ -1,5 +1,5 @@
 # [asmdiff](https://pypi.org/project/asmdiff/) 
-## per-function assembly comparison for paired C implementations
+## per-function assembly inspection and comparison, across a compiler matrix or from a shipped ELF
 
 > asmdiff is a stdlib only command-line tool for comparing the generated assembly of individual C functions across implementations, compiler flags, compiler versions, and source revisions. It is intended for
 investigating compiler code generation rather than benchmarking runtime performance.

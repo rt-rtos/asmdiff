@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Compare per-function assembly between paired C implementations.
+"""Per-function assembly inspection and comparison, across a compiler matrix or from a shipped ELF.
 
-Compiles a harness C file across a matrix of compilers, extracts each
+Compiles a C source file across a matrix of compilers, extracts each
 variant function's assembly from the -S output, and prints side-by-side
 listings plus a summary of instruction counts, loop spans (instructions
 between a local label and its last backward branch), and outbound calls.

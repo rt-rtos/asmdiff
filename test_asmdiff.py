@@ -11,6 +11,46 @@ from unittest import mock
 
 import asmdiff
 
+# Holds the isolation temp dir alive for the module's lifetime.
+_ISOLATION = None
+
+
+def setUpModule():
+    """Isolate config discovery from the developer's real environment.
+
+    Tests run ``asmdiff.main()`` in-process, and ``find_config`` falls back
+    to ``$HOME/.config/asmdiff.toml`` (and a ``./asmdiff.toml`` in the CWD).
+    A real config on the machine - e.g. one whose ``default`` names cross
+    targets - would otherwise leak into any test that passes no ``--config``,
+    changing the matrix and masking the arg-validation errors it asserts on.
+    Point HOME and the CWD at empty temp dirs so discovery finds nothing
+    unless a test sets one up itself.
+    """
+    global _ISOLATION
+    _ISOLATION = tempfile.TemporaryDirectory()
+    home = Path(_ISOLATION.name) / "home"
+    cwd = Path(_ISOLATION.name) / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    setUpModule._saved = (os.environ.get("HOME"),
+                          os.environ.get("USERPROFILE"),
+                          os.getcwd())
+    os.environ["HOME"] = str(home)
+    os.environ["USERPROFILE"] = str(home)   # Path.home() on native Windows
+    os.chdir(cwd)
+
+
+def tearDownModule():
+    home, userprofile, cwd = setUpModule._saved
+    os.chdir(cwd)
+    for name, value in (("HOME", home), ("USERPROFILE", userprofile)):
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    _ISOLATION.cleanup()
+
+
 # Trimmed but structurally faithful `gcc -O3 -S` x86-64 output.
 GCC_ASM = """\
 \t.file\t"cmp.c"
