@@ -3,6 +3,14 @@
 
 > asmdiff is a stdlib only command-line tool for comparing the generated assembly of individual C functions across implementations, compiler flags, compiler versions, and source revisions. It is intended for investigating compiler code generation rather than benchmarking runtime performance.
 
+[![asmdiff comparing gcc and clang assembly for paired C functions, with a fold-vs-libcall summary](demo/quickstart.gif)](demo/quickstart.gif)
+
+*Each function appears twice - `old_*` and `new_*`, the same routine
+before and after a rewrite - compiled across a gcc/clang matrix and diffed
+side by side. The summary's `insns` and `calls` columns are the payoff:
+`old_rt`'s 9-instruction `exp2f` call collapses to `new_rt`'s 2-instruction
+`ldexpf`. (Click to enlarge.)*
+
 ### Try it yourself:
 
 `$ uvx asmdiff` / `$ pipx run asmdiff`
@@ -255,9 +263,10 @@ everywhere else; two things are ELF-specific:
   evidence is missing or the register is overwritten in between -
   a genuine function-pointer dispatch still reads as indirect.
 
-What this looks like on real firmware: the same binary's sequencer
-core (project code, not a synth library) surfaces three findings in
-one row scan.
+What this looks like on real firmware: this binary's sequencer path -
+here in the vendored AMY synth engine (`components/amy/src/sequencer.c`,
+with the divide sourced from `amy_sysclock()` in `api.c`) - surfaces
+three findings in one row scan.
 
 ```
 $ asmdiff build/S3-Amysynth.elf --filter 'sequencer_(process_tick|recompute|timer_callback)'
@@ -271,7 +280,12 @@ sequencer_process_tick$lto_priv$0    117    .L2e:96 .L48:85 .L8d:6  xQueueSemaph
 A timer callback pays a software float divide *and* a 64-bit
 `__udivdi3` inside its 41-instruction loop - the
 [silent software divide](#example-catching-a-silent-software-divide)
-pattern, caught in shipped firmware instead of a harness.
+pattern, caught in shipped firmware instead of a harness. asmdiff was
+built to hunt exactly this in AMY, and this callback was the payoff: the
+pairing was confirmed as both a codegen cost and an upstream correctness
+bug - `amy_sysclock()`'s `uint32_t` sample count wraps far sooner than
+its comment claims and loses precision on long uptimes - and is fixed
+locally with a PR pending to shorepine/amy.
 `sequencer_recompute`'s `__extendsfdf2 -> __divdf3 -> __muldf3` chain
 is the double-promotion smell (typically an unsuffixed `60.0`-style
 literal) on a chip whose FPU is single-precision only. And the
@@ -549,6 +563,25 @@ compile_commands = true      # search instead of naming a path
 asmdiff biquad.c --compile-commands            # same, for any matrix
 asmdiff biquad.c --compile-commands path/to/compile_commands.json
 ```
+
+Below, `-db` (short for `--compile-commands`) does this on a real ESP-IDF
+synth firmware: one `synth_core` effects source, compiled across the
+esp32 / esp32s2 / esp32s3 cross-toolchains in a single run, with each
+chip's include/define flags auto-borrowed from `build/compile_commands.json`
+so the component actually compiles. No `--target` and no path are given -
+the config's `default` names the three chips and `-db` walks up to find the
+database. Reading it left to right: the three `==` banners are the three
+toolchains; each table is that chip's per-function `insns` / loop spans /
+`calls`. The tell is in the `calls` column - the esp32-S2 (the one variant
+with no hardware FPU) picks up softfloat conversion libcalls
+`__floatsisf`, `__floatunsisf`, `__ltsf2` that its FPU-equipped siblings
+never emit, so the same source is measurably heavier there:
+
+[![asmdiff running a three-chip xtensa matrix (esp32/s2/s3) on one firmware source via -db](demo/esp32-matrix.gif)](demo/esp32-matrix.gif)
+
+*One source, three real chip toolchains, build flags borrowed
+automatically - the kind of comparison that otherwise needs three separate
+build trees. (Click to enlarge.)*
 
 Both walk up from the current directory, checking each level for
 `compile_commands.json` and then `build/compile_commands.json` (where
