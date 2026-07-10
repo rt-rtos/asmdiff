@@ -13,12 +13,14 @@ Usage:
                              [--pair OLD:NEW]... [--across FUNC]...
                              [--cc 'CC FLAGS']... [--target NAME]...
                              [--config PATH] [--compile-commands [PATH]]
-                             [--flags-like PATH]
-                             [--layout list|side-by-side] [-v]
+                             [--flags-like PATH] [--db-includes]
+                             [--summary-only] [--collapse] [--span-stats]
+                             [--json] [--layout list|side-by-side] [-v]
                              [-- EXTRA_FLAGS...]
     tools/asmdiff/asmdiff.py FIRMWARE.elf [FUNC...] [--filter REGEX]
-                             [--objdump PATH]
-    tools/asmdiff/asmdiff.py --edit-config | --example-config
+                             [--objdump PATH] [--summary-only]
+                             [--span-stats] [--json]
+    tools/asmdiff/asmdiff.py --edit-config | --example-config | --version
 
 Five modes:
   SOURCE.c FUNC   inspect: print the named function's assembly, no
@@ -44,6 +46,14 @@ Five modes:
   (neither)       whole-file summary: per-function counts plus a file
                   total, for one file or side by side for two.
 
+Four flags shape the output: --summary-only prints only the stats
+tables, --collapse elides identical runs in side-by-side listings
+keeping context around each difference, --span-stats follows each
+stats table with a per-loop-span instruction mix (load/store/mul/
+branch/other counts; branch includes calls), and --json replaces the
+tables with one JSON document of per-function records (implies
+--summary-only) for scripted callers.
+
 Compilers come from --cc strings, from named targets in an asmdiff.toml
 config file (--target NAME), from the config's `default` entry, or —
 failing all of those — plain `gcc -O3` and `clang -O3`.
@@ -62,7 +72,11 @@ the CWD up to the repository root, and its build/ subdirectory; a source
 absent from a database found that way is compiled without borrowed flags
 (with a note) rather than being an error.  --flags-like PATH lets such a
 source borrow the flags recorded for PATH, so a modified copy compares
-against its original under one header environment.
+against its original under one header environment.  --db-includes limits
+any borrow to the header-search paths, re-emitted as -idirafter so they
+cannot shadow the host's own system headers: a host target can then
+compile a cross project's source without inheriting cross-only defines,
+-specs, or a libc-overlay include directory.
 """
 import argparse
 import difflib
@@ -83,6 +97,10 @@ try:
     import tomllib  # Python >= 3.11; config files are optional without it
 except ModuleNotFoundError:
     tomllib = None
+
+# Single source of truth for the package version: pyproject.toml reads
+# it from here (hatchling dynamic version).
+__version__ = "0.3.0"
 
 DEFAULT_COMPILERS = ["gcc", "clang"]
 FALLBACK_FLAGS = "-O3"
@@ -118,6 +136,12 @@ flags = [
 
 [clang]
 cc = "clang"
+flags = ["-O3", "-Wall", "-Wextra"]
+
+# The name the docs use for "your native compiler" (--target host): an
+# alias of [gcc] kept as its own table so the examples work verbatim.
+[host]
+cc = "gcc"
 flags = ["-O3", "-Wall", "-Wextra"]
 
 # cc values may use ~, $VARS, and glob patterns.  A glob that matches
@@ -213,6 +237,13 @@ _CC_DB_EQ_FLAGS = ("-specs", "--specs", "--sysroot")
 _DB_CACHE = {}
 _MISS_NOTED = set()
 _BORROW_NOTED = set()
+# --db-includes: borrow only the header-search paths from the database.
+# A project's -I paths are valid on any target; its -D defines, forced
+# includes, and -specs/--sysroot are tied to the arch the database was
+# built for — this is how a host target compiles a cross project's
+# source without inheriting cross-only flags.
+DB_INCLUDES = False
+_DB_SEARCH_PATH_FLAGS = ("-I", "-iquote", "-isystem", "-idirafter")
 # --flags-like PATH: a source with no database entry borrows the flags
 # recorded for PATH.  This is how a modified copy of a project source gets
 # the same header environment as its original, so an --across between them
@@ -383,6 +414,32 @@ def load_compile_commands(path):
     return data
 
 
+def _borrowed(flags):
+    """Apply --db-includes to one borrowed flag list: keep the
+    header-search pairs (-I/-iquote/-isystem/-idirafter PATH), drop
+    defines, forced includes, and driver-level flags.  Identity when
+    the option is off.
+
+    Kept paths are re-emitted as -idirafter — searched AFTER the
+    compiler's own system directories — because a cross project's
+    include set can overlay libc headers (ESP-IDF ships an esp_libc/
+    platform_include whose stdio.h would otherwise shadow the host's);
+    project-only headers still resolve, the host's libc wins.
+    """
+    if not DB_INCLUDES:
+        return flags
+    kept, i = [], 0
+    while i < len(flags):
+        f = flags[i]
+        if f in _CC_DB_PATH_FLAGS:              # split "-I path" pair
+            if f in _DB_SEARCH_PATH_FLAGS:
+                kept += ["-idirafter", flags[i + 1]]
+            i += 2
+        else:                                   # -DFOO / -specs=... token
+            i += 1
+    return kept
+
+
 def compile_commands_flags(db_path, source, missing_ok=False):
     """Header/define flags for ``source`` taken from a compile_commands.json.
 
@@ -401,7 +458,7 @@ def compile_commands_flags(db_path, source, missing_ok=False):
     want = Path(source).resolve()
     flags, name_seen = _lookup_entry(entries, want)
     if flags is not None:
-        return flags
+        return _borrowed(flags)
     if FLAGS_LIKE:
         like = Path(FLAGS_LIKE).resolve()
         like_flags, _ = _lookup_entry(entries, like)
@@ -413,7 +470,7 @@ def compile_commands_flags(db_path, source, missing_ok=False):
             _BORROW_NOTED.add(key)
             print(f"note: {source} not in {db_path}; borrowing the flags "
                   f"recorded for {FLAGS_LIKE}", file=sys.stderr)
-        return like_flags
+        return _borrowed(like_flags)
     suggest = ("; --flags-like PATH can borrow another entry's flags"
                if name_seen else "")
     if missing_ok:
@@ -685,8 +742,8 @@ def analyze(lines):
 LABEL_REF = re.compile(r"\.L[\w$.]+")
 
 
-def loop_spans(lines):
-    """Return [(label, insns)] spans for cleaned asm lines.
+def loop_span_ranges(lines):
+    """Return [(label, lo, hi)] line-index ranges for loop spans.
 
     A span is the run of instructions from a local label to the last
     instruction that references it from below — a backward branch, which
@@ -694,9 +751,7 @@ def loop_spans(lines):
     Xtensa zero-overhead loops (loop/loopnez/loopgt) reference their END
     label instead; there the span is the instructions the loop encloses.
     Spans are reported in order of appearance, one per label; nested
-    labels yield nested spans.  The count states how many instructions
-    lie in the span — nothing about trip count or hotness, which the
-    reader must judge from the source.
+    labels yield nested spans.
     """
     label_at = {ln[:-1]: i for i, ln in enumerate(lines)
                 if ln.endswith(":")}
@@ -719,11 +774,127 @@ def loop_spans(lines):
                 lo = min(lo, spans[ref][0])
                 hi = max(hi, spans[ref][1])
             spans[ref] = (lo, hi)
+    return [(ref, lo, hi) for ref, (lo, hi)
+            in sorted(spans.items(), key=lambda kv: kv[1])]
+
+
+def loop_spans(lines):
+    """Return [(label, insns)] spans for cleaned asm lines.
+
+    The count states how many instructions lie in the span — nothing
+    about trip count or hotness, which the reader must judge from the
+    source.
+    """
     result = []
-    for ref, (lo, hi) in sorted(spans.items(), key=lambda kv: kv[1]):
+    for ref, lo, hi in loop_span_ranges(lines):
         insns = sum(1 for ln in lines[lo:hi + 1] if not ln.endswith(":"))
         result.append((ref, insns))
     return result
+
+
+# --span-stats buckets, by mnemonic table.  Covers the targets the tool
+# routinely meets: Xtensa, RISC-V, and ARM by exact (or dot-stripped)
+# mnemonic; x86 AT&T by the memory-operand heuristic in classify_insn,
+# since there loads and stores are mostly spellings of mov.
+_LOAD_MNEMONICS = frozenset("""
+    l8ui l16ui l16si l32i l32i.n l32r l32e l32ai lsi lsiu lsx lsxu
+    lb lbu lh lhu lw lwu ld flw fld c.lw c.lwsp c.ld c.ldsp c.flw c.fld
+    ldr ldrb ldrh ldrsb ldrsh ldrd ldm ldmia vldr vldm
+    pop popl popq
+""".split())
+_STORE_MNEMONICS = frozenset("""
+    s8i s16i s32i s32i.n s32e s32ri s32c1i ssi ssiu ssx ssxu
+    sb sh sw sd fsw fsd c.sw c.swsp c.sd c.sdsp c.fsw c.fsd
+    str strb strh strd stm stmia vstr vstm
+    push pushl pushq
+""".split())
+# Any multiply, including multiply-accumulate and FP forms (mull,
+# mulsh, mula.dd.*, fmadd.s, vmla.f32, imull, mulss, ...).
+_MUL_PREFIXES = ("mul", "imul", "fmul", "fmadd", "fmsub", "fnmadd",
+                 "fnmsub", "madd", "msub", "mla", "mls", "smul", "umul",
+                 "smla", "umla", "vmul", "vmla", "vmls", "vfma", "vfms")
+_BRANCH_MNEMONICS = frozenset("""
+    beq bne blt bge bltu bgeu beqz bnez beqi bnei blti bgei bltui bgeui
+    bbci bbsi bbc bbs bany bnone ball bnall bt bf
+    blez bgez bltz bgtz bgt ble bgtu bleu
+    b bl bx blx cbz cbnz bcs bcc bmi bpl bvs bvc bhi bls bal
+    jr jal jalr ret retw tail
+    c.j c.jr c.jal c.jalr c.beqz c.bnez
+""".split())
+
+
+def classify_insn(line):
+    """Bucket one cleaned instruction: load/store/mul/branch/other.
+
+    Branch means any control transfer, calls included (a span's
+    outbound calls are already itemised in the calls column).  For
+    mnemonics no table knows, an AT&T-style memory operand decides
+    load (source side) vs store (destination, the last operand);
+    lea and alignment nops are excluded from that heuristic first.
+    """
+    parts = line.split(None, 1)
+    mnem = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
+    base = mnem.split(".", 1)[0]
+    if mnem in _LOAD_MNEMONICS or base in _LOAD_MNEMONICS:
+        return "load"
+    if mnem in _STORE_MNEMONICS or base in _STORE_MNEMONICS:
+        return "store"
+    if base.startswith(_MUL_PREFIXES):
+        return "mul"
+    if mnem in _BRANCH_MNEMONICS or base in _BRANCH_MNEMONICS:
+        return "branch"
+    if base.startswith(("j", "call", "loop")):
+        return "branch"
+    if base.startswith(("lea", "nop")):
+        return "other"
+    if "(" in rest:
+        depth, cut = 0, -1
+        for i, ch in enumerate(rest):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                cut = i
+        return "store" if "(" in rest[cut + 1:] else "load"
+    return "other"
+
+
+_MIX_KEYS = ("load", "store", "mul", "branch", "other")
+
+
+def span_mix(lines):
+    """[{label, insns, load, store, mul, branch, other}] per loop span
+    of one function — the data behind --span-stats, table and JSON."""
+    result = []
+    for label, lo, hi in loop_span_ranges(lines):
+        body = [ln for ln in lines[lo:hi + 1] if not ln.endswith(":")]
+        counts = dict.fromkeys(_MIX_KEYS, 0)
+        for ln in body:
+            counts[classify_insn(ln)] += 1
+        entry = {"label": label, "insns": len(body)}
+        entry.update(counts)
+        result.append(entry)
+    return result
+
+
+def span_stats_table(fn_names, funcs, max_width=None):
+    """Per-span instruction mix for the named functions.
+
+    One row per loop span: how many of its instructions load, store,
+    multiply, or branch.  This weighs the span the way the doctrine
+    asks — the hand-written awk this replaces kept counting past the
+    loop end into the epilogue.
+    """
+    rows = [("function", "span", "insns") + _MIX_KEYS]
+    for name in fn_names:
+        for mix in span_mix(funcs[name]):
+            rows.append((name, mix["label"], str(mix["insns"]))
+                        + tuple(str(mix[k]) for k in _MIX_KEYS))
+    if len(rows) == 1:
+        return "(no loop spans)"
+    return render_table(rows, max_width)
 
 
 def auto_pairs(names):
@@ -941,9 +1112,61 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
 
 # --verbose: print full compiler command lines and untrimmed stderr.
 VERBOSE = False
+# --summary-only: print the stats tables and skip every listing.  The
+# tables are the decision input; a listing is pulled on a second run
+# when a delta needs explaining.
+SUMMARY_ONLY = False
+# --span-stats: follow each stats table with the per-loop-span
+# instruction mix (see span_stats_table).
+SPAN_STATS = False
+# --json: collect summary records here instead of printing tables;
+# None means normal table output.  main() dumps the collected list.
+JSON_OUT = None
+
+
+def span_stats_block(fn_names, funcs):
+    """Print the per-span mix table after a stats table when
+    --span-stats is on; a silent no-op otherwise."""
+    if SPAN_STATS and JSON_OUT is None:
+        print()
+        print(span_stats_table(fn_names, funcs, table_width()))
+
+
+def json_record(name, lines, cc=None, tag=None, role=None):
+    """One --json result: a summary-table row as data.  cc is the
+    resolved compiler command, tag the source/side label of a two-file
+    comparison, role baseline/candidate for paired rows; each is
+    omitted where the mode has no such notion."""
+    insns, calls = analyze(lines)
+    rec = {"function": name}
+    if cc is not None:
+        rec["cc"] = str(cc)
+    if tag is not None:
+        rec["tag"] = tag
+    if role is not None:
+        rec["role"] = role
+    rec["insns"] = insns
+    rec["loop_spans"] = [{"label": label, "insns": n}
+                         for label, n in loop_spans(lines)]
+    rec["calls"] = calls
+    if SPAN_STATS:
+        rec["span_stats"] = span_mix(lines)
+    return rec
 # Without --verbose, a failed compile shows this many stderr lines — enough
 # for the include chain plus the first error, which is the actionable part.
 MAX_STDERR_LINES = 20
+
+# Compilers skipped because their binary was missing, in matrix order.
+# The final no-usable-compiler error repeats them (via _skipped_suffix)
+# so the fix is visible in the error itself, not only in an earlier
+# stderr warning that may have scrolled away.
+_SKIPPED_CCS = []
+
+
+def _skipped_suffix():
+    """" (cc: not found on PATH; ...)" naming every skipped compiler,
+    empty when nothing was skipped."""
+    return f" ({'; '.join(_SKIPPED_CCS)})" if _SKIPPED_CCS else ""
 
 
 def _compile_failure(cmd, stderr):
@@ -989,6 +1212,9 @@ def compile_to_asm(cc_cmd, extra_flags, harness, out_dir):
     if shutil.which(argv[0]) is None:
         print(f"warning: {argv[0]} not found on PATH, skipping",
               file=sys.stderr)
+        miss = f"{argv[0]}: not found on PATH"
+        if miss not in _SKIPPED_CCS:
+            _SKIPPED_CCS.append(miss)
         return None
     db = getattr(cc_cmd, "compile_commands", None)
     db_flags = (compile_commands_flags(
@@ -1039,14 +1265,53 @@ def mangled_pair_hint(names):
     return any(MANGLED_PAIR.match(n) for n in names)
 
 
-def side_by_side(left, right, ltitle, rtitle, width=44):
-    """Two-column view of a pair's asm lines."""
+# --collapse keeps this many line pairs of context around each
+# differing pair; longer identical runs are elided with a count.
+COLLAPSE_CONTEXT = 3
+# --collapse: elide identical runs in side-by-side listings.
+COLLAPSE = False
+
+
+def side_by_side(left, right, ltitle, rtitle, width=44, collapse=False):
+    """Two-column view of a pair's asm lines.
+
+    With collapse, runs of identical line pairs shrink to the
+    COLLAPSE_CONTEXT pairs around each difference plus an elision
+    marker — two ~500-insn functions differing by a handful of
+    instructions render as a few hunks instead of ~1000 lines.  The
+    sides are aligned first (difflib), not paired by position: an
+    inserted instruction gets a gap opposite it instead of desyncing
+    every following pair.
+    """
     rows = [f"{ltitle:<{width}} | {rtitle}",
             f"{'-' * width}-+-{'-' * width}"]
-    for l, r in zip_longest(left, right, fillvalue=""):
+    if collapse:
+        pairs = []
+        matcher = difflib.SequenceMatcher(a=left, b=right, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            pairs += zip_longest(left[i1:i2], right[j1:j2], fillvalue="")
+        keep = [False] * len(pairs)
+        for i, (l, r) in enumerate(pairs):
+            if l != r:
+                for j in range(max(0, i - COLLAPSE_CONTEXT),
+                               min(len(pairs), i + COLLAPSE_CONTEXT + 1)):
+                    keep[j] = True
+    else:
+        pairs = list(zip_longest(left, right, fillvalue=""))
+        keep = [True] * len(pairs)
+    elided = 0
+    for (l, r), kept in zip(pairs, keep):
+        if not kept:
+            elided += 1
+            continue
+        if elided:
+            rows.append(f"    ... {elided} identical lines ...")
+            elided = 0
         l = l.expandtabs(8)[:width]
         r = r.expandtabs(8)[:width]
         rows.append(f"{l:<{width}} | {r}")
+    if elided:
+        rows.append(f"    ... {elided} identical lines ...")
     return "\n".join(rows)
 
 
@@ -1187,7 +1452,8 @@ def file_tags(a, b):
     return str(a), str(b)
 
 
-def report_across(fn_names, left_funcs, right_funcs, left_tag, right_tag):
+def report_across(fn_names, left_funcs, right_funcs, left_tag, right_tag,
+                  ccs=(None, None)):
     """Side-by-side + summary for the same functions from two compilations."""
     missing = sorted({f for f in fn_names
                       if f not in left_funcs or f not in right_funcs})
@@ -1195,15 +1461,25 @@ def report_across(fn_names, left_funcs, right_funcs, left_tag, right_tag):
         sys.exit("error: function(s) not in asm: " + ", ".join(missing)
                  + f"; {left_tag} has: " + (", ".join(left_funcs) or "none")
                  + f"; {right_tag} has: " + (", ".join(right_funcs) or "none"))
+    if JSON_OUT is not None:
+        for f in fn_names:
+            JSON_OUT.append(json_record(f, left_funcs[f], cc=ccs[0],
+                                        tag=left_tag, role="baseline"))
+            JSON_OUT.append(json_record(f, right_funcs[f], cc=ccs[1],
+                                        tag=right_tag, role="candidate"))
+        return
     decorated, pairs = {}, []
     for f in fn_names:
         lt, rt = f"{f} [{left_tag}]", f"{f} [{right_tag}]"
         decorated[lt], decorated[rt] = left_funcs[f], right_funcs[f]
         pairs.append((lt, rt))
-    for lt, rt in pairs:
-        print(side_by_side(decorated[lt], decorated[rt], lt, rt))
-        print()
+    if not SUMMARY_ONLY:
+        for lt, rt in pairs:
+            print(side_by_side(decorated[lt], decorated[rt], lt, rt,
+                               collapse=COLLAPSE))
+            print()
     print(summary_table(pairs, decorated, table_width()))
+    span_stats_block([n for p in pairs for n in p], decorated)
 
 
 def run_across(sources, matrix, fn_names, extra_flags, tmp):
@@ -1227,10 +1503,13 @@ def run_across(sources, matrix, fn_names, extra_flags, tmp):
             ran_any = True
             tags = mark_db_misses(cc_cmd, sources,
                                   file_tags(sources[0], sources[1]))
-            print(f"\n== {cc_cmd} ==\n")
-            report_across(fn_names, sides[0], sides[1], *tags)
+            if JSON_OUT is None:
+                print(f"\n== {cc_cmd} ==\n")
+            report_across(fn_names, sides[0], sides[1], *tags,
+                          ccs=(cc_cmd, cc_cmd))
         if not ran_any:
-            sys.exit("error: no usable compiler in the matrix")
+            sys.exit("error: no usable compiler in the matrix"
+                     + _skipped_suffix())
         return 0
 
     usable = []
@@ -1240,14 +1519,17 @@ def run_across(sources, matrix, fn_names, extra_flags, tmp):
             usable.append((f"cc#{idx}", cc_cmd, extract_functions(asm)))
     if len(usable) < 2:
         sys.exit("error: --across needs at least two usable compilers "
-                 "in the matrix")
-    print()
-    for tag, cc_cmd, _ in usable:
-        print(f"{tag}: {cc_cmd}")
-    base_tag, _, base_funcs = usable[0]
-    for tag, _, funcs in usable[1:]:
-        print(f"\n== {base_tag} vs {tag} ==\n")
-        report_across(fn_names, base_funcs, funcs, base_tag, tag)
+                 "in the matrix" + _skipped_suffix())
+    if JSON_OUT is None:
+        print()
+        for tag, cc_cmd, _ in usable:
+            print(f"{tag}: {cc_cmd}")
+    base_tag, base_cc, base_funcs = usable[0]
+    for tag, cc_cmd, funcs in usable[1:]:
+        if JSON_OUT is None:
+            print(f"\n== {base_tag} vs {tag} ==\n")
+        report_across(fn_names, base_funcs, funcs, base_tag, tag,
+                      ccs=(base_cc, cc_cmd))
     return 0
 
 
@@ -1268,15 +1550,25 @@ def run_summary(sources, matrix, extra_flags, tmp):
         ran_any = True
         shown = (mark_db_misses(cc_cmd, sources, tags)
                  if len(sources) == 2 else tags)
-        print(f"\n== {cc_cmd} ==")
+        if JSON_OUT is None:
+            print(f"\n== {cc_cmd} ==")
         for tag, funcs in zip(shown, sections):
+            if JSON_OUT is not None:
+                JSON_OUT.extend(
+                    json_record(name, lines, cc=cc_cmd,
+                                tag=tag if len(sections) > 1 else None)
+                    for name, lines in funcs.items())
+                continue
             if len(sections) > 1:
                 print(f"\n-- {tag} --")
             print()
             print(file_summary_table(funcs, table_width()) if funcs
                   else "(no functions found)")
+            if funcs:
+                span_stats_block(list(funcs), funcs)
     if not ran_any:
-        sys.exit("error: no usable compiler in the matrix")
+        sys.exit("error: no usable compiler in the matrix"
+                 + _skipped_suffix())
     return 0
 
 
@@ -1300,22 +1592,39 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
                 print('note: C++ mangling defeats old_*/new_* auto-pairing; '
                       'declare the pairs extern "C" or use --pair with the '
                       'mangled names', file=sys.stderr)
+            if JSON_OUT is not None:
+                JSON_OUT.extend(json_record(name, lines, cc=cc_cmd)
+                                for name, lines in funcs.items())
+                continue
             print(f"\n== {cc_cmd} ==\n")
             print(file_summary_table(funcs, table_width()) if funcs
                   else "(no functions found)")
+            if funcs:
+                span_stats_block(list(funcs), funcs)
             continue
         missing = sorted({n for p in pairs for n in p if n not in funcs})
         if missing:
             sys.exit("error: function(s) not in asm: "
                      + ", ".join(missing)
                      + "; functions seen: " + ", ".join(funcs))
+        if JSON_OUT is not None:
+            for old, new in pairs:
+                JSON_OUT.append(json_record(old, funcs[old], cc=cc_cmd,
+                                            role="baseline"))
+                JSON_OUT.append(json_record(new, funcs[new], cc=cc_cmd,
+                                            role="candidate"))
+            continue
         print(f"\n== {cc_cmd} ==\n")
-        for old, new in pairs:
-            print(side_by_side(funcs[old], funcs[new], old, new))
-            print()
+        if not SUMMARY_ONLY:
+            for old, new in pairs:
+                print(side_by_side(funcs[old], funcs[new], old, new,
+                                   collapse=COLLAPSE))
+                print()
         print(summary_table(pairs, funcs, table_width()))
+        span_stats_block([n for p in pairs for n in p], funcs)
     if not ran_any:
-        sys.exit("error: no usable compiler in the matrix")
+        sys.exit("error: no usable compiler in the matrix"
+                 + _skipped_suffix())
     return 0
 
 
@@ -1333,13 +1642,19 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp):
         if asm is not None:
             usable.append((f"cc#{idx}", cc_cmd, extract_functions(asm)))
     if not usable:
-        sys.exit("error: no usable compiler in the matrix")
+        sys.exit("error: no usable compiler in the matrix"
+                 + _skipped_suffix())
     for _, cc_cmd, funcs in usable:
         missing = sorted({f for f in fn_names if f not in funcs})
         if missing:
             sys.exit("error: function(s) not in asm: " + ", ".join(missing)
                      + f" under {cc_cmd}; functions seen: "
                      + ", ".join(funcs))
+    if JSON_OUT is not None:
+        for _, cc_cmd, funcs in usable:
+            JSON_OUT.extend(json_record(name, funcs[name], cc=cc_cmd)
+                            for name in fn_names)
+        return 0
     if layout == "side-by-side" and len(usable) < 2:
         sys.exit("error: --layout side-by-side needs at least two usable "
                  "compilers in the matrix")
@@ -1357,11 +1672,13 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp):
     for _, cc_cmd, funcs in usable:
         if len(usable) > 1:
             print(f"\n== {cc_cmd} ==")
-        for name in fn_names:
-            print()
-            print(listing(name, funcs[name]))
+        if not SUMMARY_ONLY:
+            for name in fn_names:
+                print()
+                print(listing(name, funcs[name]))
         print()
         print(inspect_table(fn_names, funcs, table_width()))
+        span_stats_block(fn_names, funcs)
     return 0
 
 
@@ -1420,11 +1737,16 @@ def run_elf(elf, fn_names, filter_regex, objdump):
         if not selected:
             sys.exit(f"error: --filter {filter_regex!r} matched no function "
                      f"among the {len(funcs)} in {elf}")
-    for name in fn_names:
-        print()
-        print(listing(name, funcs[name]))
+    if JSON_OUT is not None:
+        JSON_OUT.extend(json_record(name, funcs[name]) for name in selected)
+        return 0
+    if not SUMMARY_ONLY:
+        for name in fn_names:
+            print()
+            print(listing(name, funcs[name]))
     print()
     print(inspect_table(selected, funcs, table_width()))
+    span_stats_block(selected, funcs)
     return 0
 
 
@@ -1487,6 +1809,14 @@ def main(argv=None):
                         help=f"config file; default search: {CONFIG_NAME} "
                              "next to SOURCE.c, in the current directory, "
                              "then in ~/.config/")
+    parser.add_argument("--db-includes", action="store_true",
+                        help="borrow only the header-search paths from the "
+                             "database (re-emitted as -idirafter, so they "
+                             "never shadow the host's system headers), "
+                             "dropping its defines, forced includes, and "
+                             "-specs/--sysroot - lets a host/foreign-arch "
+                             "target resolve a cross project's headers "
+                             "without inheriting cross-only flags")
     parser.add_argument("--flags-like", metavar="PATH",
                         help="when a source has no compile_commands entry, "
                              "borrow the include/define flags recorded for "
@@ -1502,14 +1832,45 @@ def main(argv=None):
                         help="print the built-in example config (the "
                              "repository's asmdiff.example.toml) to stdout, "
                              "ready to redirect into a config file")
+    parser.add_argument("--span-stats", action="store_true",
+                        help="follow each stats table with a per-loop-span "
+                             "instruction mix (load/store/mul/branch/other "
+                             "counts) - weighs the span instead of the "
+                             "whole function")
+    parser.add_argument("--collapse", action="store_true",
+                        help="in side-by-side listings, elide runs of "
+                             "identical line pairs, keeping "
+                             f"{COLLAPSE_CONTEXT} lines of context around "
+                             "each difference - near-identical functions "
+                             "render as a few hunks")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the summary as JSON on stdout instead "
+                             "of tables: one record per function per "
+                             "compiler (insns, loop spans, calls; span "
+                             "mix with --span-stats).  Implies "
+                             "--summary-only; errors stay plain text on "
+                             "stderr")
+    parser.add_argument("-s", "--summary-only", action="store_true",
+                        help="print only the summary/stats tables, "
+                             "suppressing every assembly listing - the "
+                             "scripted-caller view (pull a listing with a "
+                             "second run when a delta needs explaining)")
+    parser.add_argument("--version", action="version",
+                        version=f"asmdiff {__version__}")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="on compile failure, print the full compiler "
                              "command and complete error output instead of "
                              "the first lines")
     args = parser.parse_args(argv)
-    global VERBOSE, FLAGS_LIKE
+    global VERBOSE, FLAGS_LIKE, SUMMARY_ONLY, COLLAPSE, SPAN_STATS
+    global DB_INCLUDES, JSON_OUT
     VERBOSE = args.verbose
     FLAGS_LIKE = args.flags_like
+    SUMMARY_ONLY = args.summary_only or args.json
+    COLLAPSE = args.collapse
+    SPAN_STATS = args.span_stats
+    DB_INCLUDES = args.db_includes
+    JSON_OUT = [] if args.json else None
 
     if args.example_config:
         sys.stdout.write(EXAMPLE_CONFIG)
@@ -1542,7 +1903,12 @@ def main(argv=None):
                 sys.exit("error: no gcc in the matrix to derive an objdump "
                          "from (" + "; ".join(matrix) + "); pass --objdump "
                          "PATH or a gcc-based --cc/--target")
-        return run_elf(sources[0], fn_names, args.filter, objdump)
+        status = run_elf(sources[0], fn_names, args.filter, objdump)
+        if JSON_OUT is not None:
+            print(json.dumps({"asmdiff": __version__, "mode": "elf",
+                              "elf": sources[0], "results": JSON_OUT},
+                             indent=2))
+        return status
     if args.filter or args.objdump:
         parser.error("--filter/--objdump apply to ELF input only")
     if len(sources) > 2:
@@ -1573,15 +1939,24 @@ def main(argv=None):
 
     with tempfile.TemporaryDirectory(prefix="asmdiff") as tmp:
         if fn_names:
-            return run_inspect(sources[0], matrix, fn_names, args.layout,
+            mode = "inspect"
+            status = run_inspect(sources[0], matrix, fn_names, args.layout,
+                                 extra_flags, tmp)
+        elif args.across:
+            mode = "across"
+            status = run_across(sources, matrix, args.across,
+                                extra_flags, tmp)
+        elif len(sources) == 2:
+            mode = "summary"
+            status = run_summary(sources, matrix, extra_flags, tmp)
+        else:
+            mode = "pairs"
+            status = run_pairs(sources[0], matrix, args.pair,
                                extra_flags, tmp)
-        if args.across:
-            return run_across(sources, matrix, args.across,
-                              extra_flags, tmp)
-        if len(sources) == 2:
-            return run_summary(sources, matrix, extra_flags, tmp)
-        return run_pairs(sources[0], matrix, args.pair,
-                         extra_flags, tmp)
+    if JSON_OUT is not None:
+        print(json.dumps({"asmdiff": __version__, "mode": mode,
+                          "results": JSON_OUT}, indent=2))
+    return status
 
 
 if __name__ == "__main__":

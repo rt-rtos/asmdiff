@@ -1076,6 +1076,102 @@ __func__$1:
         self.assertEqual(insns, 2)
 
 
+class TestMissingCompilerNamed(unittest.TestCase):
+    """The no-usable-compiler error names each missed compiler, so
+    "--target rp2350 with no ARM toolchain" explains itself."""
+
+    def _expect_exit(self, fn, *args):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+             self.assertRaises(SystemExit) as ctx:
+            fn(*args)
+        return str(ctx.exception)
+
+    def test_pairs_error_names_the_miss(self):
+        msg = self._expect_exit(asmdiff.run_pairs, "h.c",
+                                ["no-such-cc-xyz -O2"], [], [], "/tmp")
+        self.assertIn("no usable compiler", msg)
+        self.assertIn("no-such-cc-xyz: not found on PATH", msg)
+
+    def test_inspect_error_names_the_miss(self):
+        msg = self._expect_exit(asmdiff.run_inspect, "h.c",
+                                ["no-such-cc-xyz -O2"], ["f"], None,
+                                [], "/tmp")
+        self.assertIn("no-such-cc-xyz: not found on PATH", msg)
+
+    def test_across_two_cc_error_names_both(self):
+        msg = self._expect_exit(asmdiff.run_across, ["h.c"],
+                                ["no-such-cc-one -O2", "no-such-cc-two -O2"],
+                                ["f"], [], "/tmp")
+        self.assertIn("at least two usable", msg)
+        self.assertIn("no-such-cc-one: not found on PATH", msg)
+        self.assertIn("no-such-cc-two: not found on PATH", msg)
+
+
+class TestDbIncludes(unittest.TestCase):
+    """--db-includes: borrow only header-search paths from the database.
+
+    A project's -I paths are target-portable; its defines, forced
+    includes, and -specs are tied to the arch the database was built
+    for - the host-target escape hatch."""
+
+    def _db(self, tmp):
+        path = Path(tmp) / "compile_commands.json"
+        path.write_text(json.dumps([{
+            "directory": tmp, "file": f"{tmp}/real.c",
+            "command": ("cc -Iinc -isystem sys -iquote q -DESP_PLATFORM "
+                        "-include sdkconfig.h -specs=picolibc.specs "
+                        "-c real.c")}]))
+        asmdiff._DB_CACHE.clear()
+        asmdiff._MISS_NOTED.clear()
+        asmdiff._BORROW_NOTED.clear()
+        return str(path)
+
+    def test_keeps_search_paths_drops_defines_and_specs(self):
+        # Kept paths are re-emitted as -idirafter: searched AFTER the
+        # host's system directories, so a database include dir that
+        # overlays libc headers (ESP-IDF's esp_libc/platform_include)
+        # cannot shadow the host's own stdio.h.
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            asmdiff.DB_INCLUDES = True
+            self.addCleanup(setattr, asmdiff, "DB_INCLUDES", False)
+            flags = asmdiff.compile_commands_flags(db, f"{tmp}/real.c")
+            self.assertEqual(flags,
+                             ["-idirafter", str(Path(tmp) / "inc"),
+                              "-idirafter", str(Path(tmp) / "sys"),
+                              "-idirafter", str(Path(tmp) / "q")])
+
+    def test_flags_like_borrow_is_filtered_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            asmdiff.DB_INCLUDES = True
+            asmdiff.FLAGS_LIKE = f"{tmp}/real.c"
+            self.addCleanup(setattr, asmdiff, "DB_INCLUDES", False)
+            self.addCleanup(setattr, asmdiff, "FLAGS_LIKE", None)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                flags = asmdiff.compile_commands_flags(
+                    db, f"{tmp}/copy.c", missing_ok=True)
+            self.assertIn("-idirafter", flags)
+            self.assertNotIn("-DESP_PLATFORM", flags)
+
+    def test_off_by_default_borrow_is_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            flags = asmdiff.compile_commands_flags(db, f"{tmp}/real.c")
+            self.assertIn("-DESP_PLATFORM", flags)
+
+    def test_main_wires_the_flag(self):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
+        self.addCleanup(setattr, asmdiff, "DB_INCLUDES", False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            asmdiff.main(["h.c", "--db-includes", "--cc", "gcc -O2"])
+        self.assertTrue(asmdiff.DB_INCLUDES)
+
+
 class TestFlagsLike(unittest.TestCase):
     """--flags-like: a source absent from the db borrows a named entry."""
 
@@ -1578,6 +1674,392 @@ class TestRunInspect(unittest.TestCase):
         self.assertIn("no usable compiler", str(ctx.exception))
 
 
+# Pair whose bodies share a long identical prefix - the collapse fixture.
+PADDED_ASM = """\
+\t.text
+\t.globl\told_pad
+\t.type\told_pad, @function
+old_pad:
+\tmovl\t$1, %eax
+\tmovl\t$2, %eax
+\tmovl\t$3, %eax
+\tmovl\t$4, %eax
+\tmovl\t$5, %eax
+\tmovl\t$6, %eax
+\tmovl\t$7, %eax
+\tmovl\t$8, %eax
+\taddl\t$9, %eax
+\tret
+\t.size\told_pad, .-old_pad
+\t.globl\tnew_pad
+\t.type\tnew_pad, @function
+new_pad:
+\tmovl\t$1, %eax
+\tmovl\t$2, %eax
+\tmovl\t$3, %eax
+\tmovl\t$4, %eax
+\tmovl\t$5, %eax
+\tmovl\t$6, %eax
+\tmovl\t$7, %eax
+\tmovl\t$8, %eax
+\tsubl\t$9, %eax
+\tret
+\t.size\tnew_pad, .-new_pad
+"""
+
+
+class TestCollapse(unittest.TestCase):
+    """--collapse elides identical runs in side-by-side listings,
+    keeping COLLAPSE_CONTEXT lines around each differing pair."""
+
+    def test_identical_run_elided_with_context(self):
+        left = [f"insn{n}" for n in range(20)]
+        right = list(left)
+        right[10] = "DIFF"
+        out = asmdiff.side_by_side(left, right, "L", "R", collapse=True)
+        self.assertIn("... 7 identical lines ...", out)   # 0..6 elided
+        self.assertNotIn("insn2 ", out.replace("|", " "))
+        self.assertIn("insn7", out)                       # context kept
+        self.assertIn("DIFF", out)
+        self.assertIn("insn13", out)                      # context kept
+        self.assertIn("... 6 identical lines ...", out)   # 14..19 elided
+
+    def test_fully_identical_pair_collapses_to_marker(self):
+        lines = [f"insn{n}" for n in range(10)]
+        out = asmdiff.side_by_side(lines, lines, "L", "R", collapse=True)
+        self.assertIn("... 10 identical lines ...", out)
+        self.assertNotIn("insn5", out)
+
+    def test_insertion_does_not_desync_collapse(self):
+        # Positional pairing would leave every pair after an inserted
+        # line unequal; collapse aligns the sides first, so the tail
+        # still elides.
+        left = [f"insn{n}" for n in range(20)]
+        right = left[:10] + ["EXTRA"] + left[10:]
+        out = asmdiff.side_by_side(left, right, "L", "R", collapse=True)
+        self.assertIn("EXTRA", out)
+        self.assertEqual(out.count("... 7 identical lines ..."), 2)
+
+    def test_collapse_off_by_default(self):
+        lines = ["alpha", "beta"]
+        out = asmdiff.side_by_side(lines, lines, "L", "R")
+        self.assertNotIn("identical lines", out)
+        self.assertIn("alpha", out)
+
+    def test_main_wires_the_flag_for_pairs(self):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: PADDED_ASM
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
+        self.addCleanup(setattr, asmdiff, "COLLAPSE", False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.main(["h.c", "--collapse", "--cc", "gcc -O2"])
+        text = out.getvalue()
+        # context is 3: identical 0..7, diff at 8, keep 5..9, elide 0..4
+        self.assertIn("... 5 identical lines ...", text)
+        self.assertNotIn("$1,", text)
+        self.assertIn("addl", text)
+        self.assertIn("subl", text)
+
+    def test_main_wires_the_flag_for_across(self):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: PADDED_ASM
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
+        self.addCleanup(setattr, asmdiff, "COLLAPSE", False)
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "a.c", Path(tmp) / "b.c"
+            a.touch()
+            b.touch()
+            with contextlib.redirect_stdout(out):
+                asmdiff.main([str(a), str(b), "-a", "old_pad", "--collapse",
+                              "--cc", "gcc -O2"])
+        # both sides compile to the same asm: fully identical listing
+        self.assertIn("... 10 identical lines ...", out.getvalue())
+
+
+class TestJsonOutput(unittest.TestCase):
+    """--json: machine-readable summary records instead of tables."""
+
+    def setUp(self):
+        self._compile = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", self._compile)
+        self.addCleanup(setattr, asmdiff, "JSON_OUT", None)
+        self.addCleanup(setattr, asmdiff, "SUMMARY_ONLY", False)
+        self.addCleanup(setattr, asmdiff, "SPAN_STATS", False)
+
+    def _run(self, argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.main(argv)
+        return json.loads(out.getvalue())   # stdout must be pure JSON
+
+    def test_pairs_mode_records(self):
+        doc = self._run(["h.c", "--json", "--cc", "gcc -O2"])
+        self.assertEqual(doc["asmdiff"], asmdiff.__version__)
+        self.assertEqual(doc["mode"], "pairs")
+        old, new = doc["results"]
+        self.assertEqual(old["function"], "old_const")
+        self.assertEqual(old["role"], "baseline")
+        self.assertEqual(old["cc"], "gcc -O2")
+        self.assertEqual(old["insns"], 2)
+        self.assertEqual(new["function"], "new_const")
+        self.assertEqual(new["role"], "candidate")
+        self.assertEqual(new["calls"], ["ldexpf"])
+
+    def test_across_two_files_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "a.c", Path(tmp) / "b.c"
+            a.touch()
+            b.touch()
+            doc = self._run([str(a), str(b), "-a", "old_const",
+                             "--json", "--cc", "gcc -O2"])
+        self.assertEqual(doc["mode"], "across")
+        base, cand = doc["results"]
+        self.assertEqual(base["tag"], "a.c")
+        self.assertEqual(base["role"], "baseline")
+        self.assertEqual(cand["tag"], "b.c")
+        self.assertEqual(cand["role"], "candidate")
+
+    def test_inspect_records_and_no_listing(self):
+        doc = self._run(["h.c", "new_const", "--json", "--cc", "gcc -O2"])
+        self.assertEqual(doc["mode"], "inspect")
+        self.assertEqual(len(doc["results"]), 1)
+        rec = doc["results"][0]
+        self.assertEqual(rec["function"], "new_const")
+        self.assertNotIn("role", rec)
+
+    def test_two_file_summary_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "a.c", Path(tmp) / "b.c"
+            a.touch()
+            b.touch()
+            doc = self._run([str(a), str(b), "--json", "--cc", "gcc -O2"])
+        self.assertEqual(doc["mode"], "summary")
+        tags = {(r["tag"], r["function"]) for r in doc["results"]}
+        self.assertIn(("a.c", "old_const"), tags)
+        self.assertIn(("b.c", "new_const"), tags)
+
+    def test_span_stats_key_present_only_when_asked(self):
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: LOOP_ASM
+        doc = self._run(["h.c", "looper", "--json", "--span-stats",
+                         "--cc", "gcc -O2"])
+        rec = doc["results"][0]
+        self.assertEqual(rec["loop_spans"], [{"label": ".L2", "insns": 3}])
+        self.assertEqual(rec["span_stats"],
+                         [{"label": ".L2", "insns": 3, "load": 0,
+                           "store": 0, "mul": 0, "branch": 1, "other": 2}])
+        doc = self._run(["h.c", "looper", "--json", "--cc", "gcc -O2"])
+        self.assertNotIn("span_stats", doc["results"][0])
+
+    def test_elf_mode_records(self):
+        real = asmdiff.run_objdump
+        asmdiff.run_objdump = lambda objdump, elf: OBJDUMP_ASM
+        self.addCleanup(setattr, asmdiff, "run_objdump", real)
+        with tempfile.TemporaryDirectory() as tmp:
+            elf = Path(tmp) / "fw.elf"
+            elf.write_bytes(b"\x7fELF" + b"\0" * 12)
+            doc = self._run([str(elf), "render_lut", "--json",
+                             "--objdump", "od"])
+        self.assertEqual(doc["mode"], "elf")
+        self.assertEqual(doc["elf"], str(elf))
+        names = [r["function"] for r in doc["results"]]
+        self.assertEqual(names, ["render_lut"])
+
+    def test_multi_compiler_matrix_tags_each_record(self):
+        doc = self._run(["h.c", "--json", "--cc", "gcc -O2",
+                         "--cc", "gcc -O3"])
+        ccs = {r["cc"] for r in doc["results"]}
+        self.assertEqual(ccs, {"gcc -O2", "gcc -O3"})
+        self.assertEqual(len(doc["results"]), 4)
+
+
+class TestVersion(unittest.TestCase):
+    """--version prints the module's single-source version."""
+
+    _pyproject = Path(asmdiff.__file__).resolve().parent / "pyproject.toml"
+
+    def test_version_flag_prints_and_exits_zero(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+             self.assertRaises(SystemExit) as ctx:
+            asmdiff.main(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(out.getvalue().strip(),
+                         f"asmdiff {asmdiff.__version__}")
+
+    @unittest.skipUnless(_pyproject.is_file(),
+                         "pyproject.toml only exists in a repo checkout")
+    def test_pyproject_takes_version_from_module(self):
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        data = asmdiff.tomllib.loads(self._pyproject.read_text())
+        self.assertIn("version", data["project"].get("dynamic", []))
+        self.assertNotIn("version", data["project"])
+        self.assertEqual(data["tool"]["hatch"]["version"]["path"],
+                         "asmdiff.py")
+
+
+class TestClassifyInsn(unittest.TestCase):
+    """Mnemonic buckets behind --span-stats: load/store/mul/branch/other."""
+
+    def test_xtensa(self):
+        self.assertEqual(asmdiff.classify_insn("l32i.n\ta8, a2, 0"), "load")
+        self.assertEqual(asmdiff.classify_insn("s32i\ta8, a2, 0"), "store")
+        self.assertEqual(asmdiff.classify_insn("mull\ta8, a8, a9"), "mul")
+        self.assertEqual(asmdiff.classify_insn("mul.s\tf0, f1, f2"), "mul")
+        self.assertEqual(asmdiff.classify_insn("madd.s\tf0, f1, f2"), "mul")
+        self.assertEqual(asmdiff.classify_insn("bne\ta2, a6, .L2"), "branch")
+        self.assertEqual(asmdiff.classify_insn("loop\ta4, .L11_LEND"),
+                         "branch")
+        self.assertEqual(asmdiff.classify_insn("call8\tfoo"), "branch")
+        self.assertEqual(asmdiff.classify_insn("addi\ta2, a2, 4"), "other")
+        self.assertEqual(asmdiff.classify_insn("nop.n"), "other")
+
+    def test_riscv(self):
+        self.assertEqual(asmdiff.classify_insn("lw\ta0, 0(a1)"), "load")
+        self.assertEqual(asmdiff.classify_insn("fsw\tfa0, 4(a1)"), "store")
+        self.assertEqual(asmdiff.classify_insn("mulh\ta0, a1, a2"), "mul")
+        self.assertEqual(asmdiff.classify_insn("fmadd.s\tfa0, fa1, fa2, fa3"),
+                         "mul")
+        self.assertEqual(asmdiff.classify_insn("beqz\ta0, .L4"), "branch")
+        self.assertEqual(asmdiff.classify_insn("jal\tra, memcpy"), "branch")
+        self.assertEqual(asmdiff.classify_insn("slli\ta0, a0, 2"), "other")
+
+    def test_x86_att(self):
+        self.assertEqual(asmdiff.classify_insn("movl\t8(%rax), %eax"),
+                         "load")
+        self.assertEqual(asmdiff.classify_insn("movl\t%eax, 8(%rax)"),
+                         "store")
+        self.assertEqual(asmdiff.classify_insn("addl\t(%rdi), %eax"), "load")
+        self.assertEqual(asmdiff.classify_insn("leaq\t8(%rax), %rbx"),
+                         "other")
+        self.assertEqual(
+            asmdiff.classify_insn("nopw\t0x0(%rax,%rax,1)"), "other")
+        self.assertEqual(asmdiff.classify_insn("mulss\t.LC0(%rip), %xmm0"),
+                         "mul")
+        self.assertEqual(asmdiff.classify_insn("jne\t.L2"), "branch")
+        self.assertEqual(asmdiff.classify_insn("call\tmalloc"), "branch")
+        self.assertEqual(asmdiff.classify_insn("movl\t$-5, %edi"), "other")
+        self.assertEqual(asmdiff.classify_insn("pushq\t%rbp"), "store")
+
+    def test_arm(self):
+        self.assertEqual(asmdiff.classify_insn("ldr\tr0, [r1]"), "load")
+        self.assertEqual(asmdiff.classify_insn("str\tr0, [r1, #4]"), "store")
+        self.assertEqual(asmdiff.classify_insn("vmul.f32\ts0, s1, s2"),
+                         "mul")
+        self.assertEqual(asmdiff.classify_insn("cbz\tr0, .L3"), "branch")
+        self.assertEqual(asmdiff.classify_insn("push\t{r4, lr}"), "store")
+        self.assertEqual(asmdiff.classify_insn("eor\tr0, r0, r1"), "other")
+
+
+class TestSpanStats(unittest.TestCase):
+    """--span-stats: per-loop-span instruction mix table."""
+
+    LINES = [".L2:", "l32i.n\ta8, a2, 0", "mull\ta8, a8, a9",
+             "s32i\ta8, a2, 0", "addi\ta2, a2, 4", "bne\ta2, a6, .L2"]
+
+    def test_loop_span_ranges_and_counts_agree(self):
+        self.assertEqual(asmdiff.loop_span_ranges(self.LINES),
+                         [(".L2", 0, 5)])   # range includes the label line
+        self.assertEqual(asmdiff.loop_spans(self.LINES), [(".L2", 5)])
+
+    def test_table_counts_the_mix(self):
+        out = asmdiff.span_stats_table(["f"], {"f": self.LINES})
+        lines = out.splitlines()
+        self.assertRegex(lines[0],
+                         r"function\s+span\s+insns\s+load\s+store\s+mul"
+                         r"\s+branch\s+other")
+        self.assertRegex(lines[1], r"f\s+\.L2\s+5\s+1\s+1\s+1\s+1\s+1")
+
+    def test_no_spans_prints_note(self):
+        out = asmdiff.span_stats_table(["g"], {"g": ["ret"]})
+        self.assertIn("no loop spans", out)
+
+    def test_main_wires_flag_in_inspect_mode(self):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: LOOP_ASM
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
+        self.addCleanup(setattr, asmdiff, "SPAN_STATS", False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.main(["h.c", "looper", "--span-stats",
+                          "--cc", "gcc -O2"])
+        # .L2 span: addl, cmpl, jne -> 2 other + 1 branch
+        self.assertRegex(out.getvalue(),
+                         r"looper\s+\.L2\s+3\s+0\s+0\s+0\s+1\s+2")
+
+    def test_elf_mode_span_stats(self):
+        real = asmdiff.run_objdump
+        asmdiff.run_objdump = lambda objdump, elf: OBJDUMP_ASM
+        self.addCleanup(setattr, asmdiff, "run_objdump", real)
+        self.addCleanup(setattr, asmdiff, "SPAN_STATS", False)
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            elf = Path(tmp) / "fw.elf"
+            elf.write_bytes(b"\x7fELF" + b"\0" * 12)
+            with contextlib.redirect_stdout(out):
+                asmdiff.main([str(elf), "render_lut", "--span-stats",
+                              "--objdump", "od"])
+        # ZOL body: add.n, l32i, add.n, nop.n -> 1 load + 3 other
+        self.assertRegex(out.getvalue(),
+                         r"render_lut\s+\.L\S+\s+4\s+1\s+0\s+0\s+0\s+3")
+
+
+class TestSummaryOnly(unittest.TestCase):
+    """--summary-only suppresses listings; the stats tables stay."""
+
+    def setUp(self):
+        self._compile = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
+        asmdiff.SUMMARY_ONLY = True
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", self._compile)
+        self.addCleanup(setattr, asmdiff, "SUMMARY_ONLY", False)
+
+    def _capture(self, fn, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fn(*args)
+        return out.getvalue()
+
+    def test_pairs_mode_prints_table_only(self):
+        out = self._capture(asmdiff.run_pairs, "h.c", ["gcc -O2"],
+                            [], [], "/tmp")
+        self.assertIn("baseline", out)
+        self.assertNotIn(" | ", out)
+
+    def test_across_mode_prints_table_only(self):
+        out = self._capture(asmdiff.run_inspect, "h.c",
+                            ["gcc -O2", "clang -O2"], ["new_const"],
+                            None, [], "/tmp")
+        self.assertIn("baseline", out)
+        self.assertNotIn(" | ", out)
+
+    def test_inspect_list_prints_table_only(self):
+        out = self._capture(asmdiff.run_inspect, "h.c", ["gcc -O2"],
+                            ["new_const"], None, [], "/tmp")
+        self.assertIn("function", out)       # stats table present
+        self.assertNotIn("\tjmp", out)       # no listing body
+
+    def test_elf_mode_prints_table_only(self):
+        real = asmdiff.run_objdump
+        asmdiff.run_objdump = lambda objdump, elf: OBJDUMP_ASM
+        self.addCleanup(setattr, asmdiff, "run_objdump", real)
+        out = self._capture(asmdiff.run_elf, "fw.elf", ["render_lut"],
+                            None, "od")
+        self.assertIn("render_lut", out)     # stats row
+        self.assertNotIn("render_lut:", out)  # no listing header
+
+    def test_main_wires_the_flag(self):
+        asmdiff.SUMMARY_ONLY = False
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.main(["h.c", "--summary-only"])
+        self.assertIn("baseline", out.getvalue())
+        self.assertNotIn(" | ", out.getvalue())
+
+
 class TestFileTags(unittest.TestCase):
     def test_distinct_basenames_used_directly(self):
         self.assertEqual(asmdiff.file_tags("p/old.c", "p/new.c"),
@@ -1716,6 +2198,14 @@ class TestConfigEditing(unittest.TestCase):
     def test_example_constant_matches_repo_file(self):
         self.assertEqual(asmdiff.EXAMPLE_CONFIG,
                          self._example_path.read_text())
+
+    def test_example_config_defines_host_target(self):
+        # The README and skill text tell users `--target host` works out
+        # of the box; the example config must actually define it.
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        data = asmdiff.tomllib.loads(asmdiff.EXAMPLE_CONFIG)
+        self.assertIn("cc", data.get("host", {}))
 
     def test_visual_beats_editor(self):
         self.assertEqual(

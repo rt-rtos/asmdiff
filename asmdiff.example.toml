@@ -26,6 +26,12 @@ flags = [
 cc = "clang"
 flags = ["-O3", "-Wall", "-Wextra"]
 
+# The name the docs use for "your native compiler" (--target host): an
+# alias of [gcc] kept as its own table so the examples work verbatim.
+[host]
+cc = "gcc"
+flags = ["-O3", "-Wall", "-Wextra"]
+
 # cc values may use ~, $VARS, and glob patterns.  A glob that matches
 # several installed toolchains resolves to the highest version-sorted
 # one (announced on stderr); pin the exact esp-NN directory instead if

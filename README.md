@@ -340,9 +340,11 @@ zero-overhead loops", the empirical rules (verified on esp-gcc 15.2,
 ```
 asmdiff SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
            [--cc 'CC FLAGS']... [--target NAME]... [--config PATH]
-           [--compile-commands [PATH]] [--flags-like PATH]
+           [--compile-commands [PATH]] [--flags-like PATH] [--db-includes]
+           [--summary-only] [--collapse] [--span-stats]
            [--layout list|side-by-side] [-v] [-- EXTRA_FLAGS...]
 asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
+           [--summary-only] [--span-stats]
 ```
 
 | Option | Meaning |
@@ -358,6 +360,12 @@ asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
 | `--config PATH` | Config file to use. Default search: `asmdiff.toml` next to `SOURCE.c`, then in the current directory, then `~/.config/`. First hit wins. |
 | `-db, --compile-commands [PATH]` | Borrow each source's include/define flags from a `compile_commands.json`; with no `PATH`, walk up from the CWD checking each directory and its `build/` until the repository root. See [below](#borrowing-includes-from-compile_commandsjson). |
 | `--flags-like PATH` | A source with no `compile_commands` entry borrows the flags recorded for `PATH` — the way to compare a modified copy of a project source under its original's header environment. |
+| `--db-includes` | Borrow only the header-search paths from the database, dropping its defines, forced includes, and `-specs`/`--sysroot`; kept paths are re-emitted as `-idirafter` so they cannot shadow the host's own system headers. This is how a host target compiles a cross project's source. |
+| `-s`, `--summary-only` | Print only the summary/stats tables, suppressing every assembly listing (see [Shaping the output](#shaping-the-output-for-reading-vs-deciding)). |
+| `--json` | Emit the summary as JSON on stdout instead of tables — one record per function per compiler. Implies `--summary-only`; errors stay plain text on stderr. |
+| `--collapse` | In side-by-side listings, elide runs of identical line pairs, keeping 3 lines of context around each difference. |
+| `--span-stats` | Follow each stats table with a per-loop-span instruction mix: load/store/mul/branch/other counts per span. |
+| `--version` | Print the version and exit. |
 | `-v`, `--verbose` | On compile failure, print the full compiler command and complete error output. Default shows only the compiler, the source, and the first error lines. |
 | `-- FLAGS...` | Everything after a bare `--` is appended to *every* compiler invocation. |
 
@@ -381,9 +389,66 @@ asmdiff h.c -- -fno-math-errno
 ```
 
 Compilers missing from `PATH` are skipped with a warning; the run fails only
-if none are usable. Exit status is non-zero only for operational failures
-(compile error — the compiler's stderr is shown — unknown `--pair` name, no
-usable compiler). Differing assembly is the expected result, never an error.
+if none are usable, and that error names each missed binary
+(`no-such-gcc: not found on PATH`) so the fix is in the message, not in a
+warning that scrolled away. Exit status is non-zero only for operational
+failures (compile error — the compiler's stderr is shown — unknown `--pair`
+name, no usable compiler). Differing assembly is the expected result, never
+an error.
+
+## Shaping the output for reading vs deciding
+
+A two-file compare over a three-target matrix prints three full
+side-by-side listings with the summary table at the *end* of each — the
+right shape for reading an unfamiliar delta, and roughly 100 KB of the
+wrong shape when the table is all the decision needs. Three flags cut the
+output to purpose:
+
+- **`--summary-only`** (`-s`) keeps only the summary/stats tables. This is
+  the scripted/agent view: the table is the decision input, and a listing
+  is pulled with a second, narrower run only when a delta needs
+  explaining.
+- **`--collapse`** elides runs of identical line pairs in every
+  side-by-side listing, keeping 3 lines of context around each difference
+  plus a `... N identical lines ...` marker. Two ~500-instruction
+  functions differing by five instructions render as a few readable hunks
+  instead of ~1000 lines.
+- **`--span-stats`** follows each stats table with a per-loop-span
+  instruction mix, one row per span:
+
+  ```
+  function       span    insns  load  store  mul  branch  other
+  stereo_reverb  .L108   327    96    31     14    12     174
+  ```
+
+  This weighs the span rather than the whole function — the number that
+  actually decides a hot-loop comparison (is the rewrite trading loads
+  for stores? did the multiplies move?) without hand-counting a listing
+  and accidentally tallying past the loop end into the epilogue.
+  Buckets are by mnemonic (Xtensa, RISC-V, ARM) with an AT&T
+  memory-operand heuristic for x86; *branch* includes calls (outbound
+  calls are already itemised in the `calls` column), and anything the
+  tables don't know lands in *other*.
+
+All three combine with every compile mode; `--summary-only` and
+`--span-stats` also apply to ELF input.
+
+For scripted callers, `--json` replaces the tables entirely with one
+JSON document on stdout: a flat `results` list holding one record per
+function per compiler — `cc`, `tag` (source label in two-file runs),
+`role` (`baseline`/`candidate` in paired runs), `insns`, `loop_spans`,
+`calls`, and `span_stats` when `--span-stats` is given. Flat records
+keep it one `jq` expression away from any question the tables answer:
+
+```bash
+asmdiff old.c new.c -a stereo_reverb --json --span-stats \
+  | jq '.results[] | {role, insns, spans: .loop_spans}'
+```
+
+The top level carries `asmdiff` (version) and `mode`
+(`pairs`/`across`/`inspect`/`summary`/`elf`; ELF runs add the binary's
+path as `elf`). Warnings and errors stay plain text on stderr, so a
+failed run never emits half a document.
 
 ## Config file: named targets
 
@@ -555,6 +620,17 @@ Details that make it robust:
 - **`compile_commands` expands `~` and `$VARS`.** The `==` header always
   prints the resolved compiler command; run with `-- -v` if you want to see
   every include path the compiler actually received.
+- **`--db-includes` restricts the borrow to header-search paths**,
+  dropping `-D`/`-U`, forced includes, and `-specs`/`--sysroot`. Use it
+  when the *target* doesn't match the arch the database was built for —
+  host gcc given an ESP-IDF database would otherwise inherit
+  `-specs=picolibc.specs` and cross-only defines it cannot compile
+  with, yet still needs the project's include paths to find its
+  headers. The kept paths are re-emitted as `-idirafter`, searched
+  *after* the compiler's own system directories: ESP-IDF's include set
+  contains a libc-overlay directory (`esp_libc/platform_include`) whose
+  `stdio.h` would shadow the host's under plain `-I`; demoted, the
+  project's own headers still resolve and the host's libc wins.
 
 ### Auto-discovering the database
 
@@ -646,6 +722,11 @@ diff is your edit and nothing else. This also covers a git-worktree
 baseline (`../baseline/src/oscillators.c`), which is the same file under a
 path the database has never heard of. The absent-source error and the
 soft-miss note both point at this flag when a same-name entry exists.
+
+To contrast the same pair on a host compiler (does gcc-on-x86 make the
+same choice?), add `--db-includes`: the borrow then carries only the
+project's include paths, which are target-portable, and none of the
+cross-only defines or `-specs` a host gcc would choke on.
 
 ## Whole-file summary
 
