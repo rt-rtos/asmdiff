@@ -426,9 +426,22 @@ output to purpose:
   for stores? did the multiplies move?) without hand-counting a listing
   and accidentally tallying past the loop end into the epilogue.
   Buckets are by mnemonic (Xtensa, RISC-V, ARM) with an AT&T
-  memory-operand heuristic for x86; *branch* includes calls (outbound
-  calls are already itemised in the `calls` column), and anything the
-  tables don't know lands in *other*.
+  memory-operand heuristic for x86; *branch* means any control
+  transfer — conditional and unconditional branches, calls, and
+  returns (outbound calls are already itemised by name in the `calls`
+  column) — and anything the tables don't know lands in *other*.
+
+  Reading *branch* inside a span: a software loop's own backedge is
+  one of them, because the span runs from the label to the last
+  backward branch inclusive. A Xtensa zero-overhead loop instead
+  encloses only the body between `loop` and its end label, so the loop
+  machinery contributes zero and any branch counted there is real
+  per-iteration control flow — early exits, per-sample `if`/`else`,
+  wrap-around checks. Track it across variants: branches replaced by
+  conditional moves (`movnez`, `csel`, `cmov` — counted under *other*)
+  show as *branch* falling while *insns* stays roughly flat, and a
+  call appearing inside a hot span is the ZOL killer the `calls`
+  column already flagged.
 
 All three combine with every compile mode; `--summary-only` and
 `--span-stats` also apply to ELF input.
