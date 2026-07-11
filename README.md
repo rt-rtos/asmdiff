@@ -363,7 +363,7 @@ asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
 | `--db-includes` | Borrow only the header-search paths from the database, dropping its defines, forced includes, and `-specs`/`--sysroot`; kept paths are re-emitted as `-idirafter` so they cannot shadow the host's own system headers. This is how a host target compiles a cross project's source. |
 | `-s`, `--summary-only` | Print only the summary/stats tables, suppressing every assembly listing (see [Shaping the output](#shaping-the-output-for-reading-vs-deciding)). |
 | `--json` | Emit the summary as JSON on stdout instead of tables — one record per function per compiler. Implies `--summary-only`; errors stay plain text on stderr. |
-| `--collapse` | In side-by-side listings, elide runs of identical line pairs, keeping 3 lines of context around each difference. |
+| `--collapse` | In side-by-side listings, omit runs of identical line pairs, keeping 3 lines of context around each difference. |
 | `--span-stats` | Follow each stats table with a per-loop-span instruction mix: load/store/mul/branch/other counts per span. |
 | `--version` | Print the version and exit. |
 | `-v`, `--verbose` | On compile failure, print the full compiler command and complete error output. Default shows only the compiler, the source, and the first error lines. |
