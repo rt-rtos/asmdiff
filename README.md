@@ -451,9 +451,33 @@ JSON document on stdout: a flat `results` list holding one record per
 function per compiler — `cc`, `tag` (source label in two-file runs),
 `role` (`baseline`/`candidate` in paired runs), `insns`, `loop_spans`,
 `calls`, and `span_stats` when `--span-stats` is given. Flat records
-keep it one `jq` expression away from any question the tables answer:
+keep it one `jq` expression away from any question the tables answer.
+There is no built-in jq subcommand and there won't be: the tool prints
+JSON on stdout, so a plain `| jq` pipe *is* the integration, and jq
+already does the filtering better than a wrapper flag could.
+
+A few recipes that cover the common questions:
 
 ```bash
+# Instruction count per function per side, as a table
+asmdiff old.c new.c --json \
+  | jq -r '.results[] | "\(.tag)\t\(.function)\t\(.insns)"'
+
+# Only the functions that emit libcalls (soft-float, __divdi3, memcpy…)
+asmdiff old.c new.c --json \
+  | jq '.results[] | select(.calls | length > 0) | {function, tag, calls}'
+
+# Per-function old→new instruction delta (regressions have a positive delta)
+asmdiff old.c new.c --json \
+  | jq -r '.results | group_by(.function)[] | select(length == 2)
+           | "\(.[0].function): \(.[0].insns) -> \(.[1].insns) (\(.[1].insns - .[0].insns))"'
+
+# Fail CI if any function grew, using jq's exit status
+asmdiff old.c new.c --json \
+  | jq -e '.results | group_by(.function)
+           | all(length < 2 or .[1].insns <= .[0].insns)' > /dev/null
+
+# The full record for one hot function, spans and all
 asmdiff old.c new.c -a stereo_reverb --json --span-stats \
   | jq '.results[] | {role, insns, spans: .loop_spans}'
 ```
