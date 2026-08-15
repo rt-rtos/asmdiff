@@ -14,12 +14,13 @@ Usage:
                              [--cc 'CC FLAGS']... [--target NAME]...
                              [--config PATH] [--compile-commands [PATH]]
                              [--flags-like PATH] [--db-includes]
-                             [--summary-only] [--collapse] [--span-stats]
+                             [--filter REGEX] [--summary-only]
+                             [--collapse] [--span-stats]
                              [--json] [--layout list|side-by-side] [-v]
                              [-- EXTRA_FLAGS...]
     tools/asmdiff/asmdiff.py FIRMWARE.elf [FUNC...] [--filter REGEX]
-                             [--objdump PATH] [--summary-only]
-                             [--span-stats] [--json]
+                             [--objdump PATH] [--layout list]
+                             [--summary-only] [--span-stats] [--json]
     tools/asmdiff/asmdiff.py --edit-config | --example-config | --version
 
 Five modes:
@@ -27,12 +28,19 @@ Five modes:
                   comparison.  One usable compiler prints a listing
                   plus a stats row, exactly two print side by side,
                   more print one block per compiler; --layout forces
-                  list or side-by-side.
+                  list or side-by-side.  --filter REGEX selects
+                  matching functions as full peers of named ones
+                  (compiler-generated clones included; lenient when a
+                  match exists under only part of the matrix), and in
+                  summary mode narrows the table.
   FIRMWARE.elf    ELF input (detected by magic bytes): disassemble a
                   linked binary through the toolchain's objdump and
                   run named and/or --filter REGEX matched functions
                   through the same analyzers - post-LTO/link reality
-                  instead of single-TU codegen.  objdump comes from
+                  instead of single-TU codegen.  Named functions are
+                  listed in full; --filter matches are summarized
+                  only, unless -l list asks for their listings too.
+                  objdump comes from
                   --objdump PATH or the first gcc in the matrix
                   (trailing gcc swapped for objdump); Xtensa
                   -mlongcalls call sequences are resolved to their
@@ -100,7 +108,7 @@ except ModuleNotFoundError:
 
 # Single source of truth for the package version: pyproject.toml reads
 # it from here (hatchling dynamic version).
-__version__ = "0.3.0"
+__version__ = "0.3.3"
 
 DEFAULT_COMPILERS = ["gcc", "clang"]
 FALLBACK_FLAGS = "-O3"
@@ -1533,21 +1541,39 @@ def run_across(sources, matrix, fn_names, extra_flags, tmp):
     return 0
 
 
-def run_summary(sources, matrix, extra_flags, tmp):
-    """No pairs to compare: whole-file summary, one block per file."""
+def _compile_filter(filter_regex):
+    """Compile a --filter regex, exiting with a clean error on a bad one."""
+    try:
+        return re.compile(filter_regex)
+    except re.error as exc:
+        sys.exit(f"error: bad --filter regex: {exc}")
+
+
+def run_summary(sources, matrix, extra_flags, tmp, filter_regex=None):
+    """No pairs to compare: whole-file summary, one block per file.
+
+    --filter narrows each file's table to matching functions - the
+    subsystem view of a big TU, same selection idea as ELF mode.
+    """
+    pattern = _compile_filter(filter_regex) if filter_regex else None
     tags = (file_tags(*sources) if len(sources) == 2
             else [Path(sources[0]).name])
     ran_any = False
+    matched_any = False
     for cc_cmd in matrix:
         sections = []
         for src in sources:
             asm = compile_to_asm(cc_cmd, extra_flags, src, tmp)
             if asm is None:
                 break
-            sections.append(extract_functions(asm))
+            funcs = extract_functions(asm)
+            if pattern is not None:
+                funcs = {n: v for n, v in funcs.items() if pattern.search(n)}
+            sections.append(funcs)
         if len(sections) < len(sources):
             continue
         ran_any = True
+        matched_any = matched_any or any(sections)
         shown = (mark_db_misses(cc_cmd, sources, tags)
                  if len(sources) == 2 else tags)
         if JSON_OUT is None:
@@ -1563,12 +1589,16 @@ def run_summary(sources, matrix, extra_flags, tmp):
                 print(f"\n-- {tag} --")
             print()
             print(file_summary_table(funcs, table_width()) if funcs
-                  else "(no functions found)")
+                  else ("(no functions match --filter)" if pattern is not None
+                        else "(no functions found)"))
             if funcs:
                 span_stats_block(list(funcs), funcs)
     if not ran_any:
         sys.exit("error: no usable compiler in the matrix"
                  + _skipped_suffix())
+    if pattern is not None and not matched_any:
+        sys.exit(f"error: --filter {filter_regex!r} matched no function "
+                 "in any compilation")
     return 0
 
 
@@ -1628,14 +1658,24 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
     return 0
 
 
-def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp):
+def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp,
+                filter_regex=None):
     """Inspect mode: print named functions' assembly, no comparison.
 
     The presentation adapts to how many matrix entries compiled: one
     gives a plain listing with a stats table, exactly two give the
     --across side-by-side, more give one block per compiler.  --layout
     forces list or side-by-side instead.
+
+    --filter adds every matching function as a full peer of the named
+    ones - the way to reach compiler-generated clones ($constprop$0,
+    .isra.0) whose exact names only the -S output knows.  Named
+    functions must exist under every compiler; filter matches are
+    lenient and appear only where that compiler emitted them, since a
+    clone existing under one compiler but not another is a finding,
+    not an error.
     """
+    pattern = _compile_filter(filter_regex) if filter_regex else None
     usable = []
     for idx, cc_cmd in enumerate(matrix, start=1):
         asm = compile_to_asm(cc_cmd, extra_flags, source, tmp)
@@ -1650,10 +1690,24 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp):
             sys.exit("error: function(s) not in asm: " + ", ".join(missing)
                      + f" under {cc_cmd}; functions seen: "
                      + ", ".join(funcs))
+    matched = []
+    if pattern is not None:
+        union = {}
+        for _, _, funcs in usable:
+            union.update(dict.fromkeys(funcs))
+        matched = [n for n in union
+                   if pattern.search(n) and n not in fn_names]
+        if not matched and not fn_names:
+            sys.exit(f"error: --filter {filter_regex!r} matched no function "
+                     f"in {source}")
+
+    def selected(funcs):
+        return list(fn_names) + [m for m in matched if m in funcs]
+
     if JSON_OUT is not None:
         for _, cc_cmd, funcs in usable:
             JSON_OUT.extend(json_record(name, funcs[name], cc=cc_cmd)
-                            for name in fn_names)
+                            for name in selected(funcs))
         return 0
     if layout == "side-by-side" and len(usable) < 2:
         sys.exit("error: --layout side-by-side needs at least two usable "
@@ -1667,18 +1721,27 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp):
         base_tag, _, base_funcs = usable[0]
         for tag, _, funcs in usable[1:]:
             print(f"\n== {base_tag} vs {tag} ==\n")
-            report_across(fn_names, base_funcs, funcs, base_tag, tag)
+            both = list(fn_names) + [m for m in matched
+                                     if m in base_funcs and m in funcs]
+            report_across(both, base_funcs, funcs, base_tag, tag)
+            one_sided = [m for m in matched
+                         if (m in base_funcs) != (m in funcs)]
+            if one_sided:
+                print("\nnote: --filter match(es) present under only one "
+                      "compiler, not compared: " + ", ".join(one_sided)
+                      + " - inspect with -l list")
         return 0
     for _, cc_cmd, funcs in usable:
+        sel = selected(funcs)
         if len(usable) > 1:
             print(f"\n== {cc_cmd} ==")
         if not SUMMARY_ONLY:
-            for name in fn_names:
+            for name in sel:
                 print()
                 print(listing(name, funcs[name]))
         print()
-        print(inspect_table(fn_names, funcs, table_width()))
-        span_stats_block(fn_names, funcs)
+        print(inspect_table(sel, funcs, table_width()))
+        span_stats_block(sel, funcs)
     return 0
 
 
@@ -1709,7 +1772,7 @@ def run_objdump(objdump, elf):
     return proc.stdout
 
 
-def run_elf(elf, fn_names, filter_regex, objdump):
+def run_elf(elf, fn_names, filter_regex, objdump, list_matches=False):
     """ELF mode: disassemble one linked binary and run the selected
     functions through the same analyzers as -S output.
 
@@ -1717,7 +1780,12 @@ def run_elf(elf, fn_names, filter_regex, objdump):
     of existence, and only the linked ELF shows whether its loops
     survived as zero-overhead loops inside the caller.  Named functions
     are listed in full; --filter matches are summarized in the stats
-    table only, since a match can cover hundreds of functions.
+    table only, since a match can cover hundreds of functions - unless
+    list_matches (-l list) asks for their listings too, the way to see
+    the assembly when only the filter's spelling of a mangled name is
+    known.  When filter matches go unlisted, a trailing note says so:
+    a summary that looks complete but silently withholds the listings
+    costs the caller a detour through raw objdump.
     """
     funcs = extract_functions_objdump(run_objdump(objdump, elf))
     missing = [f for f in fn_names if f not in funcs]
@@ -1728,10 +1796,7 @@ def run_elf(elf, fn_names, filter_regex, objdump):
                  + ("; close matches: " + ", ".join(hints) if hints else ""))
     selected = list(fn_names)
     if filter_regex:
-        try:
-            pattern = re.compile(filter_regex)
-        except re.error as exc:
-            sys.exit(f"error: bad --filter regex: {exc}")
+        pattern = _compile_filter(filter_regex)
         selected += [n for n in funcs
                      if pattern.search(n) and n not in fn_names]
         if not selected:
@@ -1740,13 +1805,19 @@ def run_elf(elf, fn_names, filter_regex, objdump):
     if JSON_OUT is not None:
         JSON_OUT.extend(json_record(name, funcs[name]) for name in selected)
         return 0
+    listed = selected if list_matches else fn_names
     if not SUMMARY_ONLY:
-        for name in fn_names:
+        for name in listed:
             print()
             print(listing(name, funcs[name]))
     print()
     print(inspect_table(selected, funcs, table_width()))
     span_stats_block(selected, funcs)
+    unlisted = len(selected) - len(listed)
+    if unlisted and not SUMMARY_ONLY:
+        print(f"\nnote: {unlisted} --filter match(es) summarized without "
+              "listings; add -l list for their assembly, or name a "
+              "function after the ELF")
     return 0
 
 
@@ -1778,12 +1849,18 @@ def main(argv=None):
     parser.add_argument("-l", "--layout", choices=["list", "side-by-side"],
                         help="force the inspect presentation instead of "
                              "adapting to the matrix (1 usable compiler "
-                             "lists, 2 go side by side, more list)")
+                             "lists, 2 go side by side, more list); with "
+                             "ELF input, 'list' also prints --filter "
+                             "matches' listings")
     parser.add_argument("--filter", metavar="REGEX",
-                        help="ELF input only: also analyze every function "
-                             "whose name matches REGEX (re.search) - the "
-                             "way to sweep a whole subsystem without "
-                             "naming each function")
+                        help="also analyze every function whose name "
+                             "matches REGEX (re.search) - sweep a "
+                             "subsystem, or reach compiler-generated "
+                             "clones, without naming each function. In "
+                             "ELF input matches are summarized only (see "
+                             "-l list); in compile modes they are full "
+                             "peers of named functions. Not with "
+                             "--pair/--across")
     parser.add_argument("--objdump", metavar="PATH",
                         help="disassembler for ELF input; default: derived "
                              "from the first gcc in the matrix by swapping "
@@ -1885,9 +1962,13 @@ def main(argv=None):
         if len(sources) > 1:
             parser.error("ELF input analyzes one binary; a second file "
                          "cannot be combined with it")
-        if args.pair or args.across or args.layout:
-            parser.error("--pair/--across/--layout compare compilations; "
+        if args.pair or args.across:
+            parser.error("--pair/--across compare compilations; "
                          "an ELF is disassembled, not compiled")
+        if args.layout == "side-by-side":
+            parser.error("-l side-by-side compares compilations; with ELF "
+                         "input use -l list to also print --filter "
+                         "matches' listings")
         if not fn_names and not args.filter:
             parser.error("a whole ELF has too many functions to table; "
                          "name functions after the file or select them "
@@ -1903,14 +1984,18 @@ def main(argv=None):
                 sys.exit("error: no gcc in the matrix to derive an objdump "
                          "from (" + "; ".join(matrix) + "); pass --objdump "
                          "PATH or a gcc-based --cc/--target")
-        status = run_elf(sources[0], fn_names, args.filter, objdump)
+        status = run_elf(sources[0], fn_names, args.filter, objdump,
+                         list_matches=args.layout == "list")
         if JSON_OUT is not None:
             print(json.dumps({"asmdiff": __version__, "mode": "elf",
                               "elf": sources[0], "results": JSON_OUT},
                              indent=2))
         return status
-    if args.filter or args.objdump:
-        parser.error("--filter/--objdump apply to ELF input only")
+    if args.objdump:
+        parser.error("--objdump applies to ELF input only")
+    if args.filter and (args.pair or args.across):
+        parser.error("--filter selects functions to inspect or summarize; "
+                     "--pair/--across name their functions explicitly")
     if len(sources) > 2:
         parser.error("at most two source files may be given")
     if fn_names and len(sources) == 2:
@@ -1919,9 +2004,9 @@ def main(argv=None):
     if fn_names and (args.pair or args.across):
         parser.error("bare function names (inspect) cannot be combined "
                      "with --pair or --across")
-    if args.layout and not fn_names:
+    if args.layout and not fn_names and not args.filter:
         parser.error("--layout only applies when inspecting functions "
-                     "(SOURCE.c FUNC ...)")
+                     "(SOURCE.c FUNC ... or --filter REGEX)")
     if args.across and args.pair:
         parser.error("--across and --pair are mutually exclusive")
     if len(sources) == 2 and args.pair:
@@ -1938,17 +2023,19 @@ def main(argv=None):
             parser.error(f"--pair expects OLD:NEW, got {spec!r}")
 
     with tempfile.TemporaryDirectory(prefix="asmdiff") as tmp:
-        if fn_names:
+        if fn_names or (args.filter and len(sources) == 1):
             mode = "inspect"
             status = run_inspect(sources[0], matrix, fn_names, args.layout,
-                                 extra_flags, tmp)
+                                 extra_flags, tmp,
+                                 filter_regex=args.filter)
         elif args.across:
             mode = "across"
             status = run_across(sources, matrix, args.across,
                                 extra_flags, tmp)
         elif len(sources) == 2:
             mode = "summary"
-            status = run_summary(sources, matrix, extra_flags, tmp)
+            status = run_summary(sources, matrix, extra_flags, tmp,
+                                 filter_regex=args.filter)
         else:
             mode = "pairs"
             status = run_pairs(sources[0], matrix, args.pair,

@@ -344,7 +344,7 @@ asmdiff SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
            [--summary-only] [--collapse] [--span-stats]
            [--layout list|side-by-side] [-v] [-- EXTRA_FLAGS...]
 asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
-           [--summary-only] [--span-stats]
+           [-l list] [--summary-only] [--span-stats]
 ```
 
 | Option | Meaning |
@@ -352,8 +352,8 @@ asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
 | `SOURCE.c` | C file to compile — a purpose-built harness or a real project source. A second file may be given: with `--across` to compare a function, without it for a whole-file A/B summary. Bare names after the file are functions to inspect (see [Quick inspect](#quick-inspect-one-function-no-comparison)). An ELF binary (any name — detected by magic bytes) switches to [ELF input](#elf-input-what-actually-shipped-after-lto) instead of compiling. |
 | `-p, --pair OLD:NEW` | Compare two *different* functions within one compilation. Repeatable. Default: every `old_X` is auto-paired with its `new_X`; with no pairs at all, the whole-file summary is printed instead. |
 | `-a, --across FUNC` | Compare the *same* function across two compilations (see below). Repeatable. Mutually exclusive with `--pair`. |
-| `-l, --layout list\|side-by-side` | Force the inspect-mode presentation instead of the adaptive default (1 usable compiler lists, 2 go side by side, more list). Inspect mode only. |
-| `--filter REGEX` | ELF input only: also analyze every function whose name matches `REGEX` (`re.search`) — sweep a subsystem without naming each function. Matches appear in the stats table but are not listed in full. |
+| `-l, --layout list\|side-by-side` | Force the inspect-mode presentation instead of the adaptive default (1 usable compiler lists, 2 go side by side, more list). With ELF input, `list` also prints `--filter` matches' listings. |
+| `--filter REGEX` | Also analyze every function whose name matches `REGEX` (`re.search`) — sweep a subsystem, or reach compiler-generated clones (`$constprop$0`, `.isra.0`), without naming each function. In compile modes matches are full peers of named functions (lenient when a match exists under only part of the matrix) and narrow the whole-file summary; in ELF mode matches appear in the stats table but are not listed in full — add `-l list` to print their listings too (a trailing note reminds you when listings were withheld). Not combinable with `--pair`/`--across`. |
 | `--objdump PATH` | Disassembler for ELF input. Default: derived from the first gcc in the matrix by swapping the trailing `gcc` for `objdump`, so `--target`/config globs locate it like they locate the compiler. |
 | `--cc 'CC FLAGS'` | One compiler invocation, command and flags in a single quoted string. Repeatable to build a matrix. |
 | `--target NAME` | A named target from the config file, resolved to a `--cc` entry. Repeatable; appended to the matrix after `--cc` entries. |

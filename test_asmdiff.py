@@ -597,6 +597,32 @@ class TestElfMode(unittest.TestCase):
         self.assertNotIn("fx_mix", out)
         self.assertNotIn("entry\t", out)         # table only, no listings
 
+    def test_filter_suppressed_listings_noted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status, out = self._run([self._elf(tmp), "--filter", "render_",
+                                     "--objdump", "od"])
+        self.assertEqual(status, 0)
+        self.assertIn("summarized without listings", out)
+        with tempfile.TemporaryDirectory() as tmp:
+            _, out = self._run([self._elf(tmp), "render_lut",
+                                "--objdump", "od"])
+        self.assertNotIn("summarized without listings", out)
+
+    def test_layout_list_prints_filter_listings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status, out = self._run([self._elf(tmp), "--filter", "render_",
+                                     "-l", "list", "--objdump", "od"])
+        self.assertEqual(status, 0)
+        self.assertIn("entry\t", out)            # listings present
+        self.assertIn("render_lut:", out)
+        self.assertNotIn("summarized without listings", out)
+
+    def test_layout_side_by_side_rejected_for_elf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._expect_error([self._elf(tmp), "--filter", "r",
+                                "-l", "side-by-side", "--objdump", "od"],
+                               "-l list")
+
     def test_names_and_filter_combine(self):
         with tempfile.TemporaryDirectory() as tmp:
             status, out = self._run([self._elf(tmp), "fx_mix",
@@ -639,8 +665,9 @@ class TestElfMode(unittest.TestCase):
             self._expect_error([self._elf(tmp), str(other),
                                 "--objdump", "od"], "one binary")
 
-    def test_filter_without_elf_rejected(self):
-        self._expect_error(["x.c", "f", "--filter", "r"], "ELF input")
+    def test_filter_with_pair_rejected(self):
+        self._expect_error(["x.c", "--pair", "a:b", "--filter", "r"],
+                           "--pair/--across name their functions")
 
     def test_no_gcc_in_matrix_needs_objdump(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -661,6 +688,83 @@ class TestElfMode(unittest.TestCase):
                                      "--config", str(cfg), "--target", "t"])
         self.assertEqual(status, 0)
         self.assertIn("render_lut:", out)
+
+
+class TestCompileModeFilter(unittest.TestCase):
+    """--filter in compile modes: matches are full peers of named
+    functions in inspect mode, lenient across the matrix (a clone under
+    one compiler only is a finding, not an error), and narrow the
+    whole-file summary."""
+
+    def _patch(self, per_cc):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: per_cc(cc)
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
+
+    def _capture(self, fn, *args, **kw):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fn(*args, **kw)
+        return out.getvalue()
+
+    def test_inspect_filter_selects_and_lists(self):
+        self._patch(lambda cc: GCC_ASM)
+        out = self._capture(asmdiff.run_inspect, "h.c", ["gcc -O2"], [],
+                            None, [], "/tmp", filter_regex="_const")
+        self.assertIn("old_const:", out)      # listing: full peer of a name
+        self.assertIn("new_const:", out)
+
+    def test_inspect_filter_lenient_across_matrix(self):
+        self._patch(lambda cc: GCC_ASM if "gcc" in cc else CLANG_ASM)
+        out = self._capture(asmdiff.run_inspect, "h.c",
+                            ["gcc -O2", "clang -O2"], [],
+                            "list", [], "/tmp", filter_regex="_const")
+        self.assertIn("old_const:", out)      # gcc block has the clone
+        self.assertIn("new_const:", out)      # both blocks have this one
+
+    def test_inspect_filter_side_by_side_notes_one_sided(self):
+        self._patch(lambda cc: GCC_ASM if "gcc" in cc else CLANG_ASM)
+        out = self._capture(asmdiff.run_inspect, "h.c",
+                            ["gcc -O2", "clang -O2"], [],
+                            None, [], "/tmp", filter_regex="_const")
+        self.assertIn("only one compiler", out)
+        self.assertIn("old_const", out)
+
+    def test_inspect_filter_no_match_errors(self):
+        self._patch(lambda cc: GCC_ASM)
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stdout(io.StringIO()):
+                asmdiff.run_inspect("h.c", ["gcc -O2"], [], None, [],
+                                    "/tmp", filter_regex="zzz")
+
+    def test_summary_filter_narrows_table(self):
+        self._patch(lambda cc: GCC_ASM)
+        out = self._capture(asmdiff.run_summary, ["a/h.c", "b/h.c"],
+                            ["gcc -O2"], [], "/tmp", filter_regex="old_")
+        self.assertIn("old_const", out)
+        self.assertNotIn("new_const", out)
+
+    def test_summary_filter_no_match_errors(self):
+        self._patch(lambda cc: GCC_ASM)
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stdout(io.StringIO()):
+                asmdiff.run_summary(["a/h.c", "b/h.c"], ["gcc -O2"], [],
+                                    "/tmp", filter_regex="zzz")
+
+    def test_main_routes_single_source_filter_to_inspect(self):
+        self._patch(lambda cc: GCC_ASM)
+        self.addCleanup(setattr, asmdiff, "JSON_OUT", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "h.c"
+            src.touch()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                asmdiff.main([str(src), "--filter", "_const", "--json",
+                              "--cc", "gcc -O2"])
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["mode"], "inspect")
+        names = sorted(r["function"] for r in doc["results"])
+        self.assertEqual(names, ["new_const", "old_const"])
 
 
 class TestAutoPairs(unittest.TestCase):

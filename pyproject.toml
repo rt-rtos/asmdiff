@@ -36,5 +36,17 @@ asmdiff = "asmdiff:main"
 [tool.hatch.version]
 path = "asmdiff.py"
 
+# Explicit allowlist: hatchling's default sdist selection includes every
+# file that is not VCS-ignored, which sweeps untracked working files
+# (and even old dist/ artifacts) into the published tarball.
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "asmdiff.py",
+    "test_asmdiff.py",
+    "asmdiff_example.c",
+    "asmdiff.example.toml",
+    "README.md",
+]
+
 [tool.hatch.build.targets.wheel]
 include = ["asmdiff.py"]
