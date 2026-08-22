@@ -109,7 +109,7 @@ except ModuleNotFoundError:
 
 # Single source of truth for the package version: pyproject.toml reads
 # it from here (hatchling dynamic version).
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 DEFAULT_COMPILERS = ["gcc", "clang"]
 FALLBACK_FLAGS = "-O3"
