@@ -265,12 +265,22 @@ everywhere else; two things are ELF-specific:
   body as a ZOL, `render_lut_cub` fell back to a 74-instruction
   branch loop.
 - **`-mlongcalls` calls are resolved.** An out-of-range call survives
-  linking as `l32r a8, <lit>` + `callx8 a8`, which would otherwise
-  report a call to "a8". When the disassembly annotates the literal
-  with its value (`l32r a8, ... (40002274 <__divsf3>)`), the real
-  callee is reported instead. Calls stay register-named when the
-  evidence is missing or the register is overwritten in between -
-  a genuine function-pointer dispatch still reads as indirect.
+  linking as `l32r a8, <lit>` + `callx8 a8`, which has no callee name
+  of its own. When the disassembly annotates the literal with its
+  value (`l32r a8, ... (40002274 <__divsf3>)`), the real callee is
+  reported instead. When the evidence is missing or the register is
+  overwritten in between, the listing keeps the raw `callx8 a8` and
+  the `calls` column reports `indirect(a8)` - a genuine
+  function-pointer dispatch still reads as indirect, without the
+  register name masquerading as a symbol.
+- **Nearest-symbol noise is stripped.** objdump names every address
+  after the closest preceding symbol, so a literal pool word renders
+  as e.g. `l32r a8, <_stext+0x44> (<some_font_table+0x707ad9>)` - two
+  unrelated symbols decorating an address and a constant. Offset-form
+  annotations of foreign symbols become raw hex
+  (`l32r a8, 0x40370100 (0x3f8f5f80)`); bare-symbol annotations (a
+  real callee or object start) and offsets into the current function
+  itself are kept.
 
 What this looks like on real firmware: this binary's sequencer path -
 here in the vendored AMY synth engine (`components/amy/src/sequencer.c`,
@@ -283,7 +293,7 @@ $ asmdiff build/S3-Amysynth.elf --filter 'sequencer_(process_tick|recompute|time
 function                             insns  loop spans              calls
 sequencer_timer_callback$lto_priv$0  77     .L21:41                 __divsf3, __udivdi3
 sequencer_recompute                  46     -                       __extendsfdf2, __divdf3, __muldf3, __fixunsdfsi, __divsf3
-sequencer_process_tick$lto_priv$0    117    .L2e:96 .L48:85 .L8d:6  xQueueSemaphoreTake, xQueueGenericSend, add_delta_to_queue, a8
+sequencer_process_tick$lto_priv$0    117    .L2e:96 .L48:85 .L8d:6  xQueueSemaphoreTake, xQueueGenericSend, add_delta_to_queue, indirect(a8)
 ```
 
 A timer callback pays a software float divide *and* a 64-bit
@@ -300,8 +310,8 @@ is the double-promotion smell (typically an unsuffixed `60.0`-style
 literal) on a chip whose FPU is single-precision only. And the
 `$lto_priv$0` suffixes show LTO renaming the survivors, which is why
 `--filter` matters: you can't name symbols you don't know exist. The
-lone `a8` is a genuine function-pointer dispatch, reported as the
-register rather than guessed at.
+lone `indirect(a8)` is a genuine function-pointer dispatch, reported
+as such rather than guessed at.
 
 Functions LTO inlined away don't table at all, and the error says so
 usefully:
@@ -796,13 +806,15 @@ measurement, and per-function rows are where the real information is.
 Only labels the assembler types as functions are listed — global data
 (string constants, state structs, lookup tables) gets column-0 labels too
 but is not code. A `calls` list longer than 8 symbols is truncated to
-`..., Total Calls:N`; real firmware dispatch functions call dozens of
-distinct symbols and would otherwise make rows thousands of characters
-wide. When stdout is a terminal, rows are additionally trimmed to the
-terminal width: callees are dropped from the end of the `calls` column
-(never the first one) behind the same `Total Calls:N` summary, so every
-row stays on one line. Piped or redirected output skips the width trim
-and keeps the full capped list, so it stays stable and greppable.
+`..., ... (N total)` (the leading `...` marks the elision, so the
+marker never reads as one more callee); real firmware dispatch
+functions call dozens of distinct symbols and would otherwise make
+rows thousands of characters wide. When stdout is a terminal, rows are
+additionally trimmed to the terminal width: callees are dropped from
+the end of the `calls` column (never the first one) behind the same
+`... (N total)` marker, so every row stays on one line. Piped or
+redirected output skips the width trim and keeps the full capped list,
+so it stays stable and greppable.
 
 ## Comparing the same function across two builds (`--across`)
 
@@ -982,6 +994,8 @@ probed the same way.
    x86 (`call`, `jmp` tail calls), ARM (`bl`, `blx`), RISC-V (`call`,
    `tail`, `jal`), and Xtensa (`call0/4/8/12`, `callx*`, `j`). Local-label
    branches and register-indirect x86 jumps are not counted as calls.
+   Register-indirect call mnemonics (`callx8 a8`, single-operand `jalr`,
+   `blx r3`) are reported as `indirect(<reg>)`.
 4. Loop spans come from label references alone — no mnemonic tables, no
    control-flow analysis. The next section walks through it.
 
@@ -1104,12 +1118,12 @@ standard library, and contains no project-specific constants. To port:
   supported — on a Mac, compare inside a Linux container or with a
   cross-toolchain.
 - Call detection is a mnemonic heuristic. Register-indirect calls through a
-  loaded address (other than x86 `jmp *reg`) can be reported as a call to
-  the register's name (e.g. Xtensa `callx8 a10`), which errs toward
-  visibility rather than silence. ELF input narrows this: `-mlongcalls`
-  sequences are resolved to their real callee when objdump's literal
-  annotation names one; genuine function-pointer dispatch still reads
-  as a register.
+  loaded address (other than x86 `jmp *reg`) are reported as
+  `indirect(<reg>)` (e.g. Xtensa `callx8 a10` -> `indirect(a10)`), which
+  errs toward visibility rather than silence. ELF input narrows this:
+  `-mlongcalls` sequences are resolved to their real callee when objdump's
+  literal annotation names one; genuine function-pointer dispatch still
+  reads as indirect.
 - Columns truncate long instruction lines to keep pairs aligned; when a
   line matters, widen it via the `width` parameter of `side_by_side()` or
   read the raw `-S` output by hand.

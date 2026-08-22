@@ -334,8 +334,15 @@ class TestAnalyze(unittest.TestCase):
         self.assertEqual(asmdiff.analyze(["tail\tldexpf@plt"])[1], ["ldexpf"])
         self.assertEqual(asmdiff.analyze(["jal\tra, exp2f"])[1], [])  # reg first: not a symbol
         self.assertEqual(asmdiff.analyze(["call8\texp2f"])[1], ["exp2f"])
-        self.assertEqual(asmdiff.analyze(["callx8\ta10"])[1], ["a10"])
         self.assertEqual(asmdiff.analyze(["j\t.L4"])[1], [])
+
+    def test_register_indirect_calls_marked(self):
+        self.assertEqual(asmdiff.analyze(["callx8\ta10"])[1],
+                         ["indirect(a10)"])
+        self.assertEqual(asmdiff.analyze(["jalr\ta5"])[1],
+                         ["indirect(a5)"])
+        self.assertEqual(asmdiff.analyze(["blx\tr3"])[1],
+                         ["indirect(r3)"])
 
     def test_duplicate_calls_reported_once(self):
         _, calls = asmdiff.analyze(["call\tf", "call\tf", "call\tg"])
@@ -503,7 +510,8 @@ class TestLongcallResolver(unittest.TestCase):
 
     def test_calls_reported_by_analyze(self):
         _, calls = asmdiff.analyze(self.funcs["render_partial"])
-        self.assertEqual(calls, ["__divsf3", "a9", "a10"])
+        self.assertEqual(calls,
+                         ["__divsf3", "indirect(a9)", "indirect(a10)"])
 
     def test_load_beyond_window_stays_indirect(self):
         self.assertIn("callx8\ta8", self.funcs["far_call"])
@@ -524,6 +532,45 @@ class TestLongcallResolver(unittest.TestCase):
         # s32i.n reads a8 (stores it to the stack) without writing it,
         # so the loaded callee is still live at the call.
         self.assertIn("callx8\t__divsf3", self.funcs["spilled"])
+
+
+class TestOffsetAnnotations(unittest.TestCase):
+    """Nearest-symbol offset annotations (<_etext+0x100>) on targets
+    outside the current function are noise - a pool address or literal
+    value named after whatever symbol happens to precede it - and are
+    rendered as raw hex.  Bare-symbol annotations and offsets into the
+    function itself are real information and are kept."""
+
+    def setUp(self):
+        self.funcs = asmdiff.extract_functions_objdump(OBJDUMP_LONGCALL_ASM)
+
+    def test_offset_annotations_become_raw_hex(self):
+        # Pool address <_stext+0x104> and literal value <_etext+0x100>
+        # both decorate unrelated symbols; neither name survives.
+        self.assertIn("l32r\ta9, 0x40370104 (0x473b8000)",
+                      self.funcs["render_partial"])
+
+    def test_bare_symbol_annotation_kept(self):
+        # The literal's value IS a symbol start (a real object): keep it.
+        self.assertIn("l32r\ta8, 0x40370108 (amy_global)",
+                      self.funcs["memberptr"])
+
+    def test_own_function_offset_kept(self):
+        # A branch into this function at a non-instruction address (a
+        # mid-body gap objdump could not label) is accurate as fn+off;
+        # a cross-symbol offset target is not, and becomes hex.
+        dump = (
+            "firmware.elf:     file format elf32-xtensa-le\n\n\n"
+            "Disassembly of section .flash.text:\n\n"
+            "40370400 <veneer>:\n"
+            "40370400:\t004136        \tentry\ta1, 32\n"
+            "40370403:\t56faff        \tbeqz\ta2, 40370409 <veneer+0x9>\n"
+            "40370406:\t0c0a          \tblt\ta3, a4, 40380010 <other_fn+0x10>\n"
+            "40370408:\tf01d          \tretw.n\n"
+        )
+        body = asmdiff.extract_functions_objdump(dump)["veneer"]
+        self.assertIn("beqz\ta2, veneer+0x9", body)
+        self.assertIn("blt\ta3, a4, 0x40380010", body)
 
 
 class TestElfMode(unittest.TestCase):
@@ -1429,7 +1476,7 @@ class TestFormatCalls(unittest.TestCase):
     def test_long_list_capped(self):
         calls = [f"fn{i}" for i in range(12)]
         out = asmdiff.format_calls(calls)
-        self.assertTrue(out.endswith("Total Calls:12"))
+        self.assertTrue(out.endswith("... (12 total)"))
         self.assertIn("fn7", out)
         self.assertNotIn("fn8,", out)
 
@@ -1437,7 +1484,7 @@ class TestFormatCalls(unittest.TestCase):
 class TestTableMaxWidth(unittest.TestCase):
     """render_table(max_width=) fits rows to the terminal by trimming
     the last column only, whole callees at a time, replacing the tail
-    with (or preserving) a Total Calls:N summary."""
+    with (or preserving) a "... (N total)" elision marker."""
 
     def test_no_max_width_keeps_long_cells(self):
         rows = [("function", "calls"),
@@ -1449,7 +1496,7 @@ class TestTableMaxWidth(unittest.TestCase):
         rows = [("function", "insns", "calls"),
                 ("f", "5", "alpha, bravo, charlie, delta")]
         out = asmdiff.render_table(rows, max_width=37)
-        self.assertIn("alpha, Total Calls:4", out)
+        self.assertIn("alpha, ... (4 total)", out)
         self.assertNotIn("bravo", out)
         self.assertTrue(all(len(l) <= 37 for l in out.splitlines()))
 
@@ -1457,12 +1504,12 @@ class TestTableMaxWidth(unittest.TestCase):
         rows = [("function", "calls"), ("f", "alpha, bravo")]
         out = asmdiff.render_table(rows, max_width=80)
         self.assertIn("alpha, bravo", out)
-        self.assertNotIn("Total Calls", out)
+        self.assertNotIn("total)", out)
 
     def test_merges_existing_total_summary(self):
-        rows = [("fn", "calls"), ("f", "a, b, c, Total Calls:12")]
+        rows = [("fn", "calls"), ("f", "a, b, c, ... (12 total)")]
         out = asmdiff.render_table(rows, max_width=21)
-        self.assertIn("a, Total Calls:12", out)
+        self.assertIn("a, ... (12 total)", out)
         self.assertNotIn("b", out.splitlines()[1])
 
     def test_single_callee_never_dropped(self):
@@ -1479,7 +1526,7 @@ class TestTableMaxWidth(unittest.TestCase):
         funcs = {"f": ["call\talpha", "call\tbravo",
                        "call\tcharlie", "call\tdelta", "ret"]}
         out = asmdiff.inspect_table(["f"], funcs, max_width=49)
-        self.assertIn("alpha, Total Calls:4", out)
+        self.assertIn("alpha, ... (4 total)", out)
         self.assertNotIn("bravo", out)
 
     def test_table_width_is_terminal_width_on_tty(self):

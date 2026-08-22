@@ -44,7 +44,8 @@ Five modes:
                   --objdump PATH or the first gcc in the matrix
                   (trailing gcc swapped for objdump); Xtensa
                   -mlongcalls call sequences are resolved to their
-                  real callees when the disassembly names them.
+                  real callees when the disassembly names them,
+                  and report as indirect(<reg>) when it does not.
   --pair OLD:NEW  compares two different functions within one compilation
                   (with no --pair, old_X/new_X names auto-pair).
   --across FUNC   compares the SAME function across two compilations:
@@ -602,6 +603,12 @@ OBJDUMP_INSN = re.compile(
     r"^\s*([0-9a-f]+):\t[0-9a-f ]+\t\s*(\S+)[ \t]*(.*?)\s*$")
 # An "addr <annotation>" operand: branch, loop or call target.
 OBJDUMP_TARGET = re.compile(r"\b([0-9a-f]+) <([^>]+)>")
+# A nearest-symbol offset annotation ("<_etext+0x100>"): objdump's name
+# for an address that is not a symbol start.  For addresses outside the
+# current function the base symbol is usually unrelated (a literal-pool
+# word or data landing after some other object), so the annotation is
+# misleading, not informative.
+OFFSET_ANNOT = re.compile(r"[+-]0x[0-9a-f]+$")
 
 
 def extract_functions_objdump(dump_text):
@@ -614,8 +621,10 @@ def extract_functions_objdump(dump_text):
     synthetic local labels (.L<hex-offset>) inserted at the target
     instruction; an Xtensa zero-overhead loop's end address becomes
     .L<off>_LEND, keeping the ZOL-vs-branch naming convention -S output
-    has.  Targets outside the function keep their symbol annotation, so
-    calls still name their callee.  Offset-form headers
+    has.  Targets outside the function keep a bare-symbol annotation,
+    so calls still name their callee; offset-form annotations of other
+    symbols are nearest-symbol noise and become raw hex addresses (see
+    _relabel_objdump).  Offset-form headers
     (``<sym+0x..>``/``<sym-0x..>``: literal pools and other symbol-less
     gaps that disassemble as garbage) and ``...`` filler are skipped.
     """
@@ -625,7 +634,7 @@ def extract_functions_objdump(dump_text):
         h = OBJDUMP_HEADER.match(raw)
         if h:
             name = h.group(2)
-            if re.search(r"[+-]0x[0-9a-f]+$", name):
+            if OFFSET_ANNOT.search(name):
                 current = None          # symbol-less gap, not a function
             else:
                 current = []
@@ -636,7 +645,7 @@ def extract_functions_objdump(dump_text):
         m = OBJDUMP_INSN.match(raw)
         if m:
             current.append((int(m.group(1), 16), m.group(2), m.group(3)))
-    return {name: _relabel_objdump(start, _resolve_longcalls(insns))
+    return {name: _relabel_objdump(name, start, _resolve_longcalls(insns))
             for name, (start, insns) in funcs.items()}
 
 
@@ -685,9 +694,15 @@ def _resolve_longcalls(insns):
     return out
 
 
-def _relabel_objdump(start, insns):
+def _relabel_objdump(name, start, insns):
     """Turn one function's (addr, mnemonic, operands) rows into cleaned
-    lines, synthesizing local labels for in-function targets."""
+    lines, synthesizing local labels for in-function targets.
+
+    Out-of-function targets keep a bare-symbol annotation (a real callee
+    or object), but an offset-form annotation whose base is not this
+    function is nearest-symbol noise - typically an l32r pool address or
+    literal value decorated with whatever symbol precedes it - and is
+    rendered as the raw hex address instead."""
     addrs = {addr for addr, _, _ in insns}
     labels = {}
     for _, mnem, ops in insns:
@@ -701,7 +716,13 @@ def _relabel_objdump(start, insns):
                 labels[taddr] = ".L%x" % (taddr - start)
 
     def target_name(m):
-        return labels.get(int(m.group(1), 16), m.group(2))
+        taddr = int(m.group(1), 16)
+        if taddr in labels:
+            return labels[taddr]
+        annot = m.group(2)
+        if OFFSET_ANNOT.search(annot) and OFFSET_ANNOT.sub("", annot) != name:
+            return "0x%x" % taddr
+        return annot
 
     lines = []
     for addr, mnem, ops in insns:
@@ -722,13 +743,26 @@ CALL_RE = re.compile(
     r"([A-Za-z_][\w$.]*)(?:@[\w.]+)?\s*(?:[#;].*)?$"
 )
 
+# Register-indirect call forms whose sole operand is a register: Xtensa
+# callx* (always a register), RISC-V single-operand jalr, ARM blx rN.
+# Without this, CALL_RE would report the register name as the callee
+# ("callx8 a8" -> a call to "a8") - technically visible, but easy to
+# mistake for a symbol, and a grep for the real callee silently misses
+# the site.  Reported as "indirect(<reg>)" instead.
+INDIRECT_CALL_RE = re.compile(
+    r"^(?:callx\d+\s+(a\d+)"
+    r"|jalr\s+(x\d+|ra|[ast]\d+)"
+    r"|blx\s+(r\d+|lr|ip))\s*$"
+)
+
 
 def analyze(lines):
     """Return (instruction_count, called_symbols) for cleaned asm lines.
 
     A call is a call/tail-call mnemonic whose first operand looks like a
     symbol name — local labels (.L*) and %-registers never match, so
-    branches inside the function are not counted.
+    branches inside the function are not counted.  A call through a
+    register is reported as "indirect(<reg>)".
     """
     insns = 0
     calls = []
@@ -736,11 +770,14 @@ def analyze(lines):
         if line.endswith(":"):
             continue
         insns += 1
-        m = CALL_RE.match(line)
+        m = INDIRECT_CALL_RE.match(line)
         if m:
-            sym = m.group(1)
-            if sym not in calls:
-                calls.append(sym)
+            sym = "indirect(%s)" % next(g for g in m.groups() if g)
+        else:
+            m = CALL_RE.match(line)
+            sym = m.group(1) if m else None
+        if sym is not None and sym not in calls:
+            calls.append(sym)
     return insns, calls
 
 
@@ -1323,22 +1360,25 @@ def side_by_side(left, right, ltitle, rtitle, width=44, collapse=False):
     return "\n".join(rows)
 
 
-TOTAL_CALLS_RE = re.compile(r"Total Calls:\d+")
+# The elision marker closing a truncated callee cell.  The leading
+# "..." keeps it from reading as one more callee name.
+CALLS_ELIDED_RE = re.compile(r"\.\.\. \((\d+) total\)")
 
 
 def _fit_calls(cell, budget):
     """Trim a comma-joined callee cell to at most budget columns by
-    dropping whole callees from the end, closing with a Total Calls:N
-    summary (N is always the full callee count, preserved from an
-    existing summary when the cell was already capped). The first
+    dropping whole callees from the end, closing with a "... (N total)"
+    elision marker (N is always the full callee count, preserved from
+    an existing marker when the cell was already capped). The first
     callee is never dropped; a cell that still overflows just wraps."""
     if len(cell) <= budget:
         return cell
     items = cell.split(", ")
-    if TOTAL_CALLS_RE.fullmatch(items[-1]):
+    m = CALLS_ELIDED_RE.fullmatch(items[-1])
+    if m:
         items, summary = items[:-1], items[-1]
     else:
-        summary = f"Total Calls:{len(items)}"
+        summary = f"... ({len(items)} total)"
     if len(items) < 2:
         return cell
     for keep in range(len(items) - 1, 0, -1):
@@ -1382,12 +1422,13 @@ MAX_CALLS_SHOWN = 8
 
 def format_calls(calls):
     """Comma-joined callee list; longer lists keep the first
-    MAX_CALLS_SHOWN callees and close with a Total Calls:N summary."""
+    MAX_CALLS_SHOWN callees and close with a "... (N total)" elision
+    marker."""
     if not calls:
         return "-"
     if len(calls) > MAX_CALLS_SHOWN:
         return (", ".join(calls[:MAX_CALLS_SHOWN])
-                + f", Total Calls:{len(calls)}")
+                + f", ... ({len(calls)} total)")
     return ", ".join(calls)
 
 
