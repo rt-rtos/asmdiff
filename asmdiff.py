@@ -11,7 +11,7 @@ Automates fold-vs-libcall analysis when evaluating micro-optimisations
 Usage:
     tools/asmdiff/asmdiff.py SOURCE.c [SOURCE2.c | FUNC...]
                              [--pair OLD:NEW]... [--across FUNC]...
-                             [--cc 'CC FLAGS']... [--target NAME]...
+                             [--target NAME]... [--cc 'CC FLAGS']...
                              [--config PATH] [--compile-commands [PATH]]
                              [--flags-like PATH] [--db-includes]
                              [--filter REGEX] [--summary-only]
@@ -21,7 +21,8 @@ Usage:
     tools/asmdiff/asmdiff.py FIRMWARE.elf [FUNC...] [--filter REGEX]
                              [--objdump PATH] [--layout list]
                              [--summary-only] [--span-stats] [--json]
-    tools/asmdiff/asmdiff.py --edit-config | --example-config | --version
+    tools/asmdiff/asmdiff.py --edit-config | --example-config
+                             | --list-targets | --version
 
 Five modes:
   SOURCE.c FUNC   inspect: print the named function's assembly, no
@@ -49,7 +50,7 @@ Five modes:
   --pair OLD:NEW  compares two different functions within one compilation
                   (with no --pair, old_X/new_X names auto-pair).
   --across FUNC   compares the SAME function across two compilations:
-                  either one file under two --cc entries (flag/define
+                  either one file under two matrix entries (flag/define
                   variants), or two source files (before/after versions)
                   under each compiler in the matrix.
   (neither)       whole-file summary: per-function counts plus a file
@@ -63,13 +64,16 @@ branch/other counts; branch includes calls), and --json replaces the
 tables with one JSON document of per-function records (implies
 --summary-only) for scripted callers.
 
-Compilers come from --cc strings, from named targets in an asmdiff.toml
-config file (--target NAME), from the config's `default` entry, or —
-failing all of those — plain `gcc -O3` and `clang -O3`.
+Compilers come from named targets in an asmdiff.toml config file
+(-t/--target NAME: a table, a [groups] name, a comma-list, or a glob),
+from ad-hoc --cc 'CC FLAGS' rows, from the config's `default` entry, or
+— failing all of those — plain `gcc -O3` and `clang -O3`.
 Flags after a bare `--` are appended to every compiler invocation.
 --edit-config opens the config (--config PATH, else ~/.config/
 asmdiff.toml) in $VISUAL/$EDITOR, creating it from the built-in example
-when missing; --example-config prints that example to stdout.
+when missing; --example-config prints that example to stdout;
+--list-targets prints the resolved config's default, groups, and
+targets.
 
 A config target may name a compile_commands.json (compile_commands = PATH):
 the include/define flags recorded there for the source being compiled are
@@ -89,6 +93,7 @@ compile a cross project's source without inheriting cross-only defines,
 """
 import argparse
 import difflib
+import fnmatch
 import glob
 import hashlib
 import json
@@ -114,6 +119,8 @@ __version__ = "0.3.4"
 DEFAULT_COMPILERS = ["gcc", "clang"]
 FALLBACK_FLAGS = "-O3"
 CONFIG_NAME = "asmdiff.toml"
+# Top-level keys that are not compiler targets.
+CONFIG_META_KEYS = ("default", "groups")
 
 # Mirror of asmdiff.example.toml, embedded because the wheel ships only
 # this module: --example-config prints it and --edit-config seeds a new
@@ -127,9 +134,11 @@ EXAMPLE_CONFIG = """\
 #   3. asmdiff.toml in the current directory
 #   4. ~/.config/asmdiff.toml
 #
-# Each [table] is a target usable as `--target NAME`; the optional
+# Each [table] is a target usable as `-t/--target NAME`; the optional
 # top-level `default` names the target(s) used when no --cc/--target
 # is given (a list runs several: default = ["gcc", "clang"]).
+# [groups] names a matrix of those tables for one `-t GROUP` (comma
+# lists and globs also work: `-t esp32c3,esp32s3`, `-t 'esp32c*'`).
 # Compile at the flags your project ships with — that is the whole
 # point of the tool.
 
@@ -153,6 +162,15 @@ flags = ["-O3", "-Wall", "-Wextra"]
 cc = "gcc"
 flags = ["-O3", "-Wall", "-Wextra"]
 
+# `-t GROUP` runs every named target.  `-t host` is still the [host]
+# gcc alias above; use `-t native` (or `-t gcc,clang`) for both host
+# compilers.  Does not change `default`.
+[groups]
+riscv32-esp = ["esp32c3", "esp32c6", "esp32h2", "esp32p4"]
+xtensa-esp = ["esp32", "esp32s2", "esp32s3"]
+esp = ["esp32", "esp32s2", "esp32s3", "esp32c3", "esp32c6", "esp32h2", "esp32p4"]
+native = ["gcc", "clang"]
+
 # cc values may use ~, $VARS, and glob patterns.  A glob that matches
 # several installed toolchains resolves to the highest version-sorted
 # one (announced on stderr); pin the exact esp-NN directory instead if
@@ -169,9 +187,8 @@ flags = ["-O3", "-Wall", "-Wextra"]
 
 # --- Profile: riscv32-esp (ESP32-C3 / C6 / H2 / P4) -------------------
 # All RISC-V ESP chips share one riscv32-esp-elf-gcc binary; the
-# targets differ only in -march/-mabi.  Uncomment to run the whole
-# profile as the default matrix:
-# default = ["esp32c3", "esp32c6", "esp32h2", "esp32p4"]
+# targets differ only in -march/-mabi.  `-t riscv32-esp` runs the
+# whole profile without editing `default`.
 
 [esp32c3]
 cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
@@ -193,7 +210,7 @@ flags = ["-O2", "-march=rv32imafc_zicsr_zifencei", "-mabi=ilp32f"]
 
 # --- Profile: xtensa-esp (ESP32 / S2 / S3) ----------------------------
 # The unified xtensa-esp-elf toolchain ships one gcc binary per chip.
-# default = ["esp32", "esp32s2", "esp32s3"]
+# `-t xtensa-esp` runs the whole profile; `-t esp` runs every ESP chip.
 
 [esp32]
 cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc"
@@ -987,21 +1004,26 @@ def is_elf(path):
         return False
 
 
-def find_config(explicit, sources):
+def find_config(explicit, sources=None):
     """Locate the config file; first hit wins, no merging.
 
     Order: --config PATH, then asmdiff.toml next to the first source
     file (a harness directory can carry its own targets), then the
-    current directory, then ~/.config/asmdiff.toml.
+    current directory, then ~/.config/asmdiff.toml.  ``sources`` may
+    be empty (--list-targets with no file): the next-to-source slot
+    is skipped.
     """
     if explicit:
         path = Path(explicit)
         if not path.is_file():
             sys.exit(f"error: config file not found: {explicit}")
         return path
-    for candidate in (Path(sources[0]).resolve().parent / CONFIG_NAME,
-                      Path.cwd() / CONFIG_NAME,
-                      Path.home() / ".config" / CONFIG_NAME):
+    candidates = []
+    if sources:
+        candidates.append(Path(sources[0]).resolve().parent / CONFIG_NAME)
+    candidates += [Path.cwd() / CONFIG_NAME,
+                   Path.home() / ".config" / CONFIG_NAME]
+    for candidate in candidates:
         if candidate.is_file():
             return candidate
     return None
@@ -1009,7 +1031,8 @@ def find_config(explicit, sources):
 
 def load_config(path):
     """Parse a TOML config: one [table] per target, optional top-level
-    `default` naming the target(s) to run when no --cc/--target is given."""
+    `default` naming the target(s) to run when no --cc/--target is given,
+    optional [groups] naming matrices of those targets."""
     if tomllib is None:
         sys.exit(f"error: {path} exists but this Python has no tomllib "
                  "(config files need Python >= 3.11)")
@@ -1084,6 +1107,132 @@ def resolve_cc(cc, name):
     return matches[-1]
 
 
+def config_target_names(config):
+    """[table] names that are compiler targets, in file order."""
+    return [k for k, v in (config or {}).items()
+            if k not in CONFIG_META_KEYS and isinstance(v, dict)]
+
+
+def config_groups(config, config_path=None):
+    """Name -> list of target names from the optional [groups] table."""
+    raw = (config or {}).get("groups")
+    if raw is None:
+        return {}
+    where = config_path or "the config"
+    if not isinstance(raw, dict):
+        sys.exit(f"error: {where}: groups must be a table of "
+                 "name = [target, ...] arrays")
+    groups = {}
+    for name, members in raw.items():
+        if (isinstance(members, str)
+                or not isinstance(members, list)
+                or not members
+                or not all(isinstance(m, str) and m for m in members)):
+            sys.exit(f"error: {where}: groups.{name} must be a non-empty "
+                     "array of target names")
+        groups[name] = list(members)
+    return groups
+
+
+def _known_suffix(config, config_path):
+    """'; targets: ...; groups: ...' for unknown-name errors."""
+    targets = config_target_names(config)
+    groups = list(config_groups(config, config_path))
+    bits = []
+    if targets:
+        bits.append("targets: " + ", ".join(targets))
+    if groups:
+        bits.append("groups: " + ", ".join(groups))
+    if not bits:
+        return "; no targets defined"
+    return "; " + "; ".join(bits)
+
+
+def _split_target_token(token):
+    """Split a --target value on commas, except inside a [...] glob class."""
+    parts, buf, depth = [], "", 0
+    for ch in token:
+        if ch == "[":
+            depth += 1
+        elif ch == "]" and depth:
+            depth -= 1
+        if ch == "," and not depth:
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    parts.append(buf)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def expand_target_args(target_args, config, config_path):
+    """Expand --target tokens: commas, [groups] names, fnmatch globs.
+
+    An exact target table wins over a group of the same name.  Globs
+    match target table names only (in config order).
+    """
+    targets = config_target_names(config)
+    groups = config_groups(config, config_path)
+    names = []
+    for token in target_args:
+        parts = _split_target_token(token)
+        if not parts:
+            sys.exit(f"error: empty --target {token!r}")
+        for part in parts:
+            names.extend(_resolve_target_token(part, targets, groups,
+                                               config, config_path))
+    return names
+
+
+def _resolve_target_token(part, targets, groups, config, config_path):
+    if part in targets:
+        return [part]
+    if part in groups:
+        missing = [m for m in groups[part] if m not in targets]
+        if missing:
+            sys.exit(f"error: group {part!r} names unknown target(s) "
+                     + ", ".join(missing)
+                     + _known_suffix(config, config_path))
+        return list(groups[part])
+    if any(ch in part for ch in "*?["):
+        matched = [n for n in targets if fnmatch.fnmatch(n, part)]
+        if not matched:
+            sys.exit(f"error: --target {part!r} matched no target in "
+                     f"{config_path or 'any config file'}"
+                     + _known_suffix(config, config_path))
+        return matched
+    sys.exit(f"error: no [{part}] target in "
+             f"{config_path or 'any config file'}"
+             + _known_suffix(config, config_path))
+
+
+def list_targets(config, config_path):
+    """Print default, groups, and targets; used by --list-targets."""
+    if not config:
+        print("no config file found; default matrix is "
+              + ", ".join(f"{cc} {FALLBACK_FLAGS}"
+                          for cc in DEFAULT_COMPILERS))
+        return 0
+    print(f"config: {config_path}")
+    default = config.get("default")
+    if default:
+        if isinstance(default, str):
+            default = [default]
+        print("default: " + ", ".join(default))
+    else:
+        print("default: (none; gcc -O3 and clang -O3)")
+    groups = config_groups(config, config_path)
+    if groups:
+        print("groups:")
+        for name, members in groups.items():
+            print(f"  {name}: " + ", ".join(members))
+    print("targets:")
+    for name in config_target_names(config):
+        cc = config[name].get("cc", "")
+        print(f"  {name}: {cc}")
+    return 0
+
+
 def target_command(config, name, config_path, want_db=True):
     """Resolve a named [target] table to one 'CC FLAGS' matrix entry.
 
@@ -1092,13 +1241,10 @@ def target_command(config, name, config_path, want_db=True):
     mode resolves targets only to find their toolchain.
     """
     entry = (config or {}).get(name)
-    if not isinstance(entry, dict):
-        known = sorted(k for k, v in (config or {}).items()
-                       if isinstance(v, dict))
+    if not isinstance(entry, dict) or name in CONFIG_META_KEYS:
         sys.exit(f"error: no [{name}] target in "
                  f"{config_path or 'any config file'}"
-                 + ("; targets: " + ", ".join(known) if known
-                    else "; no targets defined"))
+                 + _known_suffix(config, config_path))
     cc = entry.get("cc")
     if not isinstance(cc, str):
         sys.exit(f'error: target [{name}] needs cc = "compiler"')
@@ -1125,9 +1271,10 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
                  want_db=True):
     """Resolve the compiler matrix.
 
-    --cc strings verbatim, then --target entries, in that order.  With
-    neither, the config's `default` (a target name or list of names);
-    with no config or no default, plain gcc/clang at -O3.
+    --cc strings verbatim, then --target entries (comma-lists, groups,
+    and globs expanded), in that order.  With neither, the config's
+    `default` (a target name or list of names); with no config or no
+    default, plain gcc/clang at -O3.
 
     ``db_arg`` is the --compile-commands value: a PATH applies that
     database to every entry, True discovers one near the CWD.  A target
@@ -1135,7 +1282,8 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
     """
     entries = list(cc_args)
     entries += [target_command(config, name, config_path, want_db)
-                for name in target_args]
+                for name in expand_target_args(target_args, config,
+                                               config_path)]
     if not entries:
         default = (config or {}).get("default")
         if default:
@@ -1872,7 +2020,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(__doc__ or "").partition("\n")[0],
         epilog="Flags after a bare -- are appended to every compiler "
-               "invocation, e.g.: asmdiff.py h.c -- -fno-math-errno")
+               "invocation, e.g.: asmdiff.py h.c -t host -- -fno-math-errno")
     parser.add_argument("sources", nargs="*", metavar="SOURCE.c",
                         help="C file to compile; follow it with bare "
                              "function names to inspect their assembly, "
@@ -1886,14 +2034,14 @@ def main(argv=None):
                         metavar="FUNC",
                         help="compare the same function across two "
                              "compilations (repeatable): one file + two "
-                             "--cc entries, or two files")
+                             "matrix entries, or two files")
     parser.add_argument("-l", "--layout", choices=["list", "side-by-side"],
                         help="force the inspect presentation instead of "
                              "adapting to the matrix (1 usable compiler "
                              "lists, 2 go side by side, more list); with "
                              "ELF input, 'list' also prints --filter "
                              "matches' listings")
-    parser.add_argument("--filter", metavar="REGEX",
+    parser.add_argument("-f", "--filter", metavar="REGEX",
                         help="also analyze every function whose name "
                              "matches REGEX (re.search) - sweep a "
                              "subsystem, or reach compiler-generated "
@@ -1906,16 +2054,16 @@ def main(argv=None):
                         help="disassembler for ELF input; default: derived "
                              "from the first gcc in the matrix by swapping "
                              "the trailing gcc for objdump")
+    parser.add_argument("-t", "--target", action="append", default=[],
+                        metavar="NAME",
+                        help="named [table], [groups] name, comma-list, or "
+                             "glob from the config (repeatable; appended "
+                             "to the matrix after --cc entries)")
     parser.add_argument("--cc", action="append", default=[],
                         metavar="'CC FLAGS'",
-                        help="compiler and flags as one string (repeatable); "
-                             "default: config default target, else gcc and "
-                             "clang at " + FALLBACK_FLAGS)
-    parser.add_argument("--target", action="append", default=[],
-                        metavar="NAME",
-                        help="named [table] from the config file, resolved "
-                             "to a --cc entry (repeatable; appended to the "
-                             "matrix after --cc entries)")
+                        help="compiler and flags as one string, one matrix "
+                             "row (repeatable); default: config default "
+                             "target, else gcc and clang at " + FALLBACK_FLAGS)
     parser.add_argument("-db", "--compile-commands", nargs="?", const=True,
                         default=None, metavar="PATH",
                         help="borrow each source's include/define flags from "
@@ -1950,12 +2098,15 @@ def main(argv=None):
                         help="print the built-in example config (the "
                              "repository's asmdiff.example.toml) to stdout, "
                              "ready to redirect into a config file")
+    parser.add_argument("--list-targets", action="store_true",
+                        help="print the resolved config's default, groups, "
+                             "and targets, then exit (no source file needed)")
     parser.add_argument("--span-stats", action="store_true",
                         help="follow each stats table with a per-loop-span "
                              "instruction mix (load/store/mul/branch/other "
                              "counts) - weighs the span instead of the "
                              "whole function")
-    parser.add_argument("--collapse", action="store_true",
+    parser.add_argument("-C", "--collapse", action="store_true",
                         help="in side-by-side listings, elide runs of "
                              "identical line pairs, keeping "
                              f"{COLLAPSE_CONTEXT} lines of context around "
@@ -1995,6 +2146,10 @@ def main(argv=None):
         return 0
     if args.edit_config:
         return edit_config(args.config)
+    if args.list_targets:
+        config_path = find_config(args.config, args.sources)
+        config = load_config(config_path) if config_path else None
+        return list_targets(config, config_path)
     if not args.sources:
         parser.error("SOURCE.c required")
 

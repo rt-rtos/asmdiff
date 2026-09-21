@@ -926,6 +926,114 @@ class TestBuildMatrix(unittest.TestCase):
         with self.assertRaises(SystemExit):
             asmdiff.build_matrix([], ["bad"], cfg, "cfg.toml")
 
+    def test_cc_naming_a_target_is_still_a_plain_command(self):
+        # [gcc] exists in the example config; `--cc gcc` must stay a
+        # verbatim compiler command, not a typo of `-t gcc`.
+        cfg = {"gcc": {"cc": "gcc", "flags": ["-O3"]}}
+        self.assertEqual(asmdiff.build_matrix(["gcc"], [], cfg, "c"),
+                         ["gcc"])
+
+
+class TestTargetGroups(unittest.TestCase):
+    """-t NAME expands groups, comma lists, and globs over target names."""
+    CONFIG = {"groups": {"esp": ["c3", "s3"], "s3": ["c3"]},
+              "c3": {"cc": "riscv-gcc", "flags": ["-O2"]},
+              "s3": {"cc": "xtensa-gcc", "flags": ["-Os"]},
+              "host": {"cc": "gcc", "flags": ["-O3"]}}
+
+    def expand(self, *tokens, config=None):
+        return asmdiff.expand_target_args(list(tokens),
+                                          config or self.CONFIG, "cfg.toml")
+
+    def test_group_expands_in_declared_order(self):
+        self.assertEqual(self.expand("esp"), ["c3", "s3"])
+
+    def test_comma_list_and_repeat_keep_order(self):
+        self.assertEqual(self.expand("host,c3", "s3"), ["host", "c3", "s3"])
+
+    def test_glob_matches_targets_in_config_order(self):
+        self.assertEqual(self.expand("?3"), ["c3", "s3"])
+
+    def test_exact_target_beats_group_of_same_name(self):
+        self.assertEqual(self.expand("s3"), ["s3"])
+
+    def test_comma_inside_glob_class_does_not_split(self):
+        self.assertEqual(self.expand("[c,s]3"), ["c3", "s3"])
+
+    def test_group_resolves_through_build_matrix(self):
+        self.assertEqual(
+            asmdiff.build_matrix([], ["esp"], self.CONFIG, "cfg.toml"),
+            ["riscv-gcc -O2", "xtensa-gcc -Os"])
+
+    def _expect_exit(self, fragment, *tokens, config=None):
+        with self.assertRaises(SystemExit) as ctx:
+            self.expand(*tokens, config=config)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_glob_with_no_match_is_an_error(self):
+        self._expect_exit("matched no target", "zz*")
+
+    def test_unknown_name_lists_targets_and_groups(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.expand("nope")
+        msg = str(ctx.exception)
+        self.assertIn("targets: c3, s3, host", msg)
+        self.assertIn("groups: esp, s3", msg)
+
+    def test_group_with_undefined_member_is_an_error(self):
+        cfg = dict(self.CONFIG, groups={"bad": ["c3", "ghost"]})
+        self._expect_exit("ghost", "bad", config=cfg)
+
+    def test_empty_group_is_an_error(self):
+        cfg = dict(self.CONFIG, groups={"none": []})
+        self._expect_exit("non-empty", "none", config=cfg)
+
+    def test_group_must_be_an_array_of_strings(self):
+        cfg = dict(self.CONFIG, groups={"bad": "c3"})
+        self._expect_exit("groups.bad", "bad", config=cfg)
+
+    def test_empty_token_is_an_error(self):
+        self._expect_exit("empty --target", ",")
+
+    def test_groups_table_is_not_a_target(self):
+        self.assertEqual(asmdiff.config_target_names(self.CONFIG),
+                         ["c3", "s3", "host"])
+
+
+class TestListTargets(unittest.TestCase):
+    """--list-targets prints the resolved config and needs no source."""
+
+    def _run(self, argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = asmdiff.main(argv)
+        return status, out.getvalue()
+
+    def test_lists_default_groups_and_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "asmdiff.toml"
+            cfg.write_text('default = ["c3", "host"]\n'
+                           '[groups]\nesp = ["c3"]\n'
+                           '[c3]\ncc = "riscv-gcc"\nflags = ["-O2"]\n'
+                           '[host]\ncc = "gcc"\n')
+            if asmdiff.tomllib is None:
+                self.skipTest("tomllib requires Python >= 3.11")
+            status, out = self._run(["--list-targets", "--config", str(cfg)])
+        self.assertEqual(status, 0)
+        self.assertIn(f"config: {cfg}", out)
+        self.assertIn("default: c3, host", out)
+        self.assertIn("  esp: c3", out)
+        self.assertIn("  c3: riscv-gcc", out)
+        self.assertIn("  host: gcc", out)
+        self.assertNotIn("  groups: ", out)     # [groups] is not a target
+
+    def test_without_a_config_names_the_fallback_matrix(self):
+        status, out = self._run(["--list-targets"])
+        self.assertEqual(status, 0)
+        self.assertIn("no config file found", out)
+        self.assertIn("gcc -O3", out)
+        self.assertIn("clang -O3", out)
+
 
 class TestIncludeFlags(unittest.TestCase):
     """Lifting include/define flags out of one recorded compile command."""
@@ -2321,6 +2429,18 @@ class TestShortAliases(unittest.TestCase):
     def test_l_is_layout(self):
         self._expect_error(["x.c", "-l", "list"], "--layout only applies")
 
+    def test_t_is_target(self):
+        self._expect_error(["x.c", "f", "-t", "nope"], "no [nope] target")
+
+    def test_f_is_filter(self):
+        self._expect_error(["x.c", "-f", "old_", "-p", "a:b"],
+                           "--filter selects functions")
+
+    def test_C_is_collapse(self):
+        # --collapse has no validation of its own; check the global it sets.
+        self._expect_error(["x.c", "f", "-C", "-t", "nope"], "no [nope]")
+        self.assertTrue(asmdiff.COLLAPSE)
+
     def test_db_is_compile_commands(self):
         # Bare -db in a directory tree with no database is the
         # --compile-commands discovery error.
@@ -2349,6 +2469,18 @@ class TestConfigEditing(unittest.TestCase):
     def test_example_constant_matches_repo_file(self):
         self.assertEqual(asmdiff.EXAMPLE_CONFIG,
                          self._example_path.read_text())
+
+    def test_example_groups_name_defined_targets(self):
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        data = asmdiff.tomllib.loads(asmdiff.EXAMPLE_CONFIG)
+        targets = asmdiff.config_target_names(data)
+        groups = asmdiff.config_groups(data, "example")
+        self.assertIn("riscv32-esp", groups)
+        self.assertIn("xtensa-esp", groups)
+        for name, members in groups.items():
+            for member in members:
+                self.assertIn(member, targets, f"groups.{name}")
 
     def test_example_config_defines_host_target(self):
         # The README and skill text tell users `--target host` works out

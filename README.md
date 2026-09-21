@@ -349,12 +349,13 @@ zero-overhead loops", the empirical rules (verified on esp-gcc 15.2,
 
 ```
 asmdiff SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
-           [--cc 'CC FLAGS']... [--target NAME]... [--config PATH]
+           [--target NAME]... [--cc 'CC FLAGS']... [--config PATH]
            [--compile-commands [PATH]] [--flags-like PATH] [--db-includes]
-           [--summary-only] [--collapse] [--span-stats]
+           [--filter REGEX] [--summary-only] [--collapse] [--span-stats]
            [--layout list|side-by-side] [-v] [-- EXTRA_FLAGS...]
 asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
            [-l list] [--summary-only] [--span-stats]
+asmdiff --edit-config | --example-config | --list-targets | --version
 ```
 
 | Option | Meaning |
@@ -363,17 +364,18 @@ asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
 | `-p, --pair OLD:NEW` | Compare two *different* functions within one compilation. Repeatable. Default: every `old_X` is auto-paired with its `new_X`; with no pairs at all, the whole-file summary is printed instead. |
 | `-a, --across FUNC` | Compare the *same* function across two compilations (see below). Repeatable. Mutually exclusive with `--pair`. |
 | `-l, --layout list\|side-by-side` | Force the inspect-mode presentation instead of the adaptive default (1 usable compiler lists, 2 go side by side, more list). With ELF input, `list` also prints `--filter` matches' listings. |
-| `--filter REGEX` | Also analyze every function whose name matches `REGEX` (`re.search`) — sweep a subsystem, or reach compiler-generated clones (`$constprop$0`, `.isra.0`), without naming each function. In compile modes matches are full peers of named functions (lenient when a match exists under only part of the matrix) and narrow the whole-file summary; in ELF mode matches appear in the stats table but are not listed in full — add `-l list` to print their listings too (a trailing note reminds you when listings were withheld). Not combinable with `--pair`/`--across`. |
+| `-f, --filter REGEX` | Also analyze every function whose name matches `REGEX` (`re.search`) — sweep a subsystem, or reach compiler-generated clones (`$constprop$0`, `.isra.0`), without naming each function. In compile modes matches are full peers of named functions (lenient when a match exists under only part of the matrix) and narrow the whole-file summary; in ELF mode matches appear in the stats table but are not listed in full — add `-l list` to print their listings too (a trailing note reminds you when listings were withheld). Not combinable with `--pair`/`--across`. |
 | `--objdump PATH` | Disassembler for ELF input. Default: derived from the first gcc in the matrix by swapping the trailing `gcc` for `objdump`, so `--target`/config globs locate it like they locate the compiler. |
 | `--cc 'CC FLAGS'` | One compiler invocation, command and flags in a single quoted string. Repeatable to build a matrix. |
-| `--target NAME` | A named target from the config file, resolved to a `--cc` entry. Repeatable; appended to the matrix after `--cc` entries. |
+| `-t, --target NAME` | A named target from the config file, resolved to a `--cc` entry. `NAME` may also be a `[groups]` entry, a comma-separated list, or a glob over target names (`-t 'esp32c*'`). Repeatable; appended to the matrix after `--cc` entries. See [Target groups](#target-groups). |
 | `--config PATH` | Config file to use. Default search: `asmdiff.toml` next to `SOURCE.c`, then in the current directory, then `~/.config/`. First hit wins. |
+| `--list-targets` | Print the resolved config's `default`, groups, and targets (name and `cc`), then exit. No source file needed. |
 | `-db, --compile-commands [PATH]` | Borrow each source's include/define flags from a `compile_commands.json`; with no `PATH`, walk up from the CWD checking each directory and its `build/` until the repository root. See [below](#borrowing-includes-from-compile_commandsjson). |
 | `--flags-like PATH` | A source with no `compile_commands` entry borrows the flags recorded for `PATH` — the way to compare a modified copy of a project source under its original's header environment. |
 | `--db-includes` | Borrow only the header-search paths from the database, dropping its defines, forced includes, and `-specs`/`--sysroot`; kept paths are re-emitted as `-idirafter` so they cannot shadow the host's own system headers. This is how a host target compiles a cross project's source. |
 | `-s`, `--summary-only` | Print only the summary/stats tables, suppressing every assembly listing (see [Shaping the output](#shaping-the-output-for-reading-vs-deciding)). |
 | `--json` | Emit the summary as JSON on stdout instead of tables — one record per function per compiler. Implies `--summary-only`; errors stay plain text on stderr. |
-| `--collapse` | In side-by-side listings, omit runs of identical line pairs, keeping 3 lines of context around each difference. |
+| `-C, --collapse` | In side-by-side listings, omit runs of identical line pairs, keeping 3 lines of context around each difference. |
 | `--span-stats` | Follow each stats table with a per-loop-span instruction mix: load/store/mul/branch/other counts per span. |
 | `--version` | Print the version and exit. |
 | `-v`, `--verbose` | On compile failure, print the full compiler command and complete error output. Default shows only the compiler, the source, and the first error lines. |
@@ -534,8 +536,10 @@ shapes:
 
 ```bash
 asmdiff h.c                                  # config default target(s)
-asmdiff h.c --target esp32s3 --target host      # two-target matrix
-asmdiff h.c --across f --target esp32s3 --cc 'gcc -O2'  # mix freely
+asmdiff h.c -t esp32s3 -t host               # two-target matrix
+asmdiff h.c -t esp32s3,host                  # same, as a comma list
+asmdiff h.c --across f -t esp32s3 --cc 'gcc -O2'  # mix freely
+asmdiff --list-targets                       # what does my config define?
 ```
 
 A config placed next to your harness files travels with them: any invocation
@@ -544,6 +548,28 @@ single name or a list (a whole default matrix). The
 included `asmdiff.example.toml` is a starting point. If a flag or include
 path must vary per machine, that's what per-machine config files are for —
 nothing lives in the tool.
+
+### Target groups
+
+A `[groups]` table names matrices of targets so a whole family runs
+from one `-t`, without editing `default`:
+
+```toml
+[groups]
+riscv32-esp = ["esp32c3", "esp32c6", "esp32h2", "esp32p4"]
+native = ["gcc", "clang"]
+```
+
+```bash
+asmdiff h.c -t riscv32-esp        # four RISC-V targets
+asmdiff h.c -t native -t esp32s3  # a group plus a single target
+asmdiff h.c -t 'esp32c*'          # glob over target names (quote it)
+```
+
+A `-t` value is resolved as an exact target name first, then as a group
+name, then as a glob (`*`, `?`, `[...]`) over target names in config
+order. A group naming an undefined target, or an empty group, is an
+error. `--list-targets` prints what the resolved config defines.
 
 ### Bundled ESP profiles
 
@@ -570,7 +596,10 @@ flags = ["-O2", "-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"]
 A profile is nothing more than a curated group of targets — the `esp-*`
 glob finds the toolchains `idf_tools.py install` left in `~/.espressif`
 (the newest, by the version-sort rule above, when several are
-installed), and setting `default` to the group runs it as one matrix:
+installed). The example config defines each profile as a `[groups]`
+entry, so `-t riscv32-esp` or `-t xtensa-esp` runs it as one matrix and
+`-t esp` runs every ESP chip; set `default` to a group's list to make it
+the no-argument matrix:
 
 ```toml
 default = ["esp32c3", "esp32c6", "esp32h2", "esp32p4"]

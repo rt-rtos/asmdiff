@@ -6,9 +6,11 @@
 #   3. asmdiff.toml in the current directory
 #   4. ~/.config/asmdiff.toml
 #
-# Each [table] is a target usable as `--target NAME`; the optional
+# Each [table] is a target usable as `-t/--target NAME`; the optional
 # top-level `default` names the target(s) used when no --cc/--target
 # is given (a list runs several: default = ["gcc", "clang"]).
+# [groups] names a matrix of those tables for one `-t GROUP` (comma
+# lists and globs also work: `-t esp32c3,esp32s3`, `-t 'esp32c*'`).
 # Compile at the flags your project ships with — that is the whole
 # point of the tool.
 
@@ -32,6 +34,15 @@ flags = ["-O3", "-Wall", "-Wextra"]
 cc = "gcc"
 flags = ["-O3", "-Wall", "-Wextra"]
 
+# `-t GROUP` runs every named target.  `-t host` is still the [host]
+# gcc alias above; use `-t native` (or `-t gcc,clang`) for both host
+# compilers.  Does not change `default`.
+[groups]
+riscv32-esp = ["esp32c3", "esp32c6", "esp32h2", "esp32p4"]
+xtensa-esp = ["esp32", "esp32s2", "esp32s3"]
+esp = ["esp32", "esp32s2", "esp32s3", "esp32c3", "esp32c6", "esp32h2", "esp32p4"]
+native = ["gcc", "clang"]
+
 # cc values may use ~, $VARS, and glob patterns.  A glob that matches
 # several installed toolchains resolves to the highest version-sorted
 # one (announced on stderr); pin the exact esp-NN directory instead if
@@ -48,9 +59,8 @@ flags = ["-O3", "-Wall", "-Wextra"]
 
 # --- Profile: riscv32-esp (ESP32-C3 / C6 / H2 / P4) -------------------
 # All RISC-V ESP chips share one riscv32-esp-elf-gcc binary; the
-# targets differ only in -march/-mabi.  Uncomment to run the whole
-# profile as the default matrix:
-# default = ["esp32c3", "esp32c6", "esp32h2", "esp32p4"]
+# targets differ only in -march/-mabi.  `-t riscv32-esp` runs the
+# whole profile without editing `default`.
 
 [esp32c3]
 cc = "$HOME/.espressif/tools/riscv32-esp-elf/esp-*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
@@ -72,7 +82,7 @@ flags = ["-O2", "-march=rv32imafc_zicsr_zifencei", "-mabi=ilp32f"]
 
 # --- Profile: xtensa-esp (ESP32 / S2 / S3) ----------------------------
 # The unified xtensa-esp-elf toolchain ships one gcc binary per chip.
-# default = ["esp32", "esp32s2", "esp32s3"]
+# `-t xtensa-esp` runs the whole profile; `-t esp` runs every ESP chip.
 
 [esp32]
 cc = "$HOME/.espressif/tools/xtensa-esp-elf/esp-*/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc"
