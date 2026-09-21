@@ -58,6 +58,39 @@ the tool is a single stdlib-only file: `python3 asmdiff.py HARNESS.c`.
 Requires Python >= 3.8; `asmdiff.toml` config files need >= 3.11
 (stdlib `tomllib`).
 
+### Shell completion
+
+```bash
+asmdiff --install-completion        # bash, zsh or fish, taken from $SHELL
+```
+
+This writes a completion script into the directory your shell already
+autoloads from - `bash-completion`'s `completions/`,
+`~/.config/fish/completions/`, or `~/.zfunc/` - and never touches an rc
+file. A file asmdiff did not write is named and left alone rather than
+replaced. zsh reads `~/.zfunc` only once it is on `fpath`, so the command
+prints the two lines to add to `.zshrc` yourself:
+
+```zsh
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit && compinit
+```
+
+To keep everything in one rc file instead, `--completion SHELL` prints
+the script to stdout:
+
+```bash
+eval "$(asmdiff --completion bash)"   # in .bashrc
+```
+
+The flag list is read off the argument parser when the script is
+generated, so a script regenerated after an upgrade cannot drift from the
+tool. Completing `-t` offers the targets and groups from the config that
+run would resolve - a `--config PATH` already on the line is honoured -
+and a comma list is completed element by element. Each tab press starts
+Python and parses the config: fine for a `pip`, `pipx` or `uv tool`
+install, noticeably slow behind a cold `uvx` launcher.
+
 **Portability:** pure-stdlib Python with nothing intentionally
 platform-specific, developed and tested on Linux. On native Windows,
 `HOME` is usually unset, so replace `$HOME` with `$USERPROFILE` (or
@@ -359,6 +392,7 @@ asmdiff SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
 asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
            [-l list] [--summary-only] [--span-stats]
 asmdiff --edit-config | --example-config | --list-targets | --version
+asmdiff --completion bash|zsh|fish | --install-completion [SHELL]
 ```
 
 | Option | Meaning |
@@ -381,6 +415,8 @@ asmdiff --edit-config | --example-config | --list-targets | --version
 | `-C, --collapse` | In side-by-side listings, omit runs of identical line pairs, keeping 3 lines of context around each difference. |
 | `--span-stats` | Follow each stats table with a per-loop-span instruction mix: nesting depth and load/store/mul/div/branch/other counts per span. |
 | `--fail-on-growth` | Exit 3, naming each offender on stderr, if any candidate has more instructions than its baseline; exit 0 otherwise. Needs paired functions (`--pair`, auto-paired `old_X`/`new_X`, or `--across`). |
+| `--completion bash\|zsh\|fish` | Print a completion script for that shell on stdout and exit. Its flag list is read off the argument parser at generation time, so it cannot drift from the tool. See [Shell completion](#shell-completion). |
+| `--install-completion [SHELL]` | Write that script to the shell's own user completion directory and exit; no rc file is touched. `SHELL` defaults to the basename of `$SHELL`. An existing file is replaced only if asmdiff wrote it. |
 | `--version` | Print the version and exit. |
 | `-v`, `--verbose` | On compile failure, print the full compiler command and complete error output. Default shows only the compiler, the source, and the first error lines. |
 | `-- FLAGS...` | Everything after a bare `--` is appended to *every* compiler invocation. |

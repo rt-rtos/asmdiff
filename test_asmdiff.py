@@ -2802,5 +2802,228 @@ class TestConfigEditing(unittest.TestCase):
         self.assertIn("SOURCE.c required", err.getvalue())
 
 
+class TestCompletion(unittest.TestCase):
+    """--completion scripts, --install-completion, and the hidden
+    --complete helper the generated scripts call back into."""
+
+    def _run(self, argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = asmdiff.main(argv)
+        return status, out.getvalue()
+
+    def _script(self, shell):
+        status, out = self._run(["--completion", shell])
+        self.assertEqual(status, 0)
+        return out
+
+    def _parser_options(self):
+        """Option strings argparse itself advertises in --help, so this
+        test cannot go stale when a flag is added elsewhere."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            asmdiff.main(["--help"])
+        opts = set()
+        for line in out.getvalue().splitlines():
+            if not line.startswith("  -"):
+                continue
+            # argparse separates the invocation from its help by 2+ spaces.
+            for piece in line.strip().split("  ")[0].split(", "):
+                opts.add(piece.split()[0].split("=")[0])
+        return opts
+
+    def _bash_candidates(self, script):
+        """The flag list the bash script offers on a leading dash."""
+        for line in script.splitlines():
+            if "compgen -W" in line and "--version" in line:
+                return line.split('"')[1].split()
+        self.fail("bash script has no flag candidate list")
+
+    def _config(self, tmp, text):
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        path = Path(tmp) / "asmdiff.toml"
+        path.write_text(text)
+        return path
+
+    def test_parser_options_are_found(self):
+        # Guards the helper the two "lists every option" tests rest on.
+        opts = self._parser_options()
+        self.assertIn("--target", opts)
+        self.assertIn("-db", opts)
+        self.assertNotIn("--complete", opts)   # help=SUPPRESS
+
+    def test_bash_script_lists_every_option(self):
+        script = self._script("bash")
+        for opt in self._parser_options():
+            self.assertIn(opt, script, opt)
+
+    def test_zsh_script_lists_every_option(self):
+        script = self._script("zsh")
+        for opt in self._parser_options():
+            self.assertIn(opt, script, opt)
+
+    def test_fish_script_lists_every_option(self):
+        script = self._script("fish")
+        for opt in self._parser_options():
+            flag = "-l " + opt[2:] if opt.startswith("--") else None
+            if flag:
+                self.assertIn(flag, script, opt)
+
+    def test_candidate_list_omits_the_hidden_helper(self):
+        # --complete exists for the script to call, not for the user to
+        # tab into; it would print nothing useful at a prompt.
+        candidates = self._bash_candidates(self._script("bash"))
+        self.assertIn("--target", candidates)
+        self.assertNotIn("--complete", candidates)
+
+    def test_scripts_carry_the_overwrite_marker(self):
+        for shell in asmdiff.COMPLETION_SHELLS:
+            head = self._script(shell).split("\n")[:2]
+            self.assertIn(asmdiff.COMPLETION_MARKER, head, shell)
+
+    def test_zsh_script_starts_with_compdef(self):
+        # compinit reads the tag off the first line only.
+        self.assertTrue(self._script("zsh").startswith("#compdef "))
+
+    def test_bash_script_parses(self):
+        if not asmdiff.shutil.which("bash"):
+            self.skipTest("bash not on PATH")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "asmdiff.bash"
+            path.write_text(self._script("bash"))
+            self.assertEqual(
+                asmdiff.subprocess.call(["bash", "-n", str(path)]), 0)
+
+    def test_complete_targets_lists_targets_then_groups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(tmp,
+                               '[groups]\nesp = ["c3"]\n'
+                               '[c3]\ncc = "riscv-gcc"\n'
+                               '[host]\ncc = "gcc"\n')
+            status, out = self._run(["--config", str(cfg),
+                                     "--complete", "targets"])
+        self.assertEqual(status, 0)
+        self.assertEqual(out.split(), ["c3", "host", "esp"])
+
+    def test_complete_costs_lists_profile_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(tmp,
+                               '[host]\ncc = "gcc"\n'
+                               '[costs.s3-iram]\nmeasured_on = "bench"\n')
+            status, out = self._run(["--config", str(cfg),
+                                     "--complete", "costs"])
+        self.assertEqual(status, 0)
+        self.assertEqual(out.split(), ["s3-iram"])
+
+    def test_complete_is_silent_without_a_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with mock.patch.object(asmdiff.Path, "home",
+                                       return_value=Path(tmp)):
+                    status, out = self._run(["--complete", "targets"])
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(status, 0)
+        self.assertEqual(out, "")
+
+    def test_complete_is_silent_on_a_bad_config_path(self):
+        # An error here would land in the middle of the user's prompt.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            status, out = self._run(["--config", "/no/such/asmdiff.toml",
+                                     "--complete", "targets"])
+        self.assertEqual(status, 0)
+        self.assertEqual(out, "")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_complete_is_silent_on_an_unknown_kind(self):
+        # An old script against a new tool, or the other way round.
+        status, out = self._run(["--complete", "functions"])
+        self.assertEqual(status, 0)
+        self.assertEqual(out, "")
+
+    def test_install_writes_to_the_bash_user_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ,
+                                 {"BASH_COMPLETION_USER_DIR": tmp}):
+                status, out = self._run(["--install-completion", "bash"])
+            written = Path(tmp) / "completions" / "asmdiff"
+            self.assertEqual(status, 0)
+            self.assertIn(str(written), out)
+            self.assertTrue(written.read_text()
+                            .startswith(asmdiff.COMPLETION_MARKER))
+
+    def test_install_replaces_its_own_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            written = Path(tmp) / "completions" / "asmdiff"
+            written.parent.mkdir(parents=True)
+            written.write_text(asmdiff.COMPLETION_MARKER + "\n# stale\n")
+            with mock.patch.dict(os.environ,
+                                 {"BASH_COMPLETION_USER_DIR": tmp}):
+                status, _ = self._run(["--install-completion", "bash"])
+            self.assertEqual(status, 0)
+            self.assertNotIn("# stale", written.read_text())
+
+    def test_install_refuses_a_foreign_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            written = Path(tmp) / "completions" / "asmdiff"
+            written.parent.mkdir(parents=True)
+            written.write_text("# hand-written, do not clobber\n")
+            err = io.StringIO()
+            with mock.patch.dict(os.environ,
+                                 {"BASH_COMPLETION_USER_DIR": tmp}), \
+                 contextlib.redirect_stderr(err), \
+                 self.assertRaises(SystemExit) as ctx:
+                asmdiff.main(["--install-completion", "bash"])
+            # sys.exit(message): the interpreter prints it and exits 1.
+            self.assertIn("was not written by asmdiff",
+                          str(ctx.exception))
+            self.assertIn(str(written), str(ctx.exception))
+            self.assertEqual(written.read_text(),
+                             "# hand-written, do not clobber\n")
+
+    def test_install_zsh_names_the_fpath_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(asmdiff.Path, "home",
+                                   return_value=Path(tmp)):
+                status, out = self._run(["--install-completion", "zsh"])
+            self.assertEqual(status, 0)
+            self.assertTrue((Path(tmp) / ".zfunc" / "_asmdiff").is_file())
+            self.assertIn("fpath=(~/.zfunc $fpath)", out)
+            self.assertIn("compinit", out)
+
+    def test_install_fish_uses_the_autoloaded_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(asmdiff.Path, "home",
+                                   return_value=Path(tmp)):
+                status, _ = self._run(["--install-completion", "fish"])
+            self.assertEqual(status, 0)
+            self.assertTrue((Path(tmp) / ".config" / "fish" / "completions"
+                             / "asmdiff.fish").is_file())
+
+    def test_install_rejects_an_unknown_shell(self):
+        with mock.patch.dict(os.environ, {"SHELL": "/bin/tcsh"}), \
+             self.assertRaises(SystemExit) as ctx:
+            asmdiff.main(["--install-completion"])
+        self.assertIn("bash, zsh, fish", str(ctx.exception))
+        self.assertIn("tcsh", str(ctx.exception))
+
+    def test_default_shell_is_the_basename_of_shell(self):
+        self.assertEqual(asmdiff.default_shell({"SHELL": "/usr/bin/fish"}),
+                         "fish")
+        self.assertEqual(asmdiff.default_shell({}), "")
+
+    def test_prog_name_falls_back_to_the_published_name(self):
+        self.assertEqual(asmdiff.completion_prog("/usr/bin/asmdiff"),
+                         "asmdiff")
+        self.assertEqual(asmdiff.completion_prog("tools/asmdiff.py"),
+                         "asmdiff.py")
+        # A test runner or an interpreter is not a command to complete.
+        self.assertEqual(asmdiff.completion_prog("python3"), "asmdiff")
+
+
 if __name__ == "__main__":
     unittest.main()
