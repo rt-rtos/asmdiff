@@ -387,10 +387,10 @@ asmdiff SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
            [--target NAME]... [--cc 'CC FLAGS']... [--config PATH]
            [--compile-commands [PATH]] [--flags-like PATH] [--db-includes]
            [--filter REGEX] [--summary-only] [--collapse] [--span-stats]
-           [--fail-on-growth] [--layout list|side-by-side] [-v]
-           [-- EXTRA_FLAGS...]
+           [--cost] [--costs NAME] [--fail-on-growth]
+           [--layout list|side-by-side] [-v] [-- EXTRA_FLAGS...]
 asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
-           [-l list] [--summary-only] [--span-stats]
+           [-l list] [--summary-only] [--span-stats] [--cost] [--costs NAME]
 asmdiff --edit-config | --example-config | --list-targets | --version
 asmdiff --completion bash|zsh|fish | --install-completion [SHELL]
 ```
@@ -406,7 +406,7 @@ asmdiff --completion bash|zsh|fish | --install-completion [SHELL]
 | `--cc 'CC FLAGS'` | One compiler invocation, command and flags in a single quoted string. Repeatable to build a matrix. |
 | `-t, --target NAME` | A named target from the config file, resolved to a `--cc` entry. `NAME` may also be a `[groups]` entry, a comma-separated list, or a glob over target names (`-t 'esp32c*'`). Repeatable; appended to the matrix after `--cc` entries. See [Target groups](#target-groups). |
 | `--config PATH` | Config file to use. Default search: `asmdiff.toml` next to `SOURCE.c`, then in the current directory, then `~/.config/`. First hit wins. |
-| `--list-targets` | Print the resolved config's `default`, groups, and targets (name and `cc`), then exit. No source file needed. |
+| `--list-targets` | Print the resolved config's `default`, groups, cost profiles (name and `measured_on`), and targets (name and `cc`), then exit. No source file needed. |
 | `-db, --compile-commands [PATH]` | Borrow each source's include/define flags from a `compile_commands.json`; with no `PATH`, walk up from the CWD checking each directory and its `build/` until the repository root. See [below](#borrowing-includes-from-compile_commandsjson). |
 | `--flags-like PATH` | A source with no `compile_commands` entry borrows the flags recorded for `PATH` — the way to compare a modified copy of a project source under its original's header environment. |
 | `--db-includes` | Borrow only the header-search paths from the database, dropping its defines, forced includes, and `-specs`/`--sysroot`; kept paths are re-emitted as `-idirafter` so they cannot shadow the host's own system headers. This is how a host target compiles a cross project's source. |
@@ -414,6 +414,8 @@ asmdiff --completion bash|zsh|fish | --install-completion [SHELL]
 | `--json` | Emit the summary as JSON on stdout instead of tables — one record per function per compiler. Implies `--summary-only`; errors stay plain text on stderr. |
 | `-C, --collapse` | In side-by-side listings, omit runs of identical line pairs, keeping 3 lines of context around each difference. |
 | `--span-stats` | Follow each stats table with a per-loop-span instruction mix: nesting depth and load/store/mul/div/branch/other counts per span. |
+| `--cost` | Add a `cost` column to the stats tables: the instruction classes of each function and the tier of every call site (`softfp`, `softfp-div`, `int-div`, `libm`, `mem`, `call`), with the sites a loop span holds counted apart. Counts only; a score appears when a profile prices them. See [Cost column](#cost-column). |
+| `--costs NAME` | Price the cost column with the config's `[costs.NAME]` profile on every matrix row, `--cc` rows and ELF input included; implies `--cost`. Overrides a `costs = "NAME"` the target names. See [Cost profiles](#cost-profiles). |
 | `--fail-on-growth` | Exit 3, naming each offender on stderr, if any candidate has more instructions than its baseline; exit 0 otherwise. Needs paired functions (`--pair`, auto-paired `old_X`/`new_X`, or `--across`). |
 | `--completion bash\|zsh\|fish` | Print a completion script for that shell on stdout and exit. Its flag list is read off the argument parser at generation time, so it cannot drift from the tool. See [Shell completion](#shell-completion). |
 | `--install-completion [SHELL]` | Write that script to the shell's own user completion directory and exit; no rc file is touched. `SHELL` defaults to the basename of `$SHELL`. An existing file is replaced only if asmdiff wrote it. |
@@ -453,7 +455,7 @@ an error.
 A two-file compare over a three-target matrix prints three full
 side-by-side listings with the summary table at the *end* of each — the
 right shape for reading an unfamiliar delta, and roughly 100 KB of the
-wrong shape when the table is all the decision needs. Three flags cut the
+wrong shape when the table is all the decision needs. Four flags cut the
 output to purpose:
 
 - **`--summary-only`** (`-s`) keeps only the summary/stats tables. This is
@@ -477,6 +479,9 @@ output to purpose:
   actually decides a hot-loop comparison (is the rewrite trading loads
   for stores? did the multiplies move?) without hand-counting a listing
   and accidentally tallying past the loop end into the epilogue.
+  *depth* is how many other spans of the same function contain this
+  one, so an inner loop is told from the loop around it without reading
+  the listing ([How a span is found](#how-a-span-is-found)).
   Buckets are by mnemonic (Xtensa, RISC-V, ARM) with an AT&T
   memory-operand heuristic for x86; *branch* means any control
   transfer — conditional and unconditional branches, calls, and
@@ -497,22 +502,31 @@ output to purpose:
   show as *branch* falling while *insns* stays roughly flat, and a
   call appearing inside a hot span is the ZOL killer the `calls`
   column already flagged.
+- **`--cost`** adds a `cost` column to the stats tables saying what
+  each function is made of: the same instruction classes over the
+  whole body, and the tier of every call site with the sites a loop
+  span holds counted apart. `--costs NAME` prices those counts with a
+  measured profile from the config. Both are described under [Cost
+  column](#cost-column) below.
 
-All three combine with every compile mode; `--summary-only` and
-`--span-stats` also apply to ELF input.
+All four combine with every compile mode; `--summary-only`,
+`--span-stats`, `--cost` and `--costs` also apply to ELF input.
 
 For scripted callers, `--json` replaces the tables entirely with one
 JSON document on stdout: a flat `results` list holding one record per
 function per compiler — `cc`, `tag` (source label in two-file runs),
-`role` (`baseline`/`candidate` in paired runs), `insns`, `loop_spans`,
-`calls`, `delta` (on candidate records), and `span_stats` when
-`--span-stats` is given. Flat records keep it one `jq` expression away
-from any question the tables answer.
+`role` (`baseline`/`candidate` in paired runs), `insns`, `loop_spans`
+(each `{label, insns, depth}`), `calls`, `delta` (on candidate
+records), `cost` when `--cost` or `--costs` is given, and `span_stats`
+when `--span-stats` is given. Flat records keep it one `jq` expression
+away from any question the tables answer.
+
 The pairing questions the tool answers itself, because the pairing is
 its own: every summary table closes a pair with a `delta` row (signed
 instruction count, per-span `before -> after`, callees gained with `+`
-and lost with `-`), each candidate record carries the same as a `delta`
-object, and `--fail-on-growth` makes it an exit status:
+and lost with `-`, and under `--cost` the classes and tiers that
+moved), each candidate record carries the same as a `delta` object,
+and `--fail-on-growth` makes it an exit status:
 
 ```bash
 # Fail the job when a rewrite that was meant to shrink did not
@@ -541,12 +555,110 @@ asmdiff old.c new.c --json \
 # The full record for one hot function, spans and all
 asmdiff old.c new.c -a stereo_reverb --json --span-stats \
   | jq '.results[] | {role, insns, spans: .loop_spans}'
+
+# Functions reaching a soft-float helper from inside a loop
+asmdiff old.c new.c --json --cost \
+  | jq '.results[] | select(.cost.tiers_in_loop.softfp > 0)
+        | {function, tag, in_loop: .cost.tiers_in_loop}'
 ```
 
 The top level carries `asmdiff` (version) and `mode`
 (`pairs`/`across`/`inspect`/`summary`/`elf`; ELF runs add the binary's
 path as `elf`). Warnings and errors stay plain text on stderr, so a
 failed run never emits half a document.
+
+### Cost column
+
+`--cost` adds a `cost` column before `calls`, saying what each function
+is made of rather than how many lines long it is:
+
+```
+$ asmdiff asmdiff_example.c --cost -s --cc 'gcc -O2'
+
+function   role       insns  loop spans  cost                          calls
+old_const  baseline   3      -           mul 1 br 1 oth 1              -
+new_const  candidate  3      -           br 1 oth 2 libm 1             ldexpf
+           delta      0      -           mul -1 oth +1 libm +1         +ldexpf
+old_rt     baseline   9      -           st 1 mul 1 br 2 oth 5 libm 1  exp2f
+new_rt     candidate  2      -           br 1 oth 1 libm 1             ldexpf
+           delta      -7     -           st -1 mul -1 br -1 oth -4     +ldexpf -exp2f
+```
+
+Instructions fall into the six classes `--span-stats` uses, abbreviated
+here (`ld`, `st`, `mul`, `div`, `br`, `oth`). Every call site is
+additionally tiered by the callee's name:
+
+| Tier | Callees |
+|---|---|
+| `softfp` | soft-float add, subtract, multiply, compare, convert: `__addsf3`, `__muldf3`, `__floatsidf`, `__aeabi_dmul`, `__aeabi_i2d` |
+| `softfp-div` | soft-float divide: `__divsf3`, `__divdf3`, `__aeabi_fdiv`, `__aeabi_ddiv` |
+| `int-div` | integer divide and modulo helpers: `__udivdi3`, `__moddi3`, `__aeabi_idivmod`, `__aeabi_uldivmod` |
+| `libm` | the math families, float and double: `sqrtf`, `sin`, `exp2f`, `ldexpf`, `pow`, `fmod` |
+| `mem` | `memcpy`, `memset`, `memmove`, `memcmp` |
+| `call` | everything else, `indirect(<reg>)` included |
+
+The libgcc and the ARM EABI spelling of one helper land in the same
+tier, so a `__muldf3` target and a `__aeabi_dmul` target read alike. A
+name no pattern knows lands in `call`, where the `calls` column already
+spells it out.
+
+Each tier is followed by how many of its call sites a loop span holds -
+`softfp 3 (2 in loop)` - since a soft-float helper reached once per
+iteration is a different finding from one on an error path. The counts
+are per call site, not per distinct callee: two calls to `__muldf3`
+count twice, where the `calls` column names it once.
+
+The delta row's cost cell lists only what moved. A tier whose count
+came through the rewrite unchanged is absent from it even when the
+callee changed: `old_rt` and `new_rt` above each hold one `libm` call,
+so the cell says nothing about `libm` while the `calls` column carries
+the swap as `+ldexpf -exp2f`. The two cells are read together.
+
+With a profile (`--costs NAME`, or a target's `costs = "NAME"`), the
+cell opens with a score and the number of instructions and call sites
+no weight covered, and the table is followed by the line saying where
+the weights came from:
+
+```
+score 399 (1 unweighted) ld 40 st 12 mul 14 ...
+...
+costs: esp32s3-iram - ESP32-S3 rev 0.2, code in IRAM, esp-15.2.0 libgcc; esp_cpu_get_cycle_count harness, median of 1000 runs
+```
+
+The weights behind that score are the commented template in
+`asmdiff --example-config`, not a measurement; no measured profile
+ships with the tool, and [Cost profiles](#cost-profiles) below is how
+one is written. The delta row leads with the signed score. A cell is
+capped at 48 characters and closes with `...` when the mix does not fit
+(as it does here), so the table stays aligned; `--json` carries all of
+it:
+
+```json
+"cost": {
+  "classes": {"load": 40, "store": 12, "mul": 14, "div": 1,
+              "branch": 9, "other": 61},
+  "tiers": {"softfp": 3, "call": 1},
+  "tiers_in_loop": {"softfp": 2},
+  "score": 399,
+  "unweighted": 1,
+  "profile": {"name": "esp32s3-iram",
+              "measured_on": "ESP32-S3 rev 0.2, code in IRAM, ...",
+              "method": "esp_cpu_get_cycle_count harness, ..."}
+}
+```
+
+`classes` always carries all six keys. `tiers` and `tiers_in_loop` list
+only what the function reaches, so `.cost.tiers.softfp` on a function
+with no soft-float is `null` rather than `0` - `// 0` in the jq
+expression if you want a number. Without a profile, `score` and
+`profile` are `null` and `unweighted` is every instruction and call
+site the function has. Candidate records also gain `delta.cost`
+(`classes`, `tiers`, `score`), again signed and again only what moved.
+
+ELF input takes `--cost` and `--costs` like a compile run does. A
+target's `costs = "NAME"` is not consulted there: nothing is compiled,
+so no matrix row stands behind the binary's instructions. Name the
+profile with `--costs`.
 
 ## Config file: named targets
 
@@ -619,6 +731,79 @@ A `-t` value is resolved as an exact target name first, then as a group
 name, then as a glob (`*`, `?`, `[...]`) over target names in config
 order. A group naming an undefined target, or an empty group, is an
 error. `--list-targets` prints what the resolved config defines.
+
+### Cost profiles
+
+A `[costs.NAME]` table holds measured weights and where they were
+measured. `--cost` alone counts; with a profile in hand it also scores:
+
+```toml
+[costs.esp32s3-iram]
+measured_on = "ESP32-S3 rev 0.2, code in IRAM, esp-15.2.0 libgcc"
+method = "esp_cpu_get_cycle_count harness, median of 1000 runs"
+other = 1
+load = 2
+store = 1
+mul = 2
+div = 20
+branch = 2
+softfp = 60
+softfp-div = 200
+int-div = 40
+"__muldf3" = 90
+
+[esp32s3]
+cc = "..."
+flags = ["-O2", "-mlongcalls"]
+costs = "esp32s3-iram"
+```
+
+A key's value decides what it is. A number is a weight, keyed by an
+instruction class (`load`, `store`, `mul`, `div`, `branch`, `other`),
+a libcall tier (`softfp`, `softfp-div`, `int-div`, `libm`), or a call
+symbol in quotes (`"__muldf3" = 90`). A string is provenance:
+`measured_on` and `method` are required and the load fails naming the
+one that is missing, and any further string key is kept and printed
+after them. Anything else is an error naming the key. `mem` and `call`
+are refused a weight, since a `memcpy`'s cost is its size argument and
+an unknown callee's is its body, neither of which the assembly shows;
+both stay counted and land in the unweighted total. `extends = "OTHER"`
+copies another profile's weights before this table's own apply, one
+level deep - a chain is an error.
+
+Weights resolve in this order. An instruction costs its class weight,
+or counts as unweighted. A call site costs its callee's own weight
+where the profile names that symbol, else its tier's weight, else it
+counts as unweighted. The score is therefore always printed with the
+number of instructions and call sites it left out. It is an integer
+while every weight is; one fractional weight anywhere rounds the total
+to a decimal.
+
+Which profile a row uses: `--costs NAME` sets it for every matrix row
+and is the only route for a `--cc` row, which has no target to read one
+from; otherwise each target brings the one its `costs = "NAME"` names,
+so a two-target matrix scores each target under its own. A name that
+does not resolve fails before the first compile. `--list-targets`
+prints the profiles a config defines, with their `measured_on`.
+
+What a score claims, and what it does not:
+
+- **A weight is a static issue cost.** Dual issue, pipeline stalls,
+  cache and flash-fetch latency, and the operand-dependence of helpers
+  like `__divdf3` are not in it. Two scores that differ by a few
+  percent say nothing.
+- **Scores compare within one target.** Cycle costs differ per core,
+  per memory placement, and per libgcc build, so a score under
+  `esp32s3-iram` and a score under some other profile are two different
+  units. That is why the provenance line prints under every scored
+  table.
+- **Depth is reported, not multiplied.** A span at depth 2 scores like
+  one at depth 0; the trip count is not in the assembly. `--span-stats`
+  gives the depth and the per-span mix, and the weighing is yours.
+
+No measured profile ships with the tool. `asmdiff --example-config`
+carries the template above as comments, with the fields a reader needs
+in order to judge how approximate the numbers are.
 
 ### Bundled ESP profiles
 
@@ -1111,6 +1296,16 @@ into that label's single span. Nested labels report separately — the
 outer span simply contains the inner one. Forward references (loop exits
 like `jle .L24`) are ignored.
 
+Containment is what the `depth` column of `--span-stats` reports: a
+span's depth is the number of other spans of the same function that
+start at or before it and end at or after it. An outermost loop is
+depth 0, a loop nested in it 1, and a span at depth 1 runs its body
+once per iteration of the span at depth 0. Two labels covering exactly
+the same lines (one loop body reached by two edges) contain each other
+under no reading, so both keep the depth of whatever encloses them.
+Depth is a nesting fact and nothing more - the trip count is not in the
+assembly, so nothing in the tool multiplies a count by it.
+
 The one arch-specific case is Xtensa zero-overhead loops, where the
 hardware — not a branch — repeats the body, and the `loop` instruction
 names its *end* label, forward:
@@ -1141,6 +1336,11 @@ misreadings to avoid are few and predictable:
   cost more than the rest of the function. Treat the count as a *size*
   and *structure* fact - a call appearing, a loop body growing, a
   softfloat sequence materializing - and measure time on the target.
+  `--cost` splits the same body into instruction classes and libcall
+  tiers, so that one `__udivdi3` line reads as an `int-div` call
+  instead of as one more instruction; a `[costs.NAME]` profile prices
+  those counts in measured cycles, which is still a static issue cost
+  and still not a measurement of your program.
 
 - **The cost of a call is in the callee.** The listing shows only the
   call site. The `-O3` version of `new_rt` above is two instructions,
@@ -1149,7 +1349,9 @@ misreadings to avoid are few and predictable:
 
 - **Weigh the span, not the function.** One instruction added inside a
   loop that runs per sample outweighs twenty added to setup code. The
-  whole-function count charges both the same.
+  whole-function count charges both the same; `--span-stats` gives the
+  per-span mix and its nesting depth, and `--cost` counts the call
+  sites a span holds apart from the rest.
 
 - **Bigger is often faster.** Unrolling and vectorization raise every
   count on purpose - the `-Os` vs `-O3` biquad above is bigger by every

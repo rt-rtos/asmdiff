@@ -940,6 +940,13 @@ class TestBuildMatrix(unittest.TestCase):
         with self.assertRaises(SystemExit):
             asmdiff.build_matrix([], ["bad"], cfg, "cfg.toml")
 
+    def test_costs_table_is_not_a_target(self):
+        cfg = dict(self.CONFIG, costs={"bench": {"measured_on": "S3",
+                                                 "method": "h"}})
+        self.assertEqual(asmdiff.config_target_names(cfg), ["s3", "host"])
+        with self.assertRaises(SystemExit):
+            asmdiff.build_matrix([], ["costs"], cfg, "cfg.toml")
+
     def test_cc_naming_a_target_is_still_a_plain_command(self):
         # [gcc] exists in the example config; `--cc gcc` must stay a
         # verbatim compiler command, not a typo of `-t gcc`.
@@ -1040,6 +1047,21 @@ class TestListTargets(unittest.TestCase):
         self.assertIn("  c3: riscv-gcc", out)
         self.assertIn("  host: gcc", out)
         self.assertNotIn("  groups: ", out)     # [groups] is not a target
+
+    def test_lists_cost_profiles_with_where_they_were_measured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "asmdiff.toml"
+            cfg.write_text('[costs.bench]\nmeasured_on = "S3 rev 0.2"\n'
+                           'method = "cycle counter"\n'
+                           '[c3]\ncc = "riscv-gcc"\n')
+            if asmdiff.tomllib is None:
+                self.skipTest("tomllib requires Python >= 3.11")
+            status, out = self._run(["--list-targets", "--config", str(cfg)])
+        self.assertEqual(status, 0)
+        self.assertIn("costs:", out)
+        self.assertIn("  bench: S3 rev 0.2", out)
+        self.assertIn("  c3: riscv-gcc", out)
+        self.assertNotIn("  costs: ", out)   # [costs] is not a target
 
     def test_without_a_config_names_the_fallback_matrix(self):
         status, out = self._run(["--list-targets"])
@@ -2061,6 +2083,7 @@ class TestJsonOutput(unittest.TestCase):
         self.addCleanup(setattr, asmdiff, "JSON_OUT", None)
         self.addCleanup(setattr, asmdiff, "SUMMARY_ONLY", False)
         self.addCleanup(setattr, asmdiff, "SPAN_STATS", False)
+        self.addCleanup(setattr, asmdiff, "COST", False)
 
     def _run(self, argv):
         out = io.StringIO()
@@ -2132,6 +2155,23 @@ class TestJsonOutput(unittest.TestCase):
                            "branch": 1, "other": 2}])
         doc = self._run(["h.c", "looper", "--json", "--cc", "gcc -O2"])
         self.assertNotIn("span_stats", doc["results"][0])
+
+    def test_cost_object_present_only_when_asked(self):
+        doc = self._run(["h.c", "--json", "--cost", "--cc", "gcc -O2"])
+        old, new = doc["results"]
+        self.assertEqual(old["cost"]["classes"]["mul"], 1)
+        self.assertEqual(old["cost"]["tiers"], {})
+        self.assertEqual(new["cost"]["tiers"], {"libm": 1})
+        self.assertEqual(new["cost"]["tiers_in_loop"], {})
+        self.assertIsNone(new["cost"]["score"])
+        self.assertIsNone(new["cost"]["profile"])
+        self.assertEqual(new["cost"]["unweighted"], 3)   # 2 insns + 1 site
+        self.assertEqual(new["delta"]["cost"],
+                         {"classes": {"mul": -1, "other": 1},
+                          "tiers": {"libm": 1}, "score": None})
+        doc = self._run(["h.c", "--json", "--cc", "gcc -O2"])
+        self.assertNotIn("cost", doc["results"][0])
+        self.assertNotIn("cost", doc["results"][1]["delta"])
 
     def test_elf_mode_records(self):
         real = asmdiff.run_objdump
@@ -2485,6 +2525,382 @@ class TestSpanStats(unittest.TestCase):
         # ZOL body: add.n, l32i, add.n, nop.n -> 1 load + 3 other
         self.assertRegex(out.getvalue(),
                          r"render_lut\s+\.L\S+\s+0\s+4\s+1\s+0\s+0\s+0\s+0\s+3")
+
+
+class TestCostMix(unittest.TestCase):
+    """cost_mix: class counts, call tiers, and what a loop span holds."""
+
+    # One __muldf3 call inside the .L2 span, one after it, plus a
+    # memcpy - tiered so it is counted, never priced.
+    LINES = [".L2:", "movsd\t(%rdi), %xmm0", "call\t__muldf3",
+             "addq\t$8, %rdi", "cmpq\t%rdx, %rdi", "jne\t.L2",
+             "call\t__muldf3", "call\tmemcpy", "ret"]
+
+    # other = 1, load = 2 price two classes; the symbol weight for
+    # __muldf3 beats its softfp tier; branch, mem and call have none.
+    PROFILE = {"name": "bench",
+               "weights": {"other": 1, "load": 2, "softfp": 60,
+                           "__muldf3": 90},
+               "provenance": {"measured_on": "S3 rev 0.2",
+                              "method": "cycle counter, median of 1000"}}
+
+    def test_classes_count_the_whole_function(self):
+        mix = asmdiff.cost_mix(self.LINES)
+        self.assertEqual(mix["classes"],
+                         {"load": 1, "store": 0, "mul": 0, "div": 0,
+                          "branch": 5, "other": 2})
+
+    def test_tiers_count_call_sites_and_the_loop_subset(self):
+        mix = asmdiff.cost_mix(self.LINES)
+        self.assertEqual(mix["tiers"], {"softfp": 2, "mem": 1})
+        self.assertEqual(mix["tiers_in_loop"], {"softfp": 1})
+        self.assertEqual(mix["calls"], {"__muldf3": 2, "memcpy": 1})
+        # analyze names each callee once; the mix counts the sites.
+        self.assertEqual(asmdiff.analyze(self.LINES)[1],
+                         ["__muldf3", "memcpy"])
+
+    def test_precomputed_ranges_give_the_same_mix(self):
+        ranges = asmdiff.loop_span_ranges(self.LINES)
+        self.assertEqual(asmdiff.cost_mix(self.LINES, ranges),
+                         asmdiff.cost_mix(self.LINES))
+
+    def test_score_prices_what_the_profile_covers(self):
+        mix = asmdiff.cost_mix(self.LINES)
+        # 1 load * 2 + 2 other * 1 + 2 __muldf3 * 90 = 184; the five
+        # branches and the memcpy have no weight.
+        self.assertEqual(asmdiff.cost_score(mix, self.PROFILE), (184, 6))
+
+    def test_float_weight_rounds_the_score(self):
+        profile = dict(self.PROFILE, weights={"branch": 1.5})
+        mix = asmdiff.cost_mix(self.LINES)
+        # 5 branches * 1.5; the other 3 instructions and 3 call sites
+        # are unweighted.
+        self.assertEqual(asmdiff.cost_score(mix, profile), (7.5, 6))
+
+    def test_record_without_a_profile_is_ordinal(self):
+        rec = asmdiff.cost_record(asmdiff.cost_mix(self.LINES))
+        self.assertIsNone(rec["score"])
+        self.assertIsNone(rec["profile"])
+        self.assertEqual(rec["unweighted"], 11)   # 8 insns + 3 sites
+
+    def test_record_carries_the_profile_provenance(self):
+        rec = asmdiff.cost_record(asmdiff.cost_mix(self.LINES),
+                                  self.PROFILE)
+        self.assertEqual(rec["score"], 184)
+        self.assertEqual(rec["profile"],
+                         {"name": "bench", "measured_on": "S3 rev 0.2",
+                          "method": "cycle counter, median of 1000"})
+
+
+class TestCostColumn(unittest.TestCase):
+    """--cost: the cell, the delta cell, and the column that appears
+    only when asked for."""
+
+    LINES = TestCostMix.LINES
+    PROFILE = TestCostMix.PROFILE
+
+    BASE = ["call\t__muldf3", "ret"]
+    CAND = ["movsd\t(%rdi), %xmm0", "ret"]
+
+    def setUp(self):
+        self.addCleanup(setattr, asmdiff, "COST", False)
+
+    def test_cell_lists_classes_then_tiers(self):
+        cell = asmdiff.format_cost(asmdiff.cost_mix(self.LINES))
+        self.assertEqual(cell, "ld 1 br 5 oth 2 softfp 2 (1 in loop) mem 1")
+
+    def test_cell_leads_with_the_score_and_fits_the_budget(self):
+        cell = asmdiff.format_cost(asmdiff.cost_mix(self.LINES),
+                                   self.PROFILE)
+        self.assertTrue(cell.startswith("score 184 (6 unweighted) "), cell)
+        self.assertTrue(cell.endswith("..."), cell)
+        self.assertLessEqual(len(cell), asmdiff.COST_CELL_BUDGET)
+
+    def test_delta_cell_names_only_what_moved(self):
+        delta = asmdiff.cost_delta(asmdiff.cost_mix(self.BASE),
+                                   asmdiff.cost_mix(self.CAND))
+        self.assertEqual(delta, {"classes": {"load": 1, "branch": -1},
+                                 "tiers": {"softfp": -1}, "score": None})
+        self.assertEqual(asmdiff.format_cost_delta(delta),
+                         "ld +1 br -1 softfp -1")
+
+    def test_delta_cell_leads_with_the_score_difference(self):
+        delta = asmdiff.cost_delta(asmdiff.cost_mix(self.BASE),
+                                   asmdiff.cost_mix(self.CAND),
+                                   self.PROFILE)
+        self.assertEqual(delta["score"], -88)   # 2 against 90
+        self.assertEqual(asmdiff.format_cost_delta(delta),
+                         "score -88 ld +1 br -1 softfp -1")
+
+    def test_unchanged_mix_reads_as_a_dash(self):
+        delta = asmdiff.cost_delta(asmdiff.cost_mix(self.BASE),
+                                   asmdiff.cost_mix(self.BASE))
+        self.assertEqual(asmdiff.format_cost_delta(delta), "-")
+
+    def test_summary_table_header_unchanged_without_the_flag(self):
+        funcs = {"old_a": self.BASE, "new_a": self.CAND}
+        header = asmdiff.summary_table([("old_a", "new_a")],
+                                       funcs).splitlines()[0]
+        self.assertRegex(header,
+                         r"^function\s+role\s+insns\s+loop spans\s+calls$")
+
+    def test_summary_table_gains_the_column_with_the_flag(self):
+        asmdiff.COST = True
+        funcs = {"old_a": self.BASE, "new_a": self.CAND}
+        lines = asmdiff.summary_table([("old_a", "new_a")],
+                                      funcs).splitlines()
+        self.assertRegex(lines[0],
+                         r"^function\s+role\s+insns\s+loop spans\s+"
+                         r"cost\s+calls$")
+        self.assertRegex(lines[1], r"old_a\s+baseline\s+2\s+-\s+br 2 "
+                                   r"softfp 1\s+__muldf3")
+        self.assertRegex(lines[3],
+                         r"delta\s+0\s+-\s+ld \+1 br -1 softfp -1\s+")
+
+    def test_main_wires_the_flag_into_the_tables(self):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.main(["h.c", "--cost", "-s", "--cc", "gcc -O2"])
+        text = out.getvalue()
+        self.assertRegex(text, r"function\s+role\s+insns\s+loop spans"
+                               r"\s+cost\s+calls")
+        self.assertRegex(text, r"new_const\s+candidate\s+2\s+-\s+"
+                               r"br 1 oth 1 libm 1\s+ldexpf")
+        self.assertRegex(text, r"delta\s+0\s+-\s+mul -1 oth \+1 libm \+1")
+
+    def test_inspect_and_file_tables_gain_the_column(self):
+        asmdiff.COST = True
+        funcs = {"f": self.CAND}
+        for table in (asmdiff.inspect_table(["f"], funcs),
+                      asmdiff.file_summary_table(funcs)):
+            self.assertRegex(table.splitlines()[0],
+                             r"^function\s+insns\s+loop spans\s+cost"
+                             r"\s+calls$")
+            self.assertRegex(table.splitlines()[1], r"f\s+2\s+-\s+ld 1 br 1")
+
+
+class TestCostProfiles(unittest.TestCase):
+    """[costs.NAME] tables: what loads, what errors, and the
+    provenance a score is never printed without."""
+
+    CONFIG = """\
+[costs.bench]
+measured_on = "S3 rev 0.2, code in IRAM"
+method = "cycle counter, median of 1000"
+note = "divides measured on one operand pair"
+other = 1
+load = 2
+softfp = 60
+"__muldf3" = 90
+
+[costs.bench-lto]
+extends = "bench"
+measured_on = "S3 rev 0.2, -flto"
+method = "same harness"
+load = 3
+
+[s3]
+cc = "xtensa-gcc"
+flags = ["-O2"]
+costs = "bench"
+"""
+
+    def _config(self, text=None):
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        return asmdiff.tomllib.loads(self.CONFIG if text is None else text)
+
+    def _error(self, text, name="p"):
+        with self.assertRaises(SystemExit) as ctx:
+            asmdiff.load_costs(self._config(text), name, "cfg.toml")
+        return str(ctx.exception)
+
+    def test_numbers_are_weights_and_strings_provenance(self):
+        profile = asmdiff.load_costs(self._config(), "bench", "cfg.toml")
+        self.assertEqual(profile["weights"],
+                         {"other": 1, "load": 2, "softfp": 60,
+                          "__muldf3": 90})
+        self.assertEqual(list(profile["provenance"]),
+                         ["measured_on", "method", "note"])
+
+    def test_extends_copies_weights_then_overrides(self):
+        profile = asmdiff.load_costs(self._config(), "bench-lto",
+                                     "cfg.toml")
+        self.assertEqual(profile["weights"],
+                         {"other": 1, "load": 3, "softfp": 60,
+                          "__muldf3": 90})
+        self.assertEqual(profile["provenance"]["measured_on"],
+                         "S3 rev 0.2, -flto")
+
+    def test_extends_chain_is_an_error(self):
+        text = ('[costs.a]\nmeasured_on = "x"\nmethod = "y"\n'
+                '[costs.b]\nextends = "a"\nmeasured_on = "x"\n'
+                'method = "y"\n'
+                '[costs.c]\nextends = "b"\nmeasured_on = "x"\n'
+                'method = "y"\n')
+        self.assertIn("one level only", self._error(text, "c"))
+
+    def test_unknown_profile_lists_the_known_ones(self):
+        msg = self._error(self.CONFIG, "nope")
+        self.assertIn("no [costs.nope]", msg)
+        self.assertIn("cost profiles: bench, bench-lto", msg)
+
+    def test_config_without_any_profile_says_so(self):
+        msg = self._error('[s3]\ncc = "gcc"\n', "bench")
+        self.assertIn("defines no cost profiles", msg)
+
+    def test_provenance_fields_are_required(self):
+        msg = self._error('[costs.p]\nmeasured_on = "S3"\nload = 2\n')
+        self.assertIn("method", msg)
+        msg = self._error('[costs.p]\nmethod = "harness"\nload = 2\n')
+        self.assertIn("measured_on", msg)
+
+    def test_mem_and_call_have_no_weight(self):
+        text = ('[costs.p]\nmeasured_on = "S3"\nmethod = "h"\n'
+                'mem = 40\n')
+        self.assertIn("mem has no weight", self._error(text))
+
+    def test_other_value_types_name_the_key(self):
+        text = ('[costs.p]\nmeasured_on = "S3"\nmethod = "h"\n'
+                'load = [1, 2]\n')
+        msg = self._error(text)
+        self.assertIn("load must be a weight", msg)
+
+    def test_provenance_line_names_where_and_how(self):
+        profile = asmdiff.load_costs(self._config(), "bench", "cfg.toml")
+        self.assertEqual(
+            asmdiff.format_provenance(profile),
+            "costs: bench - S3 rev 0.2, code in IRAM; cycle counter, "
+            "median of 1000; note: divides measured on one operand pair")
+
+    def test_target_resolves_its_profile_before_compiling(self):
+        matrix = asmdiff.build_matrix([], ["s3"], self._config(),
+                                      "cfg.toml")
+        self.assertEqual(matrix[0].costs["name"], "bench")
+        self.assertEqual(matrix[0].costs["weights"]["softfp"], 60)
+
+    def test_target_naming_a_missing_profile_is_an_error(self):
+        text = self.CONFIG.replace('costs = "bench"', 'costs = "ghost"')
+        with self.assertRaises(SystemExit) as ctx:
+            asmdiff.build_matrix([], ["s3"], self._config(text),
+                                 "cfg.toml")
+        self.assertIn("no [costs.ghost]", str(ctx.exception))
+
+    def test_target_costs_must_be_a_string(self):
+        text = self.CONFIG.replace('costs = "bench"', "costs = 3")
+        with self.assertRaises(SystemExit) as ctx:
+            asmdiff.build_matrix([], ["s3"], self._config(text),
+                                 "cfg.toml")
+        self.assertIn("costs must name", str(ctx.exception))
+
+    def test_costs_arg_overrides_every_row_including_cc(self):
+        matrix = asmdiff.build_matrix(["gcc -O2"], ["s3"], self._config(),
+                                      "cfg.toml", costs_arg="bench-lto")
+        self.assertEqual([e.costs["name"] for e in matrix],
+                         ["bench-lto", "bench-lto"])
+
+    def test_costs_table_is_not_a_target(self):
+        config = self._config()
+        self.assertEqual(asmdiff.config_target_names(config), ["s3"])
+        self.assertEqual(asmdiff.config_cost_names(config),
+                         ["bench", "bench-lto"])
+
+    def _run_main(self, argv, asm):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: asm
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
+        self.addCleanup(setattr, asmdiff, "COST", False)
+        self.addCleanup(setattr, asmdiff, "COST_PROFILE", None)
+        self.addCleanup(setattr, asmdiff, "SUMMARY_ONLY", False)
+        self.addCleanup(setattr, asmdiff, "JSON_OUT", None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.main(argv)
+        return out.getvalue()
+
+    def test_costs_flag_implies_cost_and_prints_provenance(self):
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "asmdiff.toml"
+            cfg.write_text(self.CONFIG)
+            out = self._run_main(["h.c", "--costs", "bench", "-s",
+                                  "--config", str(cfg),
+                                  "--cc", "gcc -O2"], GCC_ASM)
+        # old_const: 1 mul (unweighted) + 1 branch (unweighted) -> 0.
+        self.assertRegex(out, r"old_const\s+baseline\s+2\s+-\s+"
+                              r"score 0 \(2 unweighted\)")
+        # new_const: 1 other * 1, the branch and ldexpf unweighted.
+        self.assertRegex(out, r"new_const\s+candidate\s+2\s+-\s+"
+                              r"score 1 \(2 unweighted\)")
+        self.assertIn("costs: bench - S3 rev 0.2, code in IRAM; "
+                      "cycle counter, median of 1000", out)
+
+    def test_json_carries_the_profile(self):
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "asmdiff.toml"
+            cfg.write_text(self.CONFIG)
+            out = self._run_main(["h.c", "--json", "--costs", "bench",
+                                  "--config", str(cfg),
+                                  "--cc", "gcc -O2"], GCC_ASM)
+        doc = json.loads(out)
+        old, new = doc["results"]
+        self.assertEqual(old["cost"]["score"], 0)
+        self.assertEqual(new["cost"]["score"], 1)
+        self.assertEqual(new["cost"]["unweighted"], 2)
+        self.assertEqual(new["cost"]["profile"]["name"], "bench")
+        self.assertEqual(new["cost"]["profile"]["method"],
+                         "cycle counter, median of 1000")
+        self.assertEqual(new["delta"]["cost"]["score"], 1)
+
+    def _run_elf(self, argv):
+        real = asmdiff.run_objdump
+        asmdiff.run_objdump = lambda objdump, elf: OBJDUMP_ASM
+        self.addCleanup(setattr, asmdiff, "run_objdump", real)
+        self.addCleanup(setattr, asmdiff, "COST", False)
+        self.addCleanup(setattr, asmdiff, "COST_PROFILE", None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = asmdiff.main(argv)
+        return status, out.getvalue()
+
+    def test_elf_mode_scores_with_costs(self):
+        # ELF mode resolves no target, so --costs is the only way a
+        # profile reaches it; the column would otherwise stay ordinal.
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "asmdiff.toml"
+            cfg.write_text(self.CONFIG)
+            elf = Path(tmp) / "fw.elf"
+            elf.write_bytes(b"\x7fELF" + b"\0" * 12)
+            status, out = self._run_elf([str(elf), "render_lut", "-s",
+                                         "--objdump", "od", "--costs",
+                                         "bench", "--config", str(cfg)])
+        self.assertEqual(status, 0)
+        # render_lut: 1 l32i * 2, 5 other * 1, loop and retw.n unweighted.
+        self.assertRegex(out, r"render_lut\s+8\s+\S+\s+"
+                              r"score 7 \(2 unweighted\)")
+        self.assertIn("costs: bench - S3 rev 0.2, code in IRAM; "
+                      "cycle counter, median of 1000", out)
+
+    def test_elf_mode_unknown_profile_errors(self):
+        if asmdiff.tomllib is None:
+            self.skipTest("tomllib requires Python >= 3.11")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "asmdiff.toml"
+            cfg.write_text(self.CONFIG)
+            elf = Path(tmp) / "fw.elf"
+            elf.write_bytes(b"\x7fELF" + b"\0" * 12)
+            with self.assertRaises(SystemExit) as ctx:
+                self._run_elf([str(elf), "render_lut", "--objdump", "od",
+                               "--costs", "ghost", "--config", str(cfg)])
+        self.assertIn("no [costs.ghost]", str(ctx.exception))
 
 
 class TestSummaryOnly(unittest.TestCase):

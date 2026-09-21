@@ -15,17 +15,19 @@ Usage:
                              [--config PATH] [--compile-commands [PATH]]
                              [--flags-like PATH] [--db-includes]
                              [--filter REGEX] [--summary-only]
-                             [--collapse] [--span-stats] [--fail-on-growth]
+                             [--collapse] [--span-stats] [--cost]
+                             [--costs NAME] [--fail-on-growth]
                              [--json] [--layout list|side-by-side] [-v]
                              [-- EXTRA_FLAGS...]
     tools/asmdiff/asmdiff.py FIRMWARE.elf [FUNC...] [--filter REGEX]
                              [--objdump PATH] [--layout list]
-                             [--summary-only] [--span-stats] [--json]
+                             [--summary-only] [--span-stats] [--cost]
+                             [--costs NAME] [--json]
     tools/asmdiff/asmdiff.py --edit-config | --example-config
                              | --list-targets | --completion SHELL
                              | --install-completion [SHELL] | --version
 
-Five modes:
+Four modes, plus the no-flag whole-file summary:
   SOURCE.c FUNC   inspect: print the named function's assembly, no
                   comparison.  One usable compiler prints a listing
                   plus a stats row, exactly two print side by side,
@@ -57,13 +59,28 @@ Five modes:
   (neither)       whole-file summary: per-function counts plus a file
                   total, for one file or side by side for two.
 
-Four flags shape the output: --summary-only prints only the stats
+Five flags shape the output: --summary-only prints only the stats
 tables, --collapse elides identical runs in side-by-side listings
 keeping context around each difference, --span-stats follows each
 stats table with a per-loop-span instruction mix (nesting depth and
-load/store/mul/div/branch/other counts; branch includes calls), and
---json replaces the tables with one JSON document of per-function
-records (implies --summary-only) for scripted callers.
+load/store/mul/div/branch/other counts; branch includes calls), --cost
+adds a column saying what each function is made of (the same six
+instruction classes, plus the libcall tier of every call site -
+softfp, softfp-div, int-div, libm, mem, call - with the sites a loop
+span holds counted apart), and --json replaces the tables with one
+JSON document of per-function records (implies --summary-only) for
+scripted callers.
+
+The cost column counts; it prices nothing until a measured profile
+says what a class or a tier costs.  A [costs.NAME] table in the config
+carries those weights (keyed by class, tier, or call symbol) together
+with the measured_on and method strings it may not omit; a target
+names one with costs = "NAME", and --costs NAME applies one to every
+matrix row, --cc rows and ELF input included, implying --cost.  A
+score is then printed with the count of instructions and call sites no
+weight covered, followed by the profile's provenance; mem and call are
+never weighted, since their cost is a size argument or a callee the
+assembly does not show.
 
 Paired output answers the paired question itself: every summary table
 closes a pair with a delta row (signed instruction count, per-span
@@ -80,8 +97,8 @@ Flags after a bare `--` are appended to every compiler invocation.
 --edit-config opens the config (--config PATH, else ~/.config/
 asmdiff.toml) in $VISUAL/$EDITOR, creating it from the built-in example
 when missing; --example-config prints that example to stdout;
---list-targets prints the resolved config's default, groups, and
-targets.
+--list-targets prints the resolved config's default, groups, cost
+profiles, and targets.
 --completion bash|zsh|fish prints a completion script built from this
 parser's own flag list, so it cannot drift from the tool; target and
 cost-profile names come from the config at each tab press, honouring a
@@ -129,13 +146,13 @@ except ModuleNotFoundError:
 
 # Single source of truth for the package version: pyproject.toml reads
 # it from here (hatchling dynamic version).
-__version__ = "0.3.4"
+__version__ = "0.4.0"
 
 DEFAULT_COMPILERS = ["gcc", "clang"]
 FALLBACK_FLAGS = "-O3"
 CONFIG_NAME = "asmdiff.toml"
 # Top-level keys that are not compiler targets.
-CONFIG_META_KEYS = ("default", "groups")
+CONFIG_META_KEYS = ("default", "groups", "costs")
 
 # Mirror of asmdiff.example.toml, embedded because the wheel ships only
 # this module: --example-config prints it and --edit-config seeds a new
@@ -185,6 +202,33 @@ riscv32-esp = ["esp32c3", "esp32c6", "esp32h2", "esp32p4"]
 xtensa-esp = ["esp32", "esp32s2", "esp32s3"]
 esp = ["esp32", "esp32s2", "esp32s3", "esp32c3", "esp32c6", "esp32h2", "esp32p4"]
 native = ["gcc", "clang"]
+
+# --- Cost profiles ---------------------------------------------------
+# A target may name a [costs.NAME] table; --cost then prints a
+# weighted score next to the class counts, with the profile's
+# provenance.  Weights are static issue costs in cycles, measured
+# on hardware, approximate by nature; measured_on and method are
+# required so a reader knows how approximate.  No profile ships
+# measured yet: fill one in from your own board (see README,
+# "Cost profiles") and consider contributing it.
+#
+# [costs.esp32s3-iram]
+# measured_on = "ESP32-S3 rev 0.2, code in IRAM, esp-15.2.0 libgcc"
+# method = "esp_cpu_get_cycle_count harness, median of 1000 runs"
+# other = 1
+# load = 2
+# store = 1
+# mul = 2
+# div = 20
+# branch = 2
+# softfp = 60
+# softfp-div = 200
+# int-div = 40
+# "__muldf3" = 90
+#
+# [esp32s3]
+# ...
+# costs = "esp32s3-iram"
 
 # cc values may use ~, $VARS, and glob patterns.  A glob that matches
 # several installed toolchains resolves to the highest version-sorted
@@ -302,12 +346,18 @@ class Target(str):
     ``db_discovered`` marks a database that was found by searching near the
     CWD rather than named explicitly; a source absent from a discovered
     database is tolerated (compiled without borrowed flags, with a note),
-    where an explicit database makes that an error."""
+    where an explicit database makes that an error.
 
-    def __new__(cls, cmd, compile_commands=None, db_discovered=False):
+    ``costs`` is the resolved cost profile this target's
+    ``costs = "NAME"`` (or --costs) names, since what an instruction
+    costs is a property of the target that runs it."""
+
+    def __new__(cls, cmd, compile_commands=None, db_discovered=False,
+                costs=None):
         self = super().__new__(cls, cmd)
         self.compile_commands = compile_commands
         self.db_discovered = db_discovered
+        self.costs = costs
         return self
 
 
@@ -788,13 +838,27 @@ INDIRECT_CALL_RE = re.compile(
 )
 
 
-def analyze(lines):
-    """Return (instruction_count, called_symbols) for cleaned asm lines.
+def call_symbol(line):
+    """The symbol one cleaned instruction calls, or None.
 
     A call is a call/tail-call mnemonic whose first operand looks like a
     symbol name — local labels (.L*) and %-registers never match, so
     branches inside the function are not counted.  A call through a
     register is reported as "indirect(<reg>)".
+    """
+    m = INDIRECT_CALL_RE.match(line)
+    if m:
+        return "indirect(%s)" % next(g for g in m.groups() if g)
+    m = CALL_RE.match(line)
+    return m.group(1) if m else None
+
+
+def analyze(lines):
+    """Return (instruction_count, called_symbols) for cleaned asm lines.
+
+    Each callee is named once, in first-call order, since the calls
+    column answers what a function reaches; cost_mix counts the call
+    sites instead, since two calls to one helper cost twice.
     """
     insns = 0
     calls = []
@@ -802,12 +866,7 @@ def analyze(lines):
         if line.endswith(":"):
             continue
         insns += 1
-        m = INDIRECT_CALL_RE.match(line)
-        if m:
-            sym = "indirect(%s)" % next(g for g in m.groups() if g)
-        else:
-            m = CALL_RE.match(line)
-            sym = m.group(1) if m else None
+        sym = call_symbol(line)
         if sym is not None and sym not in calls:
             calls.append(sym)
     return insns, calls
@@ -885,15 +944,19 @@ def span_depths(ranges):
             for label, lo, hi in ranges}
 
 
-def loop_spans(lines):
+def loop_spans(lines, ranges=None):
     """Return [(label, insns)] spans for cleaned asm lines.
 
     The count states how many instructions lie in the span — nothing
     about trip count or hotness, which the reader must judge from the
-    source.
+    source.  ``ranges`` hands in loop_span_ranges output the caller
+    already has, so a record that wants spans, depths, and the cost mix
+    walks the lines once.
     """
     result = []
-    for ref, lo, hi in loop_span_ranges(lines):
+    if ranges is None:
+        ranges = loop_span_ranges(lines)
+    for ref, lo, hi in ranges:
         insns = sum(1 for ln in lines[lo:hi + 1] if not ln.endswith(":"))
         result.append((ref, insns))
     return result
@@ -1033,15 +1096,23 @@ def libcall_tier(sym):
     return "call"
 
 
+# Tiers in reading order, floating point down to the two that are only
+# ever counted.  _LIBCALL_TIERS is ordered by match specificity, which
+# is the matcher's business, not the reader's.
+_TIER_KEYS = ("softfp", "softfp-div", "int-div", "libm", "mem", "call")
+
+
 _MIX_KEYS = ("load", "store", "mul", "div", "branch", "other")
 
 
-def span_mix(lines):
+def span_mix(lines, ranges=None):
     """[{label, depth, insns, load, store, mul, div, branch, other}] per
     loop span of one function — the data behind --span-stats, table and
-    JSON."""
+    JSON.  ``ranges`` is loop_span_ranges output a caller already
+    walked, as in loop_spans."""
     result = []
-    ranges = loop_span_ranges(lines)
+    if ranges is None:
+        ranges = loop_span_ranges(lines)
     depths = span_depths(ranges)
     for label, lo, hi in ranges:
         body = [ln for ln in lines[lo:hi + 1] if not ln.endswith(":")]
@@ -1053,6 +1124,97 @@ def span_mix(lines):
         entry.update(counts)
         result.append(entry)
     return result
+
+
+def cost_mix(lines, ranges=None):
+    """What one function is made of: {classes, tiers, tiers_in_loop,
+    calls}.
+
+    classes holds all six counts over the whole function; tiers counts
+    call sites per libcall tier and tiers_in_loop the subset a loop
+    span contains, which is where a softfp helper stops being a
+    detail; calls counts the sites per callee, for a profile that
+    prices a symbol directly.  Only classes is always fully present -
+    a function that calls nothing carries no empty tier table.
+
+    This is counting, not pricing: what a class or a tier costs comes
+    from a measured profile (see cost_score) and from nowhere else.
+    """
+    if ranges is None:
+        ranges = loop_span_ranges(lines)
+    in_loop = set()
+    for _, lo, hi in ranges:
+        in_loop.update(range(lo, hi + 1))
+    classes = dict.fromkeys(_MIX_KEYS, 0)
+    tiers, tiers_in_loop, calls = {}, {}, {}
+    for i, line in enumerate(lines):
+        if line.endswith(":"):
+            continue
+        classes[classify_insn(line)] += 1
+        sym = call_symbol(line)
+        if sym is None:
+            continue
+        calls[sym] = calls.get(sym, 0) + 1
+        tier = libcall_tier(sym)
+        tiers[tier] = tiers.get(tier, 0) + 1
+        if i in in_loop:
+            tiers_in_loop[tier] = tiers_in_loop.get(tier, 0) + 1
+    return {"classes": classes, "tiers": tiers,
+            "tiers_in_loop": tiers_in_loop, "calls": calls}
+
+
+def cost_score(mix, profile):
+    """(score, unweighted) for one cost_mix under a cost profile.
+
+    An instruction costs its class weight; a call site adds its
+    callee's, by symbol where the profile prices that symbol and by
+    tier otherwise.  What no weight covers is counted rather than
+    guessed at, so the score is never read without knowing how much of
+    the function it left out.  A profile of whole numbers scores as
+    one; a fractional weight anywhere rounds the total to a decimal,
+    since the third digit of a measured cycle count is noise.
+    """
+    weights = profile["weights"]
+    total, unweighted = 0, 0
+    for cls, n in mix["classes"].items():
+        weight = weights.get(cls)
+        if weight is None:
+            unweighted += n
+        else:
+            total += weight * n
+    for sym, n in mix["calls"].items():
+        weight = weights.get(sym)
+        if weight is None:
+            weight = weights.get(libcall_tier(sym))
+        if weight is None:
+            unweighted += n
+        else:
+            total += weight * n
+    if all(isinstance(w, int) for w in weights.values()):
+        return total, unweighted
+    return round(total, 1), unweighted
+
+
+def cost_record(mix, profile=None):
+    """The --json cost object for one function: the counts, the score
+    and what it left unweighted, and the profile that priced it.
+
+    Without a profile the counts stand alone - score and profile are
+    null and every instruction and call site is unweighted, which is
+    exactly what an ordinal run claims.
+    """
+    rec = {"classes": mix["classes"], "tiers": mix["tiers"],
+           "tiers_in_loop": mix["tiers_in_loop"]}
+    if profile is None:
+        rec["score"] = None
+        rec["unweighted"] = (sum(mix["classes"].values())
+                             + sum(mix["calls"].values()))
+        rec["profile"] = None
+        return rec
+    rec["score"], rec["unweighted"] = cost_score(mix, profile)
+    rec["profile"] = {"name": profile["name"]}
+    rec["profile"].update(profile["provenance"])
+    return rec
 
 
 def span_stats_table(fn_names, funcs, max_width=None):
@@ -1249,6 +1411,75 @@ def config_groups(config, config_path=None):
     return groups
 
 
+def config_cost_names(config):
+    """[costs.NAME] profile names, in file order."""
+    costs = (config or {}).get("costs")
+    if not isinstance(costs, dict):
+        return []
+    return [name for name, table in costs.items()
+            if isinstance(table, dict)]
+
+
+# Tiers a profile may never price: what a memcpy or an unknown callee
+# costs is the size argument or the callee's body, neither of which
+# the assembly shows.  They stay counted, and the score says how many
+# call sites it left out.
+_UNPRICED_TIERS = ("mem", "call")
+
+
+def load_costs(config, name, config_path, extended_by=None):
+    """Resolve one [costs.NAME] table to {name, weights, provenance}.
+
+    A number is a weight, keyed by instruction class, libcall tier, or
+    call symbol; a string is provenance, and measured_on and method
+    are required, because a cycle count whose origin is out of sight
+    invites more trust than it earned.  extends = "OTHER" copies
+    another profile's weights first, one level only: these are
+    measurements, not a class hierarchy.
+    """
+    where = config_path or "the config"
+    tables = (config or {}).get("costs")
+    entry = tables.get(name) if isinstance(tables, dict) else None
+    if not isinstance(entry, dict):
+        known = ", ".join(config_cost_names(config))
+        sys.exit(f"error: no [costs.{name}] in {where}"
+                 + ("; cost profiles: " + known if known
+                    else "; it defines no cost profiles"))
+    weights, provenance = {}, {}
+    base = entry.get("extends")
+    if base is not None:
+        if not isinstance(base, str):
+            sys.exit(f"error: [costs.{name}]: extends must name another "
+                     "cost profile")
+        if extended_by is not None:
+            sys.exit(f"error: [costs.{name}]: extends is one level only, "
+                     f"and [costs.{extended_by}] already extends it")
+        weights.update(load_costs(config, base, config_path, name)["weights"])
+    for key, value in entry.items():
+        if key == "extends":
+            continue
+        if isinstance(value, str):
+            provenance[key] = value
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            sys.exit(f"error: [costs.{name}]: {key} must be a weight "
+                     "(number) or provenance (string)")
+        if key in _UNPRICED_TIERS:
+            sys.exit(f"error: [costs.{name}]: {key} has no weight; its "
+                     "cost is the size argument or the callee's body, "
+                     "which the assembly does not show")
+        weights[key] = value
+    for field in ("measured_on", "method"):
+        if not provenance.get(field):
+            sys.exit(f'error: [costs.{name}]: {field} = "..." is '
+                     "required; a score nobody can place is not a "
+                     "measurement")
+    ordered = {field: provenance.pop(field)
+               for field in ("measured_on", "method")}
+    ordered.update(provenance)
+    return {"name": name, "weights": weights, "provenance": ordered}
+
+
 def _known_suffix(config, config_path):
     """'; targets: ...; groups: ...' for unknown-name errors."""
     targets = config_target_names(config)
@@ -1341,6 +1572,12 @@ def list_targets(config, config_path):
         print("groups:")
         for name, members in groups.items():
             print(f"  {name}: " + ", ".join(members))
+    costs = config_cost_names(config)
+    if costs:
+        print("costs:")
+        for name in costs:
+            measured = config["costs"][name].get("measured_on", "?")
+            print(f"  {name}: {measured}")
     print("targets:")
     for name in config_target_names(config):
         cc = config[name].get("cc", "")
@@ -1379,11 +1616,20 @@ def target_command(config, name, config_path, want_db=True):
                      "path to a compile_commands.json, or true to search "
                      "upward from the current directory")
         db = os.path.expandvars(os.path.expanduser(db))
-    return Target(shlex.join([resolve_cc(cc, name), *flags]), db, discovered)
+    # Resolved here rather than at render time, so a misspelled profile
+    # fails before the matrix spends a compile on it.
+    costs = entry.get("costs")
+    if costs is not None:
+        if not isinstance(costs, str):
+            sys.exit(f"error: target [{name}]: costs must name a "
+                     "[costs.NAME] profile")
+        costs = load_costs(config, costs, config_path)
+    return Target(shlex.join([resolve_cc(cc, name), *flags]), db, discovered,
+                  costs)
 
 
 def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
-                 want_db=True):
+                 want_db=True, costs_arg=None):
     """Resolve the compiler matrix.
 
     --cc strings verbatim, then --target entries (comma-lists, groups,
@@ -1394,6 +1640,9 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
     ``db_arg`` is the --compile-commands value: a PATH applies that
     database to every entry, True discovers one near the CWD.  A target
     whose config names its own compile_commands keeps it.
+
+    ``costs_arg`` is --costs: one profile for every entry, overriding
+    what a target named, which is how a --cc row gets one at all.
     """
     entries = list(cc_args)
     entries += [target_command(config, name, config_path, want_db)
@@ -1414,7 +1663,14 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
             db = os.path.expandvars(os.path.expanduser(db_arg))
             discovered = False
         entries = [e if getattr(e, "compile_commands", None) is not None
-                   else Target(e, db, discovered) for e in entries]
+                   else Target(e, db, discovered,
+                               getattr(e, "costs", None))
+                   for e in entries]
+    if costs_arg is not None:
+        profile = load_costs(config, costs_arg, config_path)
+        entries = [Target(e, getattr(e, "compile_commands", None),
+                          getattr(e, "db_discovered", False), profile)
+                   for e in entries]
     return entries
 
 
@@ -1430,6 +1686,12 @@ SPAN_STATS = False
 # --json: collect summary records here instead of printing tables;
 # None means normal table output.  main() dumps the collected list.
 JSON_OUT = None
+# --cost: add the cost column to the stats tables and the cost object
+# to --json.  COST_PROFILE is the [costs.NAME] table pricing the
+# counts, None until a target or --costs names one; without it the
+# column is ordinal - classes and tiers, no score.
+COST = False
+COST_PROFILE = None
 # --fail-on-growth: candidates whose instruction count exceeds their
 # baseline's, as (function, delta, baseline label, candidate label).
 # main() turns a non-empty list into exit status 3, which a CI job can
@@ -1451,10 +1713,28 @@ def note_growth(func, base_lines, cand_lines, base_label, cand_label):
         GROWTH.append((func, grew, base_label, cand_label))
 
 
-def span_stats_block(fn_names, funcs):
-    """Print the per-span mix table after a stats table when
-    --span-stats is on; a silent no-op otherwise."""
-    if SPAN_STATS and JSON_OUT is None:
+def use_cost_profile(cc_cmd):
+    """Point COST_PROFILE at the profile this matrix row names.
+
+    A profile prices one target's instruction set, so it follows the
+    row being reported rather than the run; comparing two targets, the
+    candidate's is the one its score belongs to.  A plain command
+    string (a --cc row without --costs) leaves the column ordinal.
+    """
+    global COST_PROFILE
+    if cc_cmd is not None:
+        COST_PROFILE = getattr(cc_cmd, "costs", None)
+
+
+def table_footer(fn_names, funcs):
+    """What follows a stats table: the profile that priced its scores,
+    then the --span-stats mix table.  Both are silent no-ops when
+    their flag is off or --json holds the output."""
+    if JSON_OUT is not None:
+        return
+    if COST and COST_PROFILE is not None:
+        print(format_provenance(COST_PROFILE))
+    if SPAN_STATS:
         print()
         print(span_stats_table(fn_names, funcs, table_width()))
 
@@ -1464,8 +1744,11 @@ def json_record(name, lines, cc=None, tag=None, role=None, baseline=None):
     resolved compiler command, tag the source/side label of a two-file
     comparison, role baseline/candidate for paired rows, baseline the
     paired baseline's lines, which adds the candidate's delta object;
-    each is omitted where the mode has no such notion."""
+    each is omitted where the mode has no such notion.  Spans, depths,
+    and the cost mix share one walk over the lines."""
     insns, calls = analyze(lines)
+    ranges = loop_span_ranges(lines)
+    mix = cost_mix(lines, ranges) if COST else None
     rec = {"function": name}
     if cc is not None:
         rec["cc"] = str(cc)
@@ -1474,15 +1757,20 @@ def json_record(name, lines, cc=None, tag=None, role=None, baseline=None):
     if role is not None:
         rec["role"] = role
     rec["insns"] = insns
-    depths = span_depths(loop_span_ranges(lines))
+    depths = span_depths(ranges)
     rec["loop_spans"] = [{"label": label, "insns": n,
                           "depth": depths[label]}
-                         for label, n in loop_spans(lines)]
+                         for label, n in loop_spans(lines, ranges)]
     rec["calls"] = calls
     if baseline is not None:
         rec["delta"] = pair_delta(baseline, lines)
+        if COST:
+            rec["delta"]["cost"] = cost_delta(cost_mix(baseline), mix,
+                                              COST_PROFILE)
+    if COST:
+        rec["cost"] = cost_record(mix, COST_PROFILE)
     if SPAN_STATS:
-        rec["span_stats"] = span_mix(lines)
+        rec["span_stats"] = span_mix(lines, ranges)
     return rec
 # Without --verbose, a failed compile shows this many stderr lines — enough
 # for the include chain plus the first error, which is the actionable part.
@@ -1747,23 +2035,124 @@ def format_delta_calls(delta):
     return " ".join(changed) or "-"
 
 
+# Class names abbreviated for the cost cell; the tiers keep the names
+# libcall_tier gives them, which is what a profile's keys spell.
+_COST_LABELS = {"load": "ld", "store": "st", "mul": "mul", "div": "div",
+                "branch": "br", "other": "oth"}
+
+# The cost cell sits before the ragged calls column, so render_table
+# never trims it: it caps itself instead.
+COST_CELL_BUDGET = 48
+
+
+def _fit_cost(parts, budget=COST_CELL_BUDGET):
+    """Join cost cell parts within budget, dropping whole ones from the
+    end and closing with "...".  The first part is always kept: with a
+    profile it is the score, and a cell that dropped that would say
+    less than nothing."""
+    cell = " ".join(parts)
+    if len(cell) <= budget:
+        return cell
+    kept = []
+    for part in parts:
+        if kept and len(" ".join(kept + [part, "..."])) > budget:
+            break
+        kept.append(part)
+    return " ".join(kept + ["..."])
+
+
+def format_cost(mix, profile=None):
+    """One cost cell: the non-zero classes and tiers of a function,
+    each tier followed by how many of its call sites a loop span
+    holds, after a score when a profile prices them."""
+    parts = []
+    if profile is not None:
+        score, unweighted = cost_score(mix, profile)
+        parts.append(f"score {score} ({unweighted} unweighted)")
+    parts += [f"{_COST_LABELS[k]} {mix['classes'][k]}"
+              for k in _MIX_KEYS if mix["classes"][k]]
+    for tier in _TIER_KEYS:
+        n = mix["tiers"].get(tier, 0)
+        if not n:
+            continue
+        hot = mix["tiers_in_loop"].get(tier, 0)
+        parts.append(f"{tier} {n}" + (f" ({hot} in loop)" if hot else ""))
+    return _fit_cost(parts) if parts else "-"
+
+
+def format_provenance(profile):
+    """The line under any table that shows a score: which profile
+    priced it, measured on what and how, and whatever else the table
+    said about itself."""
+    prov = profile["provenance"]
+    extra = "".join(f"; {key}: {value}" for key, value in prov.items()
+                    if key not in ("measured_on", "method"))
+    return (f"costs: {profile['name']} - {prov['measured_on']}; "
+            + prov["method"] + extra)
+
+
+def cost_delta(base_mix, cand_mix, profile=None):
+    """What the candidate's mix changed: signed counts for the classes
+    and tiers that moved, and the score difference when a profile
+    prices them.  Counts that stayed put are left out, so the row says
+    what the rewrite did instead of restating what it kept."""
+    classes = {k: cand_mix["classes"][k] - base_mix["classes"][k]
+               for k in _MIX_KEYS
+               if cand_mix["classes"][k] != base_mix["classes"][k]}
+    tiers = {}
+    for tier in _TIER_KEYS:
+        moved = (cand_mix["tiers"].get(tier, 0)
+                 - base_mix["tiers"].get(tier, 0))
+        if moved:
+            tiers[tier] = moved
+    score = None
+    if profile is not None:
+        score = (cost_score(cand_mix, profile)[0]
+                 - cost_score(base_mix, profile)[0])
+        if isinstance(score, float):
+            score = round(score, 1)
+    return {"classes": classes, "tiers": tiers, "score": score}
+
+
+def format_cost_delta(delta):
+    """The delta row's cost cell: the signed score first when one was
+    computed, then the classes and tiers that moved; "-" when the mix
+    came through the rewrite unchanged."""
+    parts = []
+    if delta["score"] is not None:
+        parts.append("score " + (f"{delta['score']:+g}"
+                                 if delta["score"] else "0"))
+    parts += [f"{_COST_LABELS[k]} {n:+d}"
+              for k, n in delta["classes"].items()]
+    parts += [f"{tier} {n:+d}" for tier, n in delta["tiers"].items()]
+    return _fit_cost(parts) if parts else "-"
+
+
 def summary_table(pairs, funcs, max_width=None):
     """Instruction counts, loop spans, and outbound calls per pair
     member, and a delta row closing each pair. Calls come last: the one
     unbounded column stays ragged right so the counts and spans keep
     their alignment."""
-    rows = [("function", "role", "insns", "loop spans", "calls")]
+    rows = [("function", "role", "insns", "loop spans")
+            + (("cost",) if COST else ()) + ("calls",)]
     for old, new in pairs:
+        mixes = {}
         for name, role in ((old, "baseline"), (new, "candidate")):
             insns, calls = analyze(funcs[name])
-            rows.append((name, role, str(insns),
-                         format_spans(loop_spans(funcs[name])),
-                         format_calls(calls)))
+            row = (name, role, str(insns),
+                   format_spans(loop_spans(funcs[name])))
+            if COST:
+                mixes[name] = cost_mix(funcs[name])
+                row += (format_cost(mixes[name], COST_PROFILE),)
+            rows.append(row + (format_calls(calls),))
         delta = pair_delta(funcs[old], funcs[new])
-        rows.append(("", "delta", format_delta_insns(delta["insns"]),
-                     format_delta_spans(loop_spans(funcs[old]),
-                                        loop_spans(funcs[new])),
-                     format_delta_calls(delta)))
+        row = ("", "delta", format_delta_insns(delta["insns"]),
+               format_delta_spans(loop_spans(funcs[old]),
+                                  loop_spans(funcs[new])))
+        if COST:
+            row += (format_cost_delta(cost_delta(mixes[old], mixes[new],
+                                                 COST_PROFILE)),)
+        rows.append(row + (format_delta_calls(delta),))
     return render_table(rows, max_width)
 
 
@@ -1775,7 +2164,8 @@ def file_summary_table(funcs, max_width=None):
     check, not a code-size measurement (literal pools, data, and
     alignment are not included).
     """
-    rows = [("function", "insns", "loop spans", "calls")]
+    rows = [("function", "insns", "loop spans")
+            + (("cost",) if COST else ()) + ("calls",)]
     total_insns, all_calls = 0, []
     for name, lines in funcs.items():
         insns, calls = analyze(lines)
@@ -1783,10 +2173,16 @@ def file_summary_table(funcs, max_width=None):
         for sym in calls:
             if sym not in all_calls:
                 all_calls.append(sym)
-        rows.append((name, str(insns),
-                     format_spans(loop_spans(lines)), format_calls(calls)))
-    rows.append((f"TOTAL ({len(funcs)} functions)", str(total_insns),
-                 "-", format_calls(all_calls)))
+        row = (name, str(insns), format_spans(loop_spans(lines)))
+        if COST:
+            row += (format_cost(cost_mix(lines), COST_PROFILE),)
+        rows.append(row + (format_calls(calls),))
+    total = (f"TOTAL ({len(funcs)} functions)", str(total_insns), "-")
+    if COST:
+        # A mix is per function; a file-wide sum of them would price
+        # nothing the rows do not already say.
+        total += ("-",)
+    rows.append(total + (format_calls(all_calls),))
     return render_table(rows, max_width)
 
 
@@ -1801,12 +2197,14 @@ def listing(name, lines):
 def inspect_table(fn_names, funcs, max_width=None):
     """Stats rows for the inspected functions only - no pair roles and
     no whole-file total, unlike summary_table/file_summary_table."""
-    rows = [("function", "insns", "loop spans", "calls")]
+    rows = [("function", "insns", "loop spans")
+            + (("cost",) if COST else ()) + ("calls",)]
     for name in fn_names:
         insns, calls = analyze(funcs[name])
-        rows.append((name, str(insns),
-                     format_spans(loop_spans(funcs[name])),
-                     format_calls(calls)))
+        row = (name, str(insns), format_spans(loop_spans(funcs[name])))
+        if COST:
+            row += (format_cost(cost_mix(funcs[name]), COST_PROFILE),)
+        rows.append(row + (format_calls(calls),))
     return render_table(rows, max_width)
 
 
@@ -1831,6 +2229,7 @@ def report_across(fn_names, left_funcs, right_funcs, left_tag, right_tag,
         sys.exit("error: function(s) not in asm: " + ", ".join(missing)
                  + f"; {left_tag} has: " + (", ".join(left_funcs) or "none")
                  + f"; {right_tag} has: " + (", ".join(right_funcs) or "none"))
+    use_cost_profile(ccs[1])
     for f in fn_names:
         note_growth(f, left_funcs[f], right_funcs[f], left_tag, right_tag)
     if JSON_OUT is not None:
@@ -1852,7 +2251,7 @@ def report_across(fn_names, left_funcs, right_funcs, left_tag, right_tag,
                                collapse=COLLAPSE))
             print()
     print(summary_table(pairs, decorated, table_width()))
-    span_stats_block([n for p in pairs for n in p], decorated)
+    table_footer([n for p in pairs for n in p], decorated)
 
 
 def run_across(sources, matrix, fn_names, extra_flags, tmp):
@@ -1938,6 +2337,7 @@ def run_summary(sources, matrix, extra_flags, tmp, filter_regex=None):
         if len(sections) < len(sources):
             continue
         ran_any = True
+        use_cost_profile(cc_cmd)
         matched_any = matched_any or any(sections)
         shown = (mark_db_misses(cc_cmd, sources, tags)
                  if len(sources) == 2 else tags)
@@ -1957,7 +2357,7 @@ def run_summary(sources, matrix, extra_flags, tmp, filter_regex=None):
                   else ("(no functions match --filter)" if pattern is not None
                         else "(no functions found)"))
             if funcs:
-                span_stats_block(list(funcs), funcs)
+                table_footer(list(funcs), funcs)
     if not ran_any:
         sys.exit("error: no usable compiler in the matrix"
                  + _skipped_suffix())
@@ -1979,6 +2379,7 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
         if asm is None:
             continue
         ran_any = True
+        use_cost_profile(cc_cmd)
         funcs = extract_functions(asm)
         pairs = ([tuple(p.split(":", 1)) for p in pair_specs]
                  or auto_pairs(funcs))
@@ -1995,7 +2396,7 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
             print(file_summary_table(funcs, table_width()) if funcs
                   else "(no functions found)")
             if funcs:
-                span_stats_block(list(funcs), funcs)
+                table_footer(list(funcs), funcs)
             continue
         missing = sorted({n for p in pairs for n in p if n not in funcs})
         if missing:
@@ -2019,7 +2420,7 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
                                    collapse=COLLAPSE))
                 print()
         print(summary_table(pairs, funcs, table_width()))
-        span_stats_block([n for p in pairs for n in p], funcs)
+        table_footer([n for p in pairs for n in p], funcs)
     if not ran_any:
         sys.exit("error: no usable compiler in the matrix"
                  + _skipped_suffix())
@@ -2074,6 +2475,7 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp,
 
     if JSON_OUT is not None:
         for _, cc_cmd, funcs in usable:
+            use_cost_profile(cc_cmd)
             JSON_OUT.extend(json_record(name, funcs[name], cc=cc_cmd)
                             for name in selected(funcs))
         return 0
@@ -2086,12 +2488,13 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp,
         print()
         for tag, cc_cmd, _ in usable:
             print(f"{tag}: {cc_cmd}")
-        base_tag, _, base_funcs = usable[0]
-        for tag, _, funcs in usable[1:]:
+        base_tag, base_cc, base_funcs = usable[0]
+        for tag, cc_cmd, funcs in usable[1:]:
             print(f"\n== {base_tag} vs {tag} ==\n")
             both = list(fn_names) + [m for m in matched
                                      if m in base_funcs and m in funcs]
-            report_across(both, base_funcs, funcs, base_tag, tag)
+            report_across(both, base_funcs, funcs, base_tag, tag,
+                          ccs=(base_cc, cc_cmd))
             one_sided = [m for m in matched
                          if (m in base_funcs) != (m in funcs)]
             if one_sided:
@@ -2100,6 +2503,7 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp,
                       + " - inspect with -l list")
         return 0
     for _, cc_cmd, funcs in usable:
+        use_cost_profile(cc_cmd)
         sel = selected(funcs)
         if len(usable) > 1:
             print(f"\n== {cc_cmd} ==")
@@ -2109,7 +2513,7 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp,
                 print(listing(name, funcs[name]))
         print()
         print(inspect_table(sel, funcs, table_width()))
-        span_stats_block(sel, funcs)
+        table_footer(sel, funcs)
     return 0
 
 
@@ -2140,7 +2544,8 @@ def run_objdump(objdump, elf):
     return proc.stdout
 
 
-def run_elf(elf, fn_names, filter_regex, objdump, list_matches=False):
+def run_elf(elf, fn_names, filter_regex, objdump, list_matches=False,
+            costs=None):
     """ELF mode: disassemble one linked binary and run the selected
     functions through the same analyzers as -S output.
 
@@ -2154,7 +2559,13 @@ def run_elf(elf, fn_names, filter_regex, objdump, list_matches=False):
     known.  When filter matches go unlisted, a trailing note says so:
     a summary that looks complete but silently withholds the listings
     costs the caller a detour through raw objdump.
+
+    ``costs`` is the --costs profile.  Nothing is compiled here, so no
+    matrix row owns the binary's instructions and use_cost_profile has
+    nothing to follow: the flag sets the profile for the whole run.
     """
+    global COST_PROFILE
+    COST_PROFILE = costs
     funcs = extract_functions_objdump(run_objdump(objdump, elf))
     missing = [f for f in fn_names if f not in funcs]
     if missing:
@@ -2180,7 +2591,7 @@ def run_elf(elf, fn_names, filter_regex, objdump, list_matches=False):
             print(listing(name, funcs[name]))
     print()
     print(inspect_table(selected, funcs, table_width()))
-    span_stats_block(selected, funcs)
+    table_footer(selected, funcs)
     unlisted = len(selected) - len(listed)
     if unlisted and not SUMMARY_ONLY:
         print(f"\nnote: {unlisted} --filter match(es) summarized without "
@@ -2525,11 +2936,7 @@ def completion_names(kind, explicit_config=None):
     if not config:
         return []
     if kind == "costs":
-        costs = config.get("costs")
-        if not isinstance(costs, dict):
-            return []
-        return [name for name, table in costs.items()
-                if isinstance(table, dict)]
+        return config_cost_names(config)
     if kind != "targets":
         return []
     names = config_target_names(config)
@@ -2699,6 +3106,20 @@ def main(argv=None):
                              "instruction mix (nesting depth and load/"
                              "store/mul/div/branch/other counts) - weighs "
                              "the span instead of the whole function")
+    parser.add_argument("--cost", action="store_true",
+                        help="add a cost column to the stats tables: the "
+                             "instruction classes of each function and "
+                             "what its calls are (softfp, softfp-div, "
+                             "int-div, libm, mem, call), with the call "
+                             "sites a loop span holds counted apart.  "
+                             "Counts only, until a measured cost profile "
+                             "prices them")
+    parser.add_argument("--costs", metavar="NAME",
+                        help="price the cost column with the config's "
+                             "[costs.NAME] profile on every matrix row, "
+                             "--cc rows included (implies --cost).  A "
+                             "target may name its own with "
+                             'costs = "NAME"; this overrides it')
     parser.add_argument("--fail-on-growth", action="store_true",
                         help="exit 3 if any candidate has more "
                              "instructions than its baseline, naming each "
@@ -2748,7 +3169,7 @@ def main(argv=None):
                              "the first lines")
     args = parser.parse_args(argv)
     global VERBOSE, FLAGS_LIKE, SUMMARY_ONLY, COLLAPSE, SPAN_STATS
-    global DB_INCLUDES, JSON_OUT, FAIL_ON_GROWTH
+    global DB_INCLUDES, JSON_OUT, FAIL_ON_GROWTH, COST, COST_PROFILE
     VERBOSE = args.verbose
     FLAGS_LIKE = args.flags_like
     SUMMARY_ONLY = args.summary_only or args.json
@@ -2756,6 +3177,8 @@ def main(argv=None):
     SPAN_STATS = args.span_stats
     DB_INCLUDES = args.db_includes
     JSON_OUT = [] if args.json else None
+    COST = args.cost or args.costs is not None
+    COST_PROFILE = None                 # set per matrix row as it runs
     FAIL_ON_GROWTH = args.fail_on_growth
     del GROWTH[:]                       # main() may run twice in a process
 
@@ -2806,10 +3229,10 @@ def main(argv=None):
             parser.error("a whole ELF has too many functions to table; "
                          "name functions after the file or select them "
                          "with --filter REGEX")
+        config_path = find_config(args.config, sources)
+        config = load_config(config_path) if config_path else None
         objdump = args.objdump
         if objdump is None:
-            config_path = find_config(args.config, sources)
-            config = load_config(config_path) if config_path else None
             matrix = build_matrix(args.cc, args.target, config, config_path,
                                   want_db=False)
             objdump = derive_objdump(matrix)
@@ -2817,8 +3240,12 @@ def main(argv=None):
                 sys.exit("error: no gcc in the matrix to derive an objdump "
                          "from (" + "; ".join(matrix) + "); pass --objdump "
                          "PATH or a gcc-based --cc/--target")
+        # A target's costs = "NAME" stays unread: ELF mode compiles
+        # nothing, so no target stands behind the binary's code.
+        profile = (load_costs(config, args.costs, config_path)
+                   if args.costs else None)
         status = run_elf(sources[0], fn_names, args.filter, objdump,
-                         list_matches=args.layout == "list")
+                         list_matches=args.layout == "list", costs=profile)
         if JSON_OUT is not None:
             print(json.dumps({"asmdiff": __version__, "mode": "elf",
                               "elf": sources[0], "results": JSON_OUT},
@@ -2848,7 +3275,7 @@ def main(argv=None):
     config_path = find_config(args.config, sources)
     config = load_config(config_path) if config_path else None
     matrix = build_matrix(args.cc, args.target, config, config_path,
-                          args.compile_commands)
+                          args.compile_commands, costs_arg=args.costs)
     if args.across and len(sources) == 1 and len(matrix) < 2:
         parser.error("--across on one file needs at least two --cc entries")
     for spec in args.pair:

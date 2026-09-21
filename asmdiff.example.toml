@@ -43,6 +43,33 @@ xtensa-esp = ["esp32", "esp32s2", "esp32s3"]
 esp = ["esp32", "esp32s2", "esp32s3", "esp32c3", "esp32c6", "esp32h2", "esp32p4"]
 native = ["gcc", "clang"]
 
+# --- Cost profiles ---------------------------------------------------
+# A target may name a [costs.NAME] table; --cost then prints a
+# weighted score next to the class counts, with the profile's
+# provenance.  Weights are static issue costs in cycles, measured
+# on hardware, approximate by nature; measured_on and method are
+# required so a reader knows how approximate.  No profile ships
+# measured yet: fill one in from your own board (see README,
+# "Cost profiles") and consider contributing it.
+#
+# [costs.esp32s3-iram]
+# measured_on = "ESP32-S3 rev 0.2, code in IRAM, esp-15.2.0 libgcc"
+# method = "esp_cpu_get_cycle_count harness, median of 1000 runs"
+# other = 1
+# load = 2
+# store = 1
+# mul = 2
+# div = 20
+# branch = 2
+# softfp = 60
+# softfp-div = 200
+# int-div = 40
+# "__muldf3" = 90
+#
+# [esp32s3]
+# ...
+# costs = "esp32s3-iram"
+
 # cc values may use ~, $VARS, and glob patterns.  A glob that matches
 # several installed toolchains resolves to the highest version-sorted
 # one (announced on stderr); pin the exact esp-NN directory instead if
