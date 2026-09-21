@@ -1,5 +1,5 @@
 
-function   role       insns  loop spans  cost                   calls
-old_const  baseline   2      -           mul 1 br 1             -
-new_const  candidate  2      -           br 1 oth 1 libm 1      ldexpf
-           delta      0      -           mul -1 oth +1 libm +1  +ldexpf
+function   role       insns  loop spans  cost                       calls
+old_const  baseline   2      -           mul:1 | br:1               -
+new_const  candidate  2      -           br:1 | oth:1 | libm:1      ldexpf
+           delta      0      -           mul:-1 | oth:+1 | libm:+1  +ldexpf

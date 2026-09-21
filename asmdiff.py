@@ -2391,23 +2391,23 @@ _COST_LABELS = {"load": "ld", "store": "st", "mul": "mul", "div": "div",
 
 # The cost cell sits before the ragged calls column, so render_table
 # never trims it: it caps itself instead.
-COST_CELL_BUDGET = 48
+COST_CELL_BUDGET = 56
 
 
 def _fit_cost(parts, budget=COST_CELL_BUDGET):
-    """Join cost cell parts within budget, dropping whole ones from the
-    end and closing with "...".  The first part is always kept: with a
-    profile it is the score, and a cell that dropped that would say
-    less than nothing."""
-    cell = " ".join(parts)
+    """Join cost cell parts with " | " within budget, dropping whole
+    ones from the end and closing with "...".  The first part is always
+    kept: with a profile it is the score, and a cell that dropped that
+    would say less than nothing."""
+    cell = " | ".join(parts)
     if len(cell) <= budget:
         return cell
     kept = []
     for part in parts:
-        if kept and len(" ".join(kept + [part, "..."])) > budget:
+        if kept and len(" | ".join(kept + [part, "..."])) > budget:
             break
         kept.append(part)
-    return " ".join(kept + ["..."])
+    return " | ".join(kept + ["..."])
 
 
 def format_cost(mix, profile=None):
@@ -2418,14 +2418,14 @@ def format_cost(mix, profile=None):
     if profile is not None:
         score, unweighted = cost_score(mix, profile)
         parts.append(f"score {score} ({unweighted} unweighted)")
-    parts += [f"{_COST_LABELS[k]} {mix['classes'][k]}"
+    parts += [f"{_COST_LABELS[k]}:{mix['classes'][k]}"
               for k in _MIX_KEYS if mix["classes"][k]]
     for tier in _TIER_KEYS:
         n = mix["tiers"].get(tier, 0)
         if not n:
             continue
         hot = mix["tiers_in_loop"].get(tier, 0)
-        parts.append(f"{tier} {n}" + (f" ({hot} in loop)" if hot else ""))
+        parts.append(f"{tier}:{n}" + (f" ({hot} in loop)" if hot else ""))
     return _fit_cost(parts) if parts else "-"
 
 
@@ -2471,9 +2471,9 @@ def format_cost_delta(delta):
     if delta["score"] is not None:
         parts.append("score " + (f"{delta['score']:+g}"
                                  if delta["score"] else "0"))
-    parts += [f"{_COST_LABELS[k]} {n:+d}"
+    parts += [f"{_COST_LABELS[k]}:{n:+d}"
               for k, n in delta["classes"].items()]
-    parts += [f"{tier} {n:+d}" for tier, n in delta["tiers"].items()]
+    parts += [f"{tier}:{n:+d}" for tier, n in delta["tiers"].items()]
     return _fit_cost(parts) if parts else "-"
 
 

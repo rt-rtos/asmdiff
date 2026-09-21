@@ -2868,12 +2868,12 @@ class TestCostColumn(unittest.TestCase):
 
     def test_cell_lists_classes_then_tiers(self):
         cell = asmdiff.format_cost(asmdiff.cost_mix(self.LINES))
-        self.assertEqual(cell, "ld 1 br 5 oth 2 softfp 2 (1 in loop) mem 1")
+        self.assertEqual(cell, "ld:1 | br:5 | oth:2 | softfp:2 (1 in loop) | mem:1")
 
     def test_cell_leads_with_the_score_and_fits_the_budget(self):
         cell = asmdiff.format_cost(asmdiff.cost_mix(self.LINES),
                                    self.PROFILE)
-        self.assertTrue(cell.startswith("score 184 (6 unweighted) "), cell)
+        self.assertTrue(cell.startswith("score 184 (6 unweighted) | "), cell)
         self.assertTrue(cell.endswith("..."), cell)
         self.assertLessEqual(len(cell), asmdiff.COST_CELL_BUDGET)
 
@@ -2883,7 +2883,7 @@ class TestCostColumn(unittest.TestCase):
         self.assertEqual(delta, {"classes": {"load": 1, "branch": -1},
                                  "tiers": {"softfp": -1}, "score": None})
         self.assertEqual(asmdiff.format_cost_delta(delta),
-                         "ld +1 br -1 softfp -1")
+                         "ld:+1 | br:-1 | softfp:-1")
 
     def test_delta_cell_leads_with_the_score_difference(self):
         delta = asmdiff.cost_delta(asmdiff.cost_mix(self.BASE),
@@ -2891,7 +2891,7 @@ class TestCostColumn(unittest.TestCase):
                                    self.PROFILE)
         self.assertEqual(delta["score"], -88)   # 2 against 90
         self.assertEqual(asmdiff.format_cost_delta(delta),
-                         "score -88 ld +1 br -1 softfp -1")
+                         "score -88 | ld:+1 | br:-1 | softfp:-1")
 
     def test_unchanged_mix_reads_as_a_dash(self):
         delta = asmdiff.cost_delta(asmdiff.cost_mix(self.BASE),
@@ -2909,7 +2909,7 @@ class TestCostColumn(unittest.TestCase):
             self.assertRegex(table.splitlines()[0],
                              r"^function\s+insns\s+loop spans\s+cost"
                              r"\s+calls$")
-            self.assertRegex(table.splitlines()[1], r"f\s+2\s+-\s+ld 1 br 1")
+            self.assertRegex(table.splitlines()[1], r"f\s+2\s+-\s+ld:1 \| br:1")
 
     def test_each_row_is_priced_by_its_own_profile(self):
         asmdiff.COST = True

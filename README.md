@@ -633,13 +633,13 @@ is made of rather than how many lines long it is:
 ```
 $ asmdiff asmdiff_example.c --cost -s --cc 'gcc -O2'
 
-function   role       insns  loop spans  cost                          calls
-old_const  baseline   3      -           mul 1 br 1 oth 1              -
-new_const  candidate  3      -           br 1 oth 2 libm 1             ldexpf
-           delta      0      -           mul -1 oth +1 libm +1         +ldexpf
-old_rt     baseline   9      -           st 1 mul 1 br 2 oth 5 libm 1  exp2f
-new_rt     candidate  2      -           br 1 oth 1 libm 1             ldexpf
-           delta      -7     -           st -1 mul -1 br -1 oth -4     +ldexpf -exp2f
+function   role       insns  loop spans  cost                                  calls
+old_const  baseline   3      -           mul:1 | br:1 | oth:1                  -
+new_const  candidate  3      -           br:1 | oth:2 | libm:1                 ldexpf
+           delta      0      -           mul:-1 | oth:+1 | libm:+1             +ldexpf
+old_rt     baseline   9      -           st:1 | mul:1 | br:2 | oth:5 | libm:1  exp2f
+new_rt     candidate  2      -           br:1 | oth:1 | libm:1                 ldexpf
+           delta      -7     -           st:-1 | mul:-1 | br:-1 | oth:-4       +ldexpf -exp2f
 ```
 
 Instructions fall into the six classes `--span-stats` uses, abbreviated
@@ -661,7 +661,7 @@ name no pattern knows lands in `call`, where the `calls` column already
 spells it out.
 
 Each tier is followed by how many of its call sites a loop span holds -
-`softfp 3 (2 in loop)` - since a soft-float helper reached once per
+`softfp:3 (2 in loop)` - since a soft-float helper reached once per
 iteration is a different finding from one on an error path. The counts
 are per call site, not per distinct callee: two calls to `__muldf3`
 count twice, where the `calls` column names it once.
@@ -678,7 +678,7 @@ no weight covered, and the table is followed by the line saying where
 the weights came from:
 
 ```
-score 399 (1 unweighted) ld 40 st 12 mul 14 ...
+score 399 (1 unweighted) | ld:40 | st:12 | mul:14 | ...
 ...
 costs: esp32s3-iram - ESP32-S3 rev 0.2, code in IRAM, esp-15.2.0 libgcc; esp_cpu_get_cycle_count harness, median of 1000 runs
 ```
@@ -687,7 +687,7 @@ The weights behind that score are the commented template in
 `asmdiff --example-config`, not a measurement; no measured profile
 ships with the tool, and [Cost profiles](#cost-profiles) below is how
 one is written. The delta row leads with the signed score. A cell is
-capped at 48 characters and closes with `...` when the mix does not fit
+capped at 56 characters and closes with `...` when the mix does not fit
 (as it does here), so the table stays aligned; `--json` carries all of
 it:
 
