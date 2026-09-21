@@ -1450,6 +1450,30 @@ class TestMissingCompilerNamed(unittest.TestCase):
             fn(*args)
         return str(ctx.exception)
 
+    def test_legend_marks_a_failed_row(self):
+        asmdiff._FAILURES[:] = [("cc#2", "error: [cc#2] gcc failed on h.c")]
+        self.addCleanup(asmdiff._FAILURES.clear)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.print_legend([asmdiff.Target("gcc -O2"),
+                                  asmdiff.Target("gcc -O3")])
+        lines = out.getvalue().splitlines()
+        self.assertTrue(any(ln.endswith("gcc -O3 (compile failed, see stderr)")
+                            for ln in lines), lines)
+        self.assertTrue(any(ln.endswith("gcc -O2") for ln in lines), lines)
+
+    def test_legend_marks_a_skipped_row(self):
+        asmdiff._SKIPPED_CCS[:] = ["nosuchcc: not found on PATH"]
+        self.addCleanup(asmdiff._SKIPPED_CCS.clear)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.print_legend([asmdiff.Target("gcc -O2"),
+                                  asmdiff.Target("nosuchcc -O2")])
+        lines = out.getvalue().splitlines()
+        self.assertTrue(any("nosuchcc -O2 (not found on PATH, skipped)"
+                            in ln for ln in lines))
+        self.assertTrue(any(ln.endswith("gcc -O2") for ln in lines))
+
     def test_pairs_error_names_the_miss(self):
         msg = self._expect_exit(asmdiff.run_pairs, "h.c",
                                 ["no-such-cc-xyz -O2"], [], [], "/tmp")
@@ -1645,14 +1669,22 @@ class TestMangledPairHint(unittest.TestCase):
 
 
 class TestCompileFailureOutput(unittest.TestCase):
+    """What a failed compile records for report_failures to print."""
+
     CMD = ["xtensa-gcc", "-O2"] + [f"-I/inc{i}" for i in range(50)] + ["a.c"]
     STDERR = "\n".join(f"err line {i}" for i in range(60))
 
+    def setUp(self):
+        self.addCleanup(asmdiff._FAILURES.clear)
+
+    def _record(self, *args):
+        self.assertIsNone(asmdiff._compile_failure(*args))
+        self.assertEqual(len(asmdiff._FAILURES), 1)
+        return asmdiff._FAILURES[0][1]
+
     def test_default_trims_flags_and_stderr(self):
         asmdiff.VERBOSE = False
-        with self.assertRaises(SystemExit) as ctx:
-            asmdiff._compile_failure(self.CMD, self.STDERR)
-        msg = str(ctx.exception)
+        msg = self._record(self.CMD, self.STDERR)
         self.assertIn("xtensa-gcc failed on a.c", msg)
         self.assertNotIn("-I/inc0", msg)                 # no flag dump
         self.assertIn("err line 0", msg)
@@ -1663,19 +1695,185 @@ class TestCompileFailureOutput(unittest.TestCase):
     def test_verbose_shows_everything(self):
         asmdiff.VERBOSE = True
         try:
-            with self.assertRaises(SystemExit) as ctx:
-                asmdiff._compile_failure(self.CMD, self.STDERR)
+            msg = self._record(self.CMD, self.STDERR)
         finally:
             asmdiff.VERBOSE = False
-        msg = str(ctx.exception)
         self.assertIn("-I/inc0", msg)
         self.assertIn("err line 59", msg)
 
     def test_short_stderr_not_annotated_with_more(self):
         asmdiff.VERBOSE = False
-        with self.assertRaises(SystemExit) as ctx:
-            asmdiff._compile_failure(["gcc", "x.c"], "one error\n")
-        self.assertNotIn("more stderr", str(ctx.exception))
+        self.assertNotIn("more stderr", self._record(["gcc", "x.c"],
+                                                     "one error\n"))
+
+    def test_unlabelled_row_keeps_todays_message(self):
+        asmdiff.VERBOSE = False
+        msg = self._record(["gcc", "x.c"], "one error\n")
+        self.assertTrue(msg.startswith("error: gcc failed on x.c"), msg)
+
+    def test_label_names_the_row_it_came_from(self):
+        asmdiff.VERBOSE = False
+        msg = self._record(["gcc", "x.c"], "one error\n", "esp32s3")
+        self.assertIn("error: [esp32s3] gcc failed on x.c", msg)
+        self.assertEqual(asmdiff._FAILURES[0][0], "esp32s3")
+
+    def test_report_prints_on_stderr_and_reports_any(self):
+        asmdiff.VERBOSE = False
+        self._record(["gcc", "x.c"], "one error\n", "esp32s3")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertTrue(asmdiff.report_failures())
+        self.assertIn("[esp32s3] gcc failed on x.c", err.getvalue())
+        asmdiff._FAILURES.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(asmdiff.report_failures())
+
+
+class TestLabels(unittest.TestCase):
+    """Every matrix row carries the name it is reported under."""
+
+    CONFIG = {"default": "s3",
+              "s3": {"cc": "xtensa-gcc", "flags": ["-O2"]},
+              "host": {"cc": "gcc", "flags": ["-O3"]}}
+
+    def labels(self, *args, **kw):
+        return [row.label for row in asmdiff.build_matrix(*args, **kw)]
+
+    def test_target_rows_take_the_config_name(self):
+        self.assertEqual(self.labels([], ["host"], self.CONFIG, "cfg.toml"),
+                         ["host"])
+
+    def test_default_entry_takes_the_config_name(self):
+        self.assertEqual(self.labels([], [], self.CONFIG, "cfg.toml"),
+                         ["s3"])
+
+    def test_cc_rows_are_numbered_by_position(self):
+        self.assertEqual(self.labels(["gcc -O2", "clang -O2"], [],
+                                     None, None),
+                         ["cc#1", "cc#2"])
+
+    def test_lone_cc_row_keeps_its_command(self):
+        self.assertEqual(self.labels(["gcc -O2"], [], None, None),
+                         ["gcc -O2"])
+
+    def test_mixed_matrix_numbers_only_the_cc_rows(self):
+        self.assertEqual(self.labels(["gcc -O2"], ["host"], self.CONFIG,
+                                     "cfg.toml"),
+                         ["cc#1", "host"])
+
+    def test_fallback_rows_are_numbered(self):
+        self.assertEqual(self.labels([], [], None, None), ["cc#1", "cc#2"])
+
+    def test_label_survives_the_costs_override(self):
+        cfg = dict(self.CONFIG,
+                   costs={"bench": {"measured_on": "S3", "method": "h",
+                                    "other": 1}})
+        matrix = asmdiff.build_matrix([], ["host"], cfg, "cfg.toml",
+                                      costs_arg="bench")
+        self.assertEqual(matrix[0].label, "host")
+        self.assertEqual(matrix[0].costs["name"], "bench")
+
+    def test_bare_command_rows_are_labelled_on_the_fly(self):
+        # A matrix that never went through build_matrix still renders.
+        self.assertEqual(asmdiff.matrix_labels(["gcc -O2", "clang -O2"]),
+                         ["cc#1", "cc#2"])
+        self.assertEqual(asmdiff.matrix_labels(["gcc -O2"]), ["gcc -O2"])
+
+    def _legend(self, rows):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.print_legend(rows)
+        return out.getvalue()
+
+    def test_lone_cc_row_prints_no_legend(self):
+        self.assertEqual(self._legend(asmdiff.build_matrix(["gcc -O2"], [],
+                                                           None, None)), "")
+
+    def test_lone_target_row_prints_a_legend(self):
+        rows = asmdiff.build_matrix([], ["host"], self.CONFIG, "cfg.toml")
+        self.assertIn("host: gcc -O3", self._legend(rows))
+
+    def test_several_rows_print_a_legend(self):
+        legend = self._legend(asmdiff.build_matrix(["gcc -O2", "clang -O2"],
+                                                   [], None, None))
+        self.assertIn("cc#1: gcc -O2", legend)
+        self.assertIn("cc#2: clang -O2", legend)
+
+
+class TestCollectedFailures(unittest.TestCase):
+    """A row that fails to compile is reported after the run, not
+    instead of it."""
+
+    def setUp(self):
+        self.addCleanup(asmdiff._FAILURES.clear)
+
+    def _fake_run(self, cmd, **kw):
+        """Stand in for the compiler: clang fails, gcc writes GCC_ASM."""
+        if cmd[0] == "clang":
+            return mock.Mock(returncode=1, stderr="boom: broken\n")
+        Path(cmd[cmd.index("-o") + 1]).write_text(GCC_ASM)
+        return mock.Mock(returncode=0, stderr="")
+
+    @contextlib.contextmanager
+    def _compilers(self):
+        with mock.patch.object(asmdiff.shutil, "which",
+                               return_value="/usr/bin/cc"), \
+             mock.patch.object(asmdiff.subprocess, "run",
+                               side_effect=self._fake_run):
+            yield
+
+    def test_compile_to_asm_records_the_row_and_returns_none(self):
+        row = asmdiff.Target("clang -O2", label="esp32s3")
+        with self._compilers():
+            self.assertIsNone(asmdiff.compile_to_asm(row, [], "h.c", "/tmp"))
+        self.assertEqual(asmdiff._FAILURES[0][0], "esp32s3")
+        self.assertIn("[esp32s3] clang failed on h.c",
+                      asmdiff._FAILURES[0][1])
+
+    def test_lone_row_failure_is_unlabelled(self):
+        row = asmdiff.Target("clang -O2", label="clang -O2")
+        with self._compilers():
+            asmdiff.compile_to_asm(row, [], "h.c", "/tmp")
+        self.assertIsNone(asmdiff._FAILURES[0][0])
+
+    def test_failed_row_keeps_the_others_table(self):
+        matrix = asmdiff.build_matrix(["gcc -O2", "clang -O2"], [],
+                                      None, None)
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, self._compilers(), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            status = asmdiff.run_pairs("h.c", matrix, [], [], tmp)
+        self.assertEqual(status, 1)
+        self.assertIn("old_const", out.getvalue())       # cc#1 reported
+        self.assertNotIn("cc#2 ==", out.getvalue())      # cc#2 has no table
+        self.assertIn("[cc#2] clang failed on h.c", err.getvalue())
+
+    def test_single_failing_row_keeps_todays_message(self):
+        matrix = asmdiff.build_matrix(["clang -O2"], [], None, None)
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, self._compilers(), \
+                contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as ctx:
+            asmdiff.run_pairs("h.c", matrix, [], [], tmp)
+        self.assertIn("error: clang failed on h.c", err.getvalue())
+        self.assertNotIn("[", err.getvalue())            # nothing to label
+        self.assertIn("no usable compiler", str(ctx.exception))
+
+    def test_json_run_keeps_stdout_pure_and_exits_one(self):
+        matrix = asmdiff.build_matrix(["gcc -O2", "clang -O2"], [],
+                                      None, None)
+        self.addCleanup(setattr, asmdiff, "JSON_OUT", None)
+        asmdiff.JSON_OUT = []
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, self._compilers(), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            status = asmdiff.run_pairs("h.c", matrix, [], [], tmp)
+        self.assertEqual(status, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual({r["target"] for r in asmdiff.JSON_OUT}, {"cc#1"})
+        self.assertIn("clang failed", err.getvalue())
 
 
 class TestFormatCalls(unittest.TestCase):
@@ -1737,21 +1935,95 @@ class TestTableMaxWidth(unittest.TestCase):
     def test_inspect_table_passes_max_width(self):
         funcs = {"f": ["call\talpha", "call\tbravo",
                        "call\tcharlie", "call\tdelta", "ret"]}
-        out = asmdiff.inspect_table(["f"], funcs, max_width=49)
+        out = asmdiff.inspect_table([asmdiff.Block("gcc", funcs, ["f"])],
+                                    max_width=49)
         self.assertIn("alpha, ... (4 total)", out)
         self.assertNotIn("bravo", out)
 
-    def test_table_width_is_terminal_width_on_tty(self):
-        with mock.patch.object(asmdiff.sys.stdout, "isatty",
-                               return_value=True), \
-             mock.patch.object(asmdiff.shutil, "get_terminal_size",
-                               return_value=os.terminal_size((100, 24))):
-            self.assertEqual(asmdiff.table_width(), 100)
 
-    def test_table_width_is_none_when_piped(self):
-        with mock.patch.object(asmdiff.sys.stdout, "isatty",
-                               return_value=False):
-            self.assertIsNone(asmdiff.table_width())
+class TestWidth(unittest.TestCase):
+    """--width, the width tables fall back to off a terminal, and the
+    caps that hang off that budget."""
+
+    def setUp(self):
+        self.addCleanup(setattr, asmdiff, "WIDTH", None)
+
+    def _table_width(self, width, tty, columns):
+        asmdiff.WIDTH = width
+        env = {} if columns is None else {"COLUMNS": columns}
+        with mock.patch.dict(asmdiff.os.environ, env, clear=True), \
+             mock.patch.object(asmdiff.sys.stdout, "isatty",
+                               return_value=tty), \
+             mock.patch.object(asmdiff.shutil, "get_terminal_size",
+                               return_value=os.terminal_size((90, 24))):
+            return asmdiff.table_width()
+
+    def test_width_resolution_order(self):
+        cases = [
+            # (--width, stdout is a tty, $COLUMNS, budget)
+            (None, True, None, 90),      # the terminal
+            (None, False, "100", 100),   # what the pipe's reader said
+            (None, True, "100", 90),     # a real terminal outranks it
+            (None, False, None, 120),    # nothing to go on
+            (None, False, "wide", 120),  # nor anything usable
+            (200, True, None, 200),      # --width outranks the terminal
+            (0, False, "100", None),     # 0 is unlimited
+        ]
+        for width, tty, columns, expected in cases:
+            with self.subTest(width=width, tty=tty, columns=columns):
+                self.assertEqual(self._table_width(width, tty, columns),
+                                 expected)
+
+    def test_listing_width_halves_the_budget(self):
+        # A side-by-side pair gets half the table, less the " | ", and
+        # never narrows past the floor.
+        for width, expected in [(200, 98),
+                                (60, asmdiff.MIN_LISTING_WIDTH),
+                                (0, asmdiff.MIN_LISTING_WIDTH)]:
+            with self.subTest(width=width):
+                asmdiff.WIDTH = width
+                self.assertEqual(asmdiff.listing_width(), expected)
+
+    def test_span_column_caps_with_a_count(self):
+        spans = [(f".L{n}", n + 1) for n in range(7)]
+        out = asmdiff.format_spans(spans)
+        self.assertIn(".L5:6", out)
+        self.assertNotIn(".L6", out)
+        self.assertTrue(out.endswith("+1 more"))
+
+    def test_span_column_within_the_cap_is_whole(self):
+        spans = [(f".L{n}", n + 1) for n in range(6)]
+        out = asmdiff.format_spans(spans)
+        self.assertIn(".L5:6", out)
+        self.assertNotIn("more", out)
+
+    def test_main_wires_the_flag(self):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
+        with contextlib.redirect_stdout(io.StringIO()):
+            asmdiff.main(["h.c", "--width", "60", "--cc", "gcc -O2"])
+        self.assertEqual(asmdiff.WIDTH, 60)
+
+    def test_width_argument_is_a_budget_or_a_usage_error(self):
+        # USAGE: argparse rejects the value; anything else is the
+        # budget the renderers get.
+        USAGE = object()
+        cases = [("0", 0), ("1", 1), ("200", 200),
+                 ("-1", USAGE), ("-200", USAGE), ("wide", USAGE)]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                if expected is USAGE:
+                    with self.assertRaises(asmdiff.argparse.ArgumentTypeError):
+                        asmdiff.width_arg(value)
+                else:
+                    self.assertEqual(asmdiff.width_arg(value), expected)
+
+    def test_negative_width_exits_with_the_usage_status(self):
+        with contextlib.redirect_stderr(io.StringIO()), \
+             self.assertRaises(SystemExit) as ctx:
+            asmdiff.main(["h.c", "--width", "-1", "--cc", "gcc -O2"])
+        self.assertEqual(ctx.exception.code, 2)
 
 
 class TestDiscoveredCompileCommands(unittest.TestCase):
@@ -1934,10 +2206,31 @@ class TestRendering(unittest.TestCase):
         self.assertEqual(lines[2], "a    | b")
         self.assertEqual(lines[3], "     | c")
 
+    def test_side_by_side_drops_trailing_comments(self):
+        cases = [
+            # (line, width, what survives, what the comment took away)
+            ("jmp\tldexpf@PLT # TAILCALL", 20, "ldexpf@PLT", "#"),
+            ("movss\t8(%rsp), %xmm0 # 8-byte Reload", 24, "%xmm0", "#"),
+            # An ARM immediate has no space after the hash.
+            ("mov\tr0, #4", 20, "r0, #4", None),
+        ]
+        for line, width, kept, dropped in cases:
+            with self.subTest(line=line):
+                out = asmdiff.side_by_side([line], ["ret"], "L", "R",
+                                           width=width)
+                self.assertIn(kept, out)
+                if dropped:
+                    self.assertNotIn(dropped, out)
+
+    def test_single_column_listing_keeps_the_comment(self):
+        out = asmdiff.listing("f", ["jmp\tldexpf@PLT # TAILCALL"])
+        self.assertIn("# TAILCALL", out)
+
     def test_summary_table(self):
         funcs = {"old_c": ["mulss\tx, %xmm0", "ret"],
                  "new_c": ["jmp\tldexpf@PLT"]}
-        out = asmdiff.summary_table([("old_c", "new_c")], funcs)
+        out = asmdiff.summary_table(
+            [asmdiff.Block("gcc -O2", funcs, [("old_c", "new_c")])])
         lines = out.splitlines()
         self.assertIn("function", lines[0])
         self.assertIn("loop spans", lines[0])
@@ -1948,7 +2241,8 @@ class TestRendering(unittest.TestCase):
     def test_summary_table_loop_spans_column(self):
         funcs = {"a": [".L2:", "addl\t$1, %eax", "jne\t.L2"],
                  "b": ["ret"]}
-        out = asmdiff.summary_table([("a", "b")], funcs)
+        out = asmdiff.summary_table(
+            [asmdiff.Block("gcc -O2", funcs, [("a", "b")])])
         lines = out.splitlines()
         self.assertRegex(lines[1], r"a\s+baseline\s+2\s+\.L2:2\s+-")
         self.assertRegex(lines[2], r"b\s+candidate\s+1\s+-\s+-")
@@ -1957,7 +2251,7 @@ class TestRendering(unittest.TestCase):
         funcs = {"f": ["call\tmalloc", "ret"],
                  "g": [".L2:", "addl\t$1, %eax", "jne\t.L2",
                        "call\tmalloc", "call\tfree", "ret"]}
-        out = asmdiff.file_summary_table(funcs)
+        out = asmdiff.file_summary_table([asmdiff.Block("gcc -O2", funcs)])
         lines = out.splitlines()
         self.assertRegex(lines[1], r"f\s+2\s+-\s+malloc")
         self.assertRegex(lines[2], r"g\s+5\s+\.L2:2\s+malloc, free")
@@ -1974,29 +2268,89 @@ class TestRendering(unittest.TestCase):
             asmdiff.run_pairs("h.c", ["gcc -O2"], [], [], "/tmp")
         self.assertIn("TOTAL (1 functions)", out.getvalue())
 
-    def test_two_file_summary_tables_share_column_layout(self):
+    def test_two_file_summary_is_one_table_with_a_file_column(self):
         short = {"f": ["ret"]}
         long = {"a_much_longer_function_name": [".L2:", "addl\t$1, %eax",
                                                 "jne\t.L2", "call\tmalloc",
                                                 "ret"]}
-        shared = asmdiff.column_widths(asmdiff.file_summary_rows(short),
-                                       asmdiff.file_summary_rows(long))
-        a = asmdiff.file_summary_table(short, None, shared).splitlines()
-        b = asmdiff.file_summary_table(long, None, shared).splitlines()
-        # the header row is laid out identically in both tables ...
-        self.assertEqual(a[0], b[0])
-        # ... so every column starts at the same offset in each
-        self.assertEqual(a[0].index("insns"), b[0].index("insns"))
-        self.assertEqual(a[0].index("calls"), b[0].index("calls"))
-        # and a table rendered alone stays as narrow as before
-        alone = asmdiff.file_summary_table(short).splitlines()
-        self.assertLess(alone[0].index("insns"), a[0].index("insns"))
+        out = asmdiff.file_summary_table(
+            [asmdiff.Block("gcc -O2", short, "a.c"),
+             asmdiff.Block("gcc -O2", long, "b.c")]).splitlines()
+        # One matrix row, so no target column; the file column leads
+        # and every row says which file it came from.
+        self.assertRegex(out[0], r"^file\s+function\s+insns")
+        self.assertRegex(out[1], r"^a\.c\s+f\s+1\s+")
+        self.assertRegex(out[3], r"^b\.c\s+a_much_longer_function_name\s+")
+        # ... and one layout: a column starts at the same offset in
+        # both files' rows.
+        self.assertEqual(out[1].index("a.c"), out[3].index("b.c"))
 
-    def test_min_widths_keep_fit_budget_honest(self):
-        rows = [("function", "calls"), ("f", "a, b, c, d, e, f, g, h, i")]
-        wide = asmdiff.render_table(rows, max_width=40, min_widths=[20, 0])
-        for line in wide.splitlines():
-            self.assertLessEqual(len(line), 40)
+    def test_several_rows_lead_with_a_target_column(self):
+        funcs = {"f": ["ret"]}
+        out = asmdiff.file_summary_table(
+            [asmdiff.Block("gcc", funcs, "a.c"),
+             asmdiff.Block("esp32s3", funcs, "a.c")]).splitlines()
+        self.assertRegex(out[0], r"^target\s+file\s+function\s+insns")
+        self.assertRegex(out[1], r"^gcc\s+a\.c\s+f\s+")
+        self.assertRegex(out[3], r"^esp32s3\s+a\.c\s+f\s+")
+
+    def test_single_row_keeps_the_plain_header(self):
+        funcs = {"old_c": ["ret"], "new_c": ["ret"]}
+        blocks = [asmdiff.Block("gcc -O2", funcs, [("old_c", "new_c")])]
+        header = asmdiff.summary_table(blocks).splitlines()[0]
+        self.assertRegex(header,
+                         r"^function\s+role\s+insns\s+loop spans\s+calls$")
+
+    def test_pair_table_repeats_the_target_on_every_row(self):
+        funcs = {"old_c": ["ret"], "new_c": ["ret"]}
+        pairs = [("old_c", "new_c")]
+        lines = asmdiff.summary_table(
+            [asmdiff.Block("gcc", funcs, pairs),
+             asmdiff.Block("esp32s3", funcs, pairs)]).splitlines()
+        self.assertRegex(lines[0], r"^target\s+function\s+role\s+insns")
+        self.assertRegex(lines[1], r"^gcc\s+old_c\s+baseline")
+        self.assertRegex(lines[3], r"^gcc\s+delta\s+0")  # no function cell
+        self.assertRegex(lines[4], r"^esp32s3\s+old_c\s+baseline")
+
+    def test_empty_block_keeps_its_line(self):
+        out = asmdiff.file_summary_table(
+            [asmdiff.Block("gcc", {"f": ["ret"]}, "a.c"),
+             asmdiff.Block("gcc", {}, "b.c")]).splitlines()
+        self.assertRegex(out[-1], r"^b\.c\s+\(none\)")
+
+    def _run_pairs(self, matrix):
+        saved = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", saved)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.run_pairs("h.c", matrix, [], [], "/tmp")
+        return out.getvalue()
+
+    def test_pairs_run_prints_one_table_before_the_listings(self):
+        matrix = asmdiff.build_matrix(["gcc -O2", "clang -O2"], [],
+                                      None, None)
+        lines = self._run_pairs(matrix).splitlines()
+        headers = [i for i, line in enumerate(lines)
+                   if line.startswith("target ")]
+        self.assertEqual(len(headers), 1)        # one table for the matrix
+        self.assertRegex(lines[headers[0]],
+                         r"^target\s+function\s+role\s+insns")
+        groups = [i for i, line in enumerate(lines)
+                  if line.startswith("== ")]
+        self.assertEqual([lines[i] for i in groups],
+                         ["== cc#1 ==", "== cc#2 =="])
+        self.assertLess(headers[0], groups[0])   # table, then listings
+
+    def test_single_row_run_keeps_the_0_4_0_header(self):
+        matrix = asmdiff.build_matrix(["gcc -O2"], [], None, None)
+        out = self._run_pairs(matrix)
+        header = next(line for line in out.splitlines()
+                      if line.startswith("function"))
+        self.assertRegex(header,
+                         r"^function\s+role\s+insns\s+loop spans\s+calls$")
+        self.assertNotIn("target", out)          # nothing to tell apart
+        self.assertNotIn("== ", out)             # nor to group listings by
 
 
 class TestInspectRendering(unittest.TestCase):
@@ -2010,7 +2364,8 @@ class TestInspectRendering(unittest.TestCase):
 
     def test_inspect_table_only_requested_functions(self):
         funcs = asmdiff.extract_functions(GCC_ASM)
-        out = asmdiff.inspect_table(["new_const"], funcs)
+        out = asmdiff.inspect_table(
+            [asmdiff.Block("gcc -O2", funcs, ["new_const"])])
         lines = out.splitlines()
         self.assertIn("function", lines[0])
         self.assertEqual(len(lines), 2)      # header + the one function
@@ -2019,8 +2374,18 @@ class TestInspectRendering(unittest.TestCase):
 
     def test_inspect_table_loop_spans(self):
         funcs = asmdiff.extract_functions(LOOP_ASM)
-        out = asmdiff.inspect_table(["looper"], funcs)
+        out = asmdiff.inspect_table(
+            [asmdiff.Block("gcc -O2", funcs, ["looper"])])
         self.assertRegex(out.splitlines()[1], r"looper\s+5\s+\.L2:3\s+-")
+
+    def test_inspect_table_leads_with_the_target_for_several_rows(self):
+        funcs = asmdiff.extract_functions(GCC_ASM)
+        out = asmdiff.inspect_table(
+            [asmdiff.Block("gcc", funcs, ["new_const"]),
+             asmdiff.Block("esp32s3", funcs, ["new_const"])]).splitlines()
+        self.assertRegex(out[0], r"^target\s+function\s+insns")
+        self.assertRegex(out[1], r"^gcc\s+new_const\s+")
+        self.assertRegex(out[2], r"^esp32s3\s+new_const\s+")
 
 
 class TestRunInspect(unittest.TestCase):
@@ -2054,7 +2419,8 @@ class TestRunInspect(unittest.TestCase):
 
     def test_three_compilers_sequential_blocks(self):
         out = self._run(["gcc -O1", "gcc -O2", "gcc -O3"], ["new_const"])
-        self.assertEqual(out.count("== gcc -O"), 3)
+        self.assertEqual(out.count("== cc#"), 3)   # one block per label
+        self.assertIn("cc#3: gcc -O3", out)        # the legend resolves it
         self.assertNotIn(" | ", out)
 
     def test_multiple_functions_listed(self):
@@ -2065,7 +2431,8 @@ class TestRunInspect(unittest.TestCase):
     def test_forced_list_with_two_compilers(self):
         out = self._run(["gcc -O2", "clang -O2"], ["new_const"],
                         layout="list")
-        self.assertIn("== gcc -O2 ==", out)
+        self.assertIn("cc#1: gcc -O2", out)
+        self.assertIn("== cc#1 ==", out)
         self.assertNotIn(" | ", out)
 
     def test_forced_side_by_side_with_three_compilers(self):
@@ -2161,11 +2528,18 @@ class TestCollapse(unittest.TestCase):
         self.assertIn("insn13", out)                      # context kept
         self.assertIn("... 6 identical lines ...", out)   # 14..19 elided
 
-    def test_fully_identical_pair_collapses_to_marker(self):
+    def test_fully_identical_pair_collapses_to_its_header(self):
         lines = [f"insn{n}" for n in range(10)]
         out = asmdiff.side_by_side(lines, lines, "L", "R", collapse=True)
-        self.assertIn("... 10 identical lines ...", out)
+        self.assertEqual(len(out.splitlines()), 2)   # titles and the rule
+        self.assertIn("L (identical)", out)
         self.assertNotIn("insn5", out)
+
+    def test_identical_pair_without_collapse_still_prints(self):
+        lines = [f"insn{n}" for n in range(10)]
+        out = asmdiff.side_by_side(lines, lines, "L", "R")
+        self.assertNotIn("(identical)", out)
+        self.assertIn("insn5", out)
 
     def test_insertion_does_not_desync_collapse(self):
         # Positional pairing would leave every pair after an inserted
@@ -2211,8 +2585,8 @@ class TestCollapse(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 asmdiff.main([str(a), str(b), "-a", "old_pad", "--collapse",
                               "--cc", "gcc -O2"])
-        # both sides compile to the same asm: fully identical listing
-        self.assertIn("... 10 identical lines ...", out.getvalue())
+        # both sides compile to the same asm: nothing left to list
+        self.assertIn("(identical)", out.getvalue())
 
 
 class TestJsonOutput(unittest.TestCase):
@@ -2241,6 +2615,7 @@ class TestJsonOutput(unittest.TestCase):
         self.assertEqual(old["function"], "old_const")
         self.assertEqual(old["role"], "baseline")
         self.assertEqual(old["cc"], "gcc -O2")
+        self.assertEqual(old["target"], "gcc -O2")   # lone row: its command
         self.assertEqual(old["insns"], 2)
         self.assertEqual(new["function"], "new_const")
         self.assertEqual(new["role"], "candidate")
@@ -2261,8 +2636,10 @@ class TestJsonOutput(unittest.TestCase):
         base, cand = doc["results"]
         self.assertEqual(base["tag"], "a.c")
         self.assertEqual(base["role"], "baseline")
+        self.assertEqual(base["target"], "gcc -O2")
         self.assertEqual(cand["tag"], "b.c")
         self.assertEqual(cand["role"], "candidate")
+        self.assertEqual(cand["target"], "gcc -O2")
 
     def test_inspect_records_and_no_listing(self):
         doc = self._run(["h.c", "new_const", "--json", "--cc", "gcc -O2"])
@@ -2270,6 +2647,7 @@ class TestJsonOutput(unittest.TestCase):
         self.assertEqual(len(doc["results"]), 1)
         rec = doc["results"][0]
         self.assertEqual(rec["function"], "new_const")
+        self.assertEqual(rec["target"], "gcc -O2")
         self.assertNotIn("role", rec)
         self.assertNotIn("delta", rec)   # nothing to pair it with
 
@@ -2283,6 +2661,8 @@ class TestJsonOutput(unittest.TestCase):
         tags = {(r["tag"], r["function"]) for r in doc["results"]}
         self.assertIn(("a.c", "old_const"), tags)
         self.assertIn(("b.c", "new_const"), tags)
+        self.assertEqual({r["target"] for r in doc["results"]},
+                         {"gcc -O2"})
 
     def test_span_stats_key_present_only_when_asked(self):
         asmdiff.compile_to_asm = lambda cc, extra, src, tmp: LOOP_ASM
@@ -2328,12 +2708,16 @@ class TestJsonOutput(unittest.TestCase):
         self.assertEqual(doc["elf"], str(elf))
         names = [r["function"] for r in doc["results"]]
         self.assertEqual(names, ["render_lut"])
+        # No matrix row stands behind a linked binary, so no target.
+        self.assertNotIn("target", doc["results"][0])
 
     def test_multi_compiler_matrix_tags_each_record(self):
         doc = self._run(["h.c", "--json", "--cc", "gcc -O2",
                          "--cc", "gcc -O3"])
         ccs = {r["cc"] for r in doc["results"]}
         self.assertEqual(ccs, {"gcc -O2", "gcc -O3"})
+        self.assertEqual({r["target"] for r in doc["results"]},
+                         {"cc#1", "cc#2"})
         self.assertEqual(len(doc["results"]), 4)
 
 
@@ -2415,8 +2799,9 @@ rt:
 
     def test_delta_row_closes_each_pair(self):
         funcs = asmdiff.extract_functions(self.PAIR_ASM)
-        lines = asmdiff.summary_table([("old_rt", "new_rt")],
-                                      funcs).splitlines()
+        lines = asmdiff.summary_table(
+            [asmdiff.Block("gcc -O2", funcs,
+                           [("old_rt", "new_rt")])]).splitlines()
         self.assertRegex(lines[1],
                          r"old_rt\s+baseline\s+6\s+\.L2:4\s+exp2f")
         self.assertRegex(lines[2], r"new_rt\s+candidate\s+2\s+-\s+ldexpf")
@@ -2425,15 +2810,17 @@ rt:
 
     def test_unchanged_pair_reads_zero_and_dashes(self):
         funcs = {"old_a": ["ret"], "new_a": ["ret"]}
-        lines = asmdiff.summary_table([("old_a", "new_a")],
-                                      funcs).splitlines()
+        lines = asmdiff.summary_table(
+            [asmdiff.Block("gcc -O2", funcs,
+                           [("old_a", "new_a")])]).splitlines()
         self.assertRegex(lines[3], r"^\s+delta\s+0\s+-\s+-$")
 
     def test_span_cell_pairs_positions(self):
         funcs = {"old_l": [".L2:", "addl\t$1, %eax", "jne\t.L2"],
                  "new_l": [".L7:", "jne\t.L7"]}
-        lines = asmdiff.summary_table([("old_l", "new_l")],
-                                      funcs).splitlines()
+        lines = asmdiff.summary_table(
+            [asmdiff.Block("gcc -O2", funcs,
+                           [("old_l", "new_l")])]).splitlines()
         self.assertRegex(lines[3], r"delta\s+-1\s+2 -> 1\s+-$")
 
     def test_fail_on_growth_names_the_offender(self):
@@ -2620,7 +3007,8 @@ class TestSpanStats(unittest.TestCase):
         self.assertEqual(asmdiff.loop_spans(self.LINES), [(".L2", 5)])
 
     def test_table_counts_the_mix(self):
-        out = asmdiff.span_stats_table(["f"], {"f": self.LINES})
+        out = asmdiff.span_stats_table(
+            [asmdiff.Block("gcc -O2", {"f": self.LINES}, ["f"])])
         lines = out.splitlines()
         self.assertRegex(lines[0],
                          r"function\s+span\s+depth\s+insns\s+load\s+store"
@@ -2631,12 +3019,14 @@ class TestSpanStats(unittest.TestCase):
     def test_table_reports_nesting_depth(self):
         lines = [".L1:", "movl\t$0, %ecx", ".L2:", "addl\t$1, %ecx",
                  "jne\t.L2", "jnz\t.L1"]
-        out = asmdiff.span_stats_table(["f"], {"f": lines}).splitlines()
+        out = asmdiff.span_stats_table(
+            [asmdiff.Block("gcc -O2", {"f": lines}, ["f"])]).splitlines()
         self.assertRegex(out[1], r"f\s+\.L1\s+0\s+")
         self.assertRegex(out[2], r"f\s+\.L2\s+1\s+")
 
     def test_no_spans_prints_note(self):
-        out = asmdiff.span_stats_table(["g"], {"g": ["ret"]})
+        out = asmdiff.span_stats_table(
+            [asmdiff.Block("gcc -O2", {"g": ["ret"]}, ["g"])])
         self.assertIn("no loop spans", out)
 
     def test_main_wires_flag_in_inspect_mode(self):
@@ -2779,18 +3169,21 @@ class TestCostColumn(unittest.TestCase):
                                    asmdiff.cost_mix(self.BASE))
         self.assertEqual(asmdiff.format_cost_delta(delta), "-")
 
+    def _blocks(self, funcs, sel, profile=None):
+        return [asmdiff.Block("gcc -O2", funcs, sel, profile)]
+
     def test_summary_table_header_unchanged_without_the_flag(self):
         funcs = {"old_a": self.BASE, "new_a": self.CAND}
-        header = asmdiff.summary_table([("old_a", "new_a")],
-                                       funcs).splitlines()[0]
+        header = asmdiff.summary_table(
+            self._blocks(funcs, [("old_a", "new_a")])).splitlines()[0]
         self.assertRegex(header,
                          r"^function\s+role\s+insns\s+loop spans\s+calls$")
 
     def test_summary_table_gains_the_column_with_the_flag(self):
         asmdiff.COST = True
         funcs = {"old_a": self.BASE, "new_a": self.CAND}
-        lines = asmdiff.summary_table([("old_a", "new_a")],
-                                      funcs).splitlines()
+        lines = asmdiff.summary_table(
+            self._blocks(funcs, [("old_a", "new_a")])).splitlines()
         self.assertRegex(lines[0],
                          r"^function\s+role\s+insns\s+loop spans\s+"
                          r"cost\s+calls$")
@@ -2816,12 +3209,32 @@ class TestCostColumn(unittest.TestCase):
     def test_inspect_and_file_tables_gain_the_column(self):
         asmdiff.COST = True
         funcs = {"f": self.CAND}
-        for table in (asmdiff.inspect_table(["f"], funcs),
-                      asmdiff.file_summary_table(funcs)):
+        for table in (asmdiff.inspect_table(self._blocks(funcs, ["f"])),
+                      asmdiff.file_summary_table(self._blocks(funcs, None))):
             self.assertRegex(table.splitlines()[0],
                              r"^function\s+insns\s+loop spans\s+cost"
                              r"\s+calls$")
             self.assertRegex(table.splitlines()[1], r"f\s+2\s+-\s+ld 1 br 1")
+
+    def test_each_row_is_priced_by_its_own_profile(self):
+        asmdiff.COST = True
+        funcs = {"f": self.BASE}
+        lines = asmdiff.inspect_table(
+            [asmdiff.Block("bench", funcs, ["f"], self.PROFILE),
+             asmdiff.Block("plain", funcs, ["f"])]).splitlines()
+        self.assertIn("score", lines[1])         # priced by [costs.bench]
+        self.assertNotIn("score", lines[2])      # the other row stays ordinal
+
+    def test_footer_names_each_distinct_profile_once(self):
+        asmdiff.COST = True
+        funcs = {"f": self.BASE}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.table_footer(
+                [asmdiff.Block("a", funcs, ["f"], self.PROFILE),
+                 asmdiff.Block("b", funcs, ["f"], self.PROFILE),
+                 asmdiff.Block("c", funcs, ["f"])])
+        self.assertEqual(out.getvalue().count("costs: bench"), 1)
 
 
 class TestCostProfiles(unittest.TestCase):
@@ -3088,6 +3501,17 @@ class TestSummaryOnly(unittest.TestCase):
                             None, "od")
         self.assertIn("render_lut", out)     # stats row
         self.assertNotIn("render_lut:", out)  # no listing header
+
+    def test_output_is_the_legend_and_the_table(self):
+        matrix = asmdiff.build_matrix(["gcc -O2", "clang -O2"], [],
+                                      None, None)
+        out = self._capture(asmdiff.run_pairs, "h.c", matrix, [], [], "/tmp")
+        lines = [line for line in out.splitlines() if line.strip()]
+        self.assertEqual(lines[:2], ["cc#1: gcc -O2", "cc#2: clang -O2"])
+        self.assertRegex(lines[2], r"^target\s+function\s+role")
+        # header plus one pair - baseline, candidate, delta - per row,
+        # and nothing else: no listings, no group headers.
+        self.assertEqual(len(lines), 2 + 1 + 6)
 
     def test_main_wires_the_flag(self):
         asmdiff.SUMMARY_ONLY = False

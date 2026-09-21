@@ -8,7 +8,9 @@
 #
 # Each [table] is a target usable as `-t/--target NAME`; the optional
 # top-level `default` names the target(s) used when no --cc/--target
-# is given (a list runs several: default = ["gcc", "clang"]).
+# is given.  It takes whatever -t takes: a target name, a [groups]
+# name, a comma list, a glob, or an array mixing them
+# (default = ["native", "esp32s3"]).
 # [groups] names a matrix of those tables for one `-t GROUP` (comma
 # lists and globs also work: `-t esp32c3,esp32s3`, `-t 'esp32c*'`).
 # Compile at the flags your project ships with — that is the whole

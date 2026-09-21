@@ -17,12 +17,13 @@ Usage:
                              [--filter REGEX] [--summary-only]
                              [--collapse] [--span-stats] [--cost]
                              [--costs NAME] [--fail-on-growth]
-                             [--json] [--layout list|side-by-side] [-v]
+                             [--json] [--width N]
+                             [--layout list|side-by-side] [-v]
                              [-- EXTRA_FLAGS...]
     tools/asmdiff/asmdiff.py FIRMWARE.elf [FUNC...] [--filter REGEX]
                              [--objdump PATH] [--layout list]
                              [--summary-only] [--span-stats] [--cost]
-                             [--costs NAME] [--json]
+                             [--costs NAME] [--json] [--width N]
     tools/asmdiff/asmdiff.py --edit-config | --example-config
                              | --list-targets | --completion SHELL
                              | --install-completion [SHELL] | --version
@@ -59,9 +60,34 @@ Four modes, plus the no-flag whole-file summary:
   (neither)       whole-file summary: per-function counts plus a file
                   total, for one file or side by side for two.
 
+Every compile mode prints the same three parts in this order: a legend
+naming each matrix row ("label: resolved command", once per run), one
+stats table for the whole matrix, which leads with a `target` column
+of those labels once more than one row reaches it, and the listings,
+grouped per row under "== LABEL ==".  The label is the config target a
+row came from, or cc#N for a --cc row in a matrix of several; a lone
+--cc row is its own label, and then neither the legend nor the
+`target` column appears.  Two source files add a `file` column after
+`target`; ELF input has no matrix rows, hence neither column.
+
+A row whose compile fails is dropped rather than ending the run: the
+rest of the matrix still renders, the recorded compiler output goes to
+stderr after everything else, and the run returns 1.  A compiler
+missing from PATH is skipped with a warning at matrix time, and only
+an empty matrix is an error.
+
+Tables and listings are rendered to a column budget: --width N, else
+the terminal, else $COLUMNS, else 120; --width 0 is unlimited, which
+leaves the callee column untrimmed for a script to grep.
+
+Exit status: 0 printed what was asked for (differing assembly is the
+expected result), 1 the tool failed (compile error, unknown --pair
+name, no usable compiler), 2 argparse's usage error, 3
+--fail-on-growth found a grown candidate.
+
 Five flags shape the output: --summary-only prints only the stats
 tables, --collapse elides identical runs in side-by-side listings
-keeping context around each difference, --span-stats follows each
+keeping context around each difference, --span-stats follows the
 stats table with a per-loop-span instruction mix (nesting depth and
 load/store/mul/div/branch/other counts; branch includes calls), --cost
 adds a column saying what each function is made of (the same six
@@ -124,6 +150,7 @@ compile a cross project's source without inheriting cross-only defines,
 -specs, or a libc-overlay include directory.
 """
 import argparse
+import collections
 import difflib
 import fnmatch
 import glob
@@ -168,7 +195,9 @@ EXAMPLE_CONFIG = """\
 #
 # Each [table] is a target usable as `-t/--target NAME`; the optional
 # top-level `default` names the target(s) used when no --cc/--target
-# is given (a list runs several: default = ["gcc", "clang"]).
+# is given.  It takes whatever -t takes: a target name, a [groups]
+# name, a comma list, a glob, or an array mixing them
+# (default = ["native", "esp32s3"]).
 # [groups] names a matrix of those tables for one `-t GROUP` (comma
 # lists and globs also work: `-t esp32c3,esp32s3`, `-t 'esp32c*'`).
 # Compile at the flags your project ships with — that is the whole
@@ -350,14 +379,20 @@ class Target(str):
 
     ``costs`` is the resolved cost profile this target's
     ``costs = "NAME"`` (or --costs) names, since what an instruction
-    costs is a property of the target that runs it."""
+    costs is a property of the target that runs it.
+
+    ``label`` is how the row is named everywhere it is reported: the
+    legend, the table's target column, the listing headers, a failure
+    message.  build_matrix fills it in (see row_label); None means the
+    row has not been through it."""
 
     def __new__(cls, cmd, compile_commands=None, db_discovered=False,
-                costs=None):
+                costs=None, label=None):
         self = super().__new__(cls, cmd)
         self.compile_commands = compile_commands
         self.db_discovered = db_discovered
         self.costs = costs
+        self.label = label
         return self
 
 
@@ -1228,20 +1263,55 @@ def cost_record(mix, profile=None):
     return rec
 
 
-def span_stats_table(fn_names, funcs, max_width=None):
-    """Per-span instruction mix for the named functions.
+# One matrix row's contribution to a table: the label it is reported
+# under, the functions it compiled, what to report from them (the
+# pairs, the function names, or the file tag of a two-file summary),
+# and the cost profile pricing its instructions.  A run renders one
+# table for the whole matrix, so the builders see every row at once and
+# whatever differs per row has to travel with it.
+Block = collections.namedtuple("Block", "label funcs sel profile",
+                               defaults=(None, None))
+
+
+def block_names(block):
+    """The functions a block reports, in order and without repeats: a
+    pair list's members, the inspected names as given, or - when the
+    selection is a file tag or nothing - everything the block holds."""
+    if not isinstance(block.sel, list):
+        return list(block.funcs)
+    names = []
+    for item in block.sel:
+        for name in ((item,) if isinstance(item, str) else item):
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def target_column(blocks):
+    """("target",) when several matrix rows share one table, ()
+    otherwise: with a single row the legend (or the lone --cc command)
+    already says whose numbers these are, and a column repeating it on
+    every line would push the calls off the screen for nothing."""
+    return ("target",) if len({b.label for b in blocks}) > 1 else ()
+
+
+def span_stats_table(blocks, max_width=None):
+    """Per-span instruction mix for every function the run reports.
 
     One row per loop span: its nesting depth, and how many of its
     instructions load, store, multiply, divide, or branch.  This weighs
     the span the way the doctrine asks — the hand-written awk this
     replaces kept counting past the loop end into the epilogue.
     """
-    rows = [("function", "span", "depth", "insns") + _MIX_KEYS]
-    for name in fn_names:
-        for mix in span_mix(funcs[name]):
-            rows.append((name, mix["label"], str(mix["depth"]),
-                         str(mix["insns"]))
-                        + tuple(str(mix[k]) for k in _MIX_KEYS))
+    lead = target_column(blocks)
+    rows = [lead + ("function", "span", "depth", "insns") + _MIX_KEYS]
+    for block in blocks:
+        head = (block.label,) if lead else ()
+        for name in block_names(block):
+            for mix in span_mix(block.funcs[name]):
+                rows.append(head + (name, mix["label"], str(mix["depth"]),
+                                    str(mix["insns"]))
+                            + tuple(str(mix[k]) for k in _MIX_KEYS))
     if len(rows) == 1:
         return "(no loop spans)"
     return render_table(rows, max_width)
@@ -1655,9 +1725,15 @@ def list_targets(config, config_path):
 def target_command(config, name, config_path, want_db=True):
     """Resolve a named [target] table to one 'CC FLAGS' matrix entry.
 
-    want_db=False skips the compile_commands lookup (including the
-    discovery walk a `compile_commands = true` entry asks for) - ELF
-    mode resolves targets only to find their toolchain.
+    A `compile_commands = true` entry asks for the discovery walk, and
+    tolerates a miss: finding no database leaves the target with none
+    after a note on stderr, since the config says where the target is
+    usually compiled, not what this run must have.  A path that does
+    not resolve stays an error, and so does a bare --compile-commands
+    that finds nothing (build_matrix's call, not this one).
+
+    want_db=False skips the lookup and the walk entirely - ELF mode
+    resolves targets only to find their toolchain.
     """
     entry = (config or {}).get(name)
     if not isinstance(entry, dict) or name in CONFIG_META_KEYS:
@@ -1696,14 +1772,47 @@ def target_command(config, name, config_path, want_db=True):
                   costs)
 
 
+def row_label(row, index, total):
+    """How one matrix row is named in the output: the config target it
+    came from, else its position in the matrix (``cc#N``).
+
+    A lone unnamed row keeps its whole command as its label: with
+    nothing to tell it apart from, a position number would only stand
+    between the reader and the compiler that produced the table.
+    """
+    label = getattr(row, "label", None)
+    if label is not None:
+        return label
+    return f"cc#{index}" if total > 1 else str(row)
+
+
+def matrix_labels(rows):
+    """Labels for a whole matrix, in row order.  Rows that never went
+    through build_matrix - a bare command string from a caller or a
+    test - are labelled here instead."""
+    return [row_label(row, n, len(rows)) for n, row in enumerate(rows, 1)]
+
+
+def _named(target, name):
+    """Label a matrix row with the config target name it came from."""
+    target.label = name
+    return target
+
+
 def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
                  want_db=True, costs_arg=None):
     """Resolve the compiler matrix.
 
     --cc strings verbatim, then --target entries (comma-lists, groups,
     and globs expanded), in that order.  With neither, the config's
-    `default` (a target name or list of names); with no config or no
-    default, plain gcc/clang at -O3.
+    `default`, which goes through the same expansion as -t: a target
+    name, a [groups] name, a comma list, a glob, or an array mixing
+    those, and a name it cannot resolve is the error -t would give.
+    With no config or no default, plain gcc/clang at -O3.
+
+    Every row comes back as a Target carrying the label it is reported
+    under, so the legend, the tables, and the listings all name the
+    same thing (see row_label).
 
     ``db_arg`` is the --compile-commands value: a PATH applies that
     database to every entry, True discovers one near the CWD.  A target
@@ -1712,8 +1821,9 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
     ``costs_arg`` is --costs: one profile for every entry, overriding
     what a target named, which is how a --cc row gets one at all.
     """
-    entries = list(cc_args)
-    entries += [target_command(config, name, config_path, want_db)
+    entries = [Target(cc) for cc in cc_args]
+    entries += [_named(target_command(config, name, config_path, want_db),
+                       name)
                 for name in expand_target_args(target_args, config,
                                                config_path)]
     if not entries:
@@ -1730,11 +1840,13 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
                          "such names")
             # Same expansion as -t, so a group, a comma list or a glob
             # names the standing matrix as readily as a single target.
-            entries = [target_command(config, name, config_path, want_db)
+            entries = [_named(target_command(config, name, config_path,
+                                             want_db), name)
                        for name in expand_target_args(tokens, config,
                                                       config_path)]
         else:
-            entries = [f"{cc} {FALLBACK_FLAGS}" for cc in DEFAULT_COMPILERS]
+            entries = [Target(f"{cc} {FALLBACK_FLAGS}")
+                       for cc in DEFAULT_COMPILERS]
     if db_arg is not None:
         if db_arg is True:
             db, discovered = _discovered_db("--compile-commands",
@@ -1744,13 +1856,18 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
             discovered = False
         entries = [e if getattr(e, "compile_commands", None) is not None
                    else Target(e, db, discovered,
-                               getattr(e, "costs", None))
+                               getattr(e, "costs", None),
+                               getattr(e, "label", None))
                    for e in entries]
     if costs_arg is not None:
         profile = load_costs(config, costs_arg, config_path)
         entries = [Target(e, getattr(e, "compile_commands", None),
-                          getattr(e, "db_discovered", False), profile)
+                          getattr(e, "db_discovered", False), profile,
+                          getattr(e, "label", None))
                    for e in entries]
+    for n, entry in enumerate(entries, start=1):
+        if entry.label is None:
+            entry.label = row_label(entry, n, len(entries))
     announce_glob_choices()
     return entries
 
@@ -1761,7 +1878,7 @@ VERBOSE = False
 # tables are the decision input; a listing is pulled on a second run
 # when a delta needs explaining.
 SUMMARY_ONLY = False
-# --span-stats: follow each stats table with the per-loop-span
+# --span-stats: follow the stats table with the per-loop-span
 # instruction mix (see span_stats_table).
 SPAN_STATS = False
 # --json: collect summary records here instead of printing tables;
@@ -1807,22 +1924,60 @@ def use_cost_profile(cc_cmd):
         COST_PROFILE = getattr(cc_cmd, "costs", None)
 
 
-def table_footer(fn_names, funcs):
-    """What follows a stats table: the profile that priced its scores,
-    then the --span-stats mix table.  Both are silent no-ops when
-    their flag is off or --json holds the output."""
+def print_legend(rows):
+    """"label: command" for every matrix row, once per run.
+
+    A single unnamed row is its own label, so there is nothing to look
+    up and nothing is printed; anything else - several rows, or a row a
+    config target named - gets the legend, and the tables and listings
+    below it say only the label.
+    """
+    labels = matrix_labels(rows)
+    if len(rows) < 2 and all(label == str(row)
+                             for label, row in zip(labels, rows)):
+        return
+    skipped = {miss.split(":", 1)[0] for miss in _SKIPPED_CCS}
+    failed = {label for label, _ in _FAILURES}
+    print()
+    for label, row in zip(labels, rows):
+        # The legend prints after the compile phase, so a row that
+        # produced nothing can say why where the reader looks it up.
+        if shlex.split(row)[0] in skipped:
+            note = " (not found on PATH, skipped)"
+        elif label in failed:
+            note = " (compile failed, see stderr)"
+        else:
+            note = ""
+        print(f"{label}: {row}{note}")
+
+
+def table_footer(blocks):
+    """What follows the run's stats table: the profiles that priced its
+    scores, then the --span-stats mix table.  Both are silent no-ops
+    when their flag is off or --json holds the output.
+
+    One line per distinct profile, not per row: a matrix of four
+    targets sharing one measured profile has one thing to say about
+    where its numbers come from.
+    """
     if JSON_OUT is not None:
         return
-    if COST and COST_PROFILE is not None:
-        print(format_provenance(COST_PROFILE))
+    if COST:
+        seen = []
+        for block in blocks:
+            if block.profile is not None and block.profile["name"] not in seen:
+                seen.append(block.profile["name"])
+                print(format_provenance(block.profile))
     if SPAN_STATS:
         print()
-        print(span_stats_table(fn_names, funcs, table_width()))
+        print(span_stats_table(blocks, table_width()))
 
 
-def json_record(name, lines, cc=None, tag=None, role=None, baseline=None):
-    """One --json result: a summary-table row as data.  cc is the
-    resolved compiler command, tag the source/side label of a two-file
+def json_record(name, lines, cc=None, tag=None, role=None, baseline=None,
+                target=None):
+    """One --json result: a summary-table row as data.  target is the
+    matrix row's label (the table's target column), cc the resolved
+    compiler command, tag the source/side label of a two-file
     comparison, role baseline/candidate for paired rows, baseline the
     paired baseline's lines, which adds the candidate's delta object;
     each is omitted where the mode has no such notion.  Spans, depths,
@@ -1831,6 +1986,8 @@ def json_record(name, lines, cc=None, tag=None, role=None, baseline=None):
     ranges = loop_span_ranges(lines)
     mix = cost_mix(lines, ranges) if COST else None
     rec = {"function": name}
+    if target is not None:
+        rec["target"] = target
     if cc is not None:
         rec["cc"] = str(cc)
     if tag is not None:
@@ -1870,22 +2027,47 @@ def _skipped_suffix():
     return f" ({'; '.join(_SKIPPED_CCS)})" if _SKIPPED_CCS else ""
 
 
-def _compile_failure(cmd, stderr):
-    """Exit for a failed compile.
+# Compile failures recorded during a run, as (label, message).  A row
+# that fails to compile no longer ends the run: the rows that did
+# compile still answer the question that was asked, so their tables
+# print first and the messages wait for report_failures.
+_FAILURES = []
+
+
+def _compile_failure(cmd, stderr, label=None):
+    """Record a failed compile; the caller drops that row and goes on.
 
     A borrowed-flags command runs to hundreds of tokens and a broken
     header environment produces pages of stderr; dumping both buries the
     actual error.  Default: compiler + source + the first stderr lines.
-    --verbose restores the complete command and output.
+    --verbose restores the complete command and output.  ``label`` names
+    the matrix row when the matrix has more than one thing to blame.
     """
+    where = f"[{label}] " if label else ""
     if VERBOSE:
-        sys.exit(f"error: compile failed: {shlex.join(cmd)}\n{stderr}")
+        _FAILURES.append((label, f"error: {where}compile failed: "
+                                 f"{shlex.join(cmd)}\n{stderr}"))
+        return None
     lines = stderr.splitlines()
     shown = "\n".join(lines[:MAX_STDERR_LINES])
     dropped = len(lines) - MAX_STDERR_LINES
     more = f"\n... {dropped} more stderr lines" if dropped > 0 else ""
-    sys.exit(f"error: {cmd[0]} failed on {cmd[-1]}\n{shown}{more}\n"
-             "(re-run with --verbose for the full command and output)")
+    _FAILURES.append((label, f"error: {where}{cmd[0]} failed on {cmd[-1]}\n"
+                             f"{shown}{more}\n(re-run with --verbose for "
+                             "the full command and output)"))
+    return None
+
+
+def report_failures():
+    """Print every recorded compile failure on stderr; True if there
+    were any, which the run turns into exit status 1.
+
+    They come last, after the tables: what did compile is the answer
+    the caller asked for, and a row that broke should not push it off
+    the screen."""
+    for _, message in _FAILURES:
+        print(message, file=sys.stderr)
+    return bool(_FAILURES)
 
 
 def asm_output_name(cc_cmd, harness):
@@ -1906,8 +2088,9 @@ def compile_to_asm(cc_cmd, extra_flags, harness, out_dir):
 
     If the matrix entry names a compile_commands.json, this source's
     include/define flags from that database are inserted before any bare-``--``
-    flags.  Returns None (with a warning) if the compiler is not on PATH.
-    Exits with the compiler's stderr on a compile failure.
+    flags.  Returns None if the compiler is not on PATH (with a warning)
+    or the compile failed (with the error recorded for report_failures);
+    either way the caller drops the row and reports the rest.
     """
     argv = shlex.split(cc_cmd)
     if shutil.which(argv[0]) is None:
@@ -1927,7 +2110,12 @@ def compile_to_asm(cc_cmd, extra_flags, harness, out_dir):
            + ["-S", "-o", str(out_s), str(harness)])
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        _compile_failure(cmd, proc.stderr)
+        # A lone --cc row is labelled with its own command; naming it in
+        # front of a message that already quotes the compiler would only
+        # make today's single-row error longer.
+        label = getattr(cc_cmd, "label", None)
+        return _compile_failure(cmd, proc.stderr,
+                                label if label != str(cc_cmd) else None)
     return out_s.read_text()
 
 
@@ -1972,9 +2160,18 @@ COLLAPSE_CONTEXT = 3
 # --collapse: elide identical runs in side-by-side listings.
 COLLAPSE = False
 
+# A trailing assembler comment (" # TAILCALL", " # 8-byte Reload",
+# " # sp + 16") is the compiler talking, not an instruction, and it
+# costs columns the operands need at half a terminal's width.  The
+# space after the hash is what tells it from an ARM "#4" immediate.
+TRAILING_COMMENT = re.compile(r"\s+#\s.*$")
+
 
 def side_by_side(left, right, ltitle, rtitle, width=44, collapse=False):
     """Two-column view of a pair's asm lines.
+
+    Trailing assembler comments are dropped here only: the single
+    column listings and --json keep the line as it was extracted.
 
     With collapse, runs of identical line pairs shrink to the
     COLLAPSE_CONTEXT pairs around each difference plus an elision
@@ -1982,10 +2179,17 @@ def side_by_side(left, right, ltitle, rtitle, width=44, collapse=False):
     instructions render as a few hunks instead of ~1000 lines.  The
     sides are aligned first (difflib), not paired by position: an
     inserted instruction gets a gap opposite it instead of desyncing
-    every following pair.
+    every following pair.  Two sides that are equal collapse to their
+    header: there is no reading to do, and the table above has the
+    counts.
     """
+    identical = collapse and left == right
+    if identical:
+        ltitle += " (identical)"
     rows = [f"{ltitle:<{width}} | {rtitle}",
             f"{'-' * width}-+-{'-' * width}"]
+    if identical:
+        return "\n".join(rows)
     if collapse:
         pairs = []
         matcher = difflib.SequenceMatcher(a=left, b=right, autojunk=False)
@@ -2008,8 +2212,8 @@ def side_by_side(left, right, ltitle, rtitle, width=44, collapse=False):
         if elided:
             rows.append(f"    ... {elided} identical lines ...")
             elided = 0
-        l = l.expandtabs(8)[:width]
-        r = r.expandtabs(8)[:width]
+        l = TRAILING_COMMENT.sub("", l.expandtabs(8))[:width]
+        r = TRAILING_COMMENT.sub("", r.expandtabs(8))[:width]
         rows.append(f"{l:<{width}} | {r}")
     if elided:
         rows.append(f"    ... {elided} identical lines ...")
@@ -2044,17 +2248,13 @@ def _fit_calls(cell, budget):
     return items[0] + ", " + summary
 
 
-def render_table(rows, max_width=None, min_widths=None):
+def render_table(rows, max_width=None):
     """Column-aligned text for a list of equal-length string tuples.
 
     max_width (terminal columns) keeps each row on one line by
     trimming the last column's cells (see _fit_calls); the other
-    columns are never touched. None renders untrimmed.  min_widths
-    (per column, see column_widths) lets several tables share one
-    layout: a two-file summary aligns its columns across both."""
+    columns are never touched. None renders untrimmed."""
     widths = column_widths(rows)
-    if min_widths is not None:
-        widths = [max(w, m) for w, m in zip(widths, min_widths)]
     if max_width is not None:
         fixed = widths[:-1]
         budget = max_width - sum(fixed) - 2 * len(fixed)
@@ -2071,14 +2271,72 @@ def column_widths(*row_sets):
     return [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
 
 
+# --width: the column budget the user asked for, 0 meaning unlimited.
+# None leaves the decision to table_width().
+WIDTH = None
+# What a table falls back to off a terminal.  Wide enough for a matrix
+# row with a few callees, narrow enough to paste into a report or an
+# issue without it rewrapping.
+DEFAULT_WIDTH = 120
+# One side of a side-by-side listing never narrows past this: an asm
+# line with a label and two operands still fits.
+MIN_LISTING_WIDTH = 44
+
+
+def width_arg(value):
+    """argparse type for --width: 0 or a positive column budget.
+
+    A negative budget would reach the renderers as a width every
+    column overflows, which reads as a broken table rather than as a
+    rejected argument."""
+    try:
+        width = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid int value: %r" % value)
+    if width < 0:
+        raise argparse.ArgumentTypeError(
+            "must be 0 (unlimited) or a positive column count, not %d"
+            % width)
+    return width
+
+
 def table_width():
-    """Width budget for summary tables: the terminal width when stdout
-    is a tty, else None so piped output keeps every callee greppable."""
-    return shutil.get_terminal_size().columns if sys.stdout.isatty() else None
+    """Column budget for tables and listings.
+
+    --width wins; then the terminal when stdout is a tty; then
+    $COLUMNS, which is how a caller driving a pipe says how wide its
+    reader is; else DEFAULT_WIDTH.  None means unlimited, which keeps
+    every callee greppable at whatever width the row ends up."""
+    if WIDTH is not None:
+        return WIDTH or None
+    if sys.stdout.isatty():
+        return shutil.get_terminal_size().columns
+    columns = os.environ.get("COLUMNS", "")
+    return int(columns) if columns.isdigit() and int(columns) else DEFAULT_WIDTH
+
+
+def listing_width():
+    """Width of one column of a side-by-side listing: half the table
+    budget, less the " | " between the sides."""
+    total = table_width()
+    if total is None:
+        return MIN_LISTING_WIDTH
+    return max(MIN_LISTING_WIDTH, (total - 3) // 2)
+
+
+# Past a handful of spans the column stops being readable and the
+# count is all that is left to say; --json keeps every span.
+MAX_SPANS_SHOWN = 6
 
 
 def format_spans(spans):
-    return " ".join(f"{label}:{n}" for label, n in spans) or "-"
+    """Space-joined "label:insns" per span, capped with a "+N more"
+    tail so one dispatch function cannot widen the whole table."""
+    shown = " ".join(f"{label}:{n}"
+                     for label, n in spans[:MAX_SPANS_SHOWN])
+    if len(spans) > MAX_SPANS_SHOWN:
+        shown += f" +{len(spans) - MAX_SPANS_SHOWN} more"
+    return shown or "-"
 
 
 # Real firmware dispatch functions call dozens of distinct symbols; an
@@ -2219,67 +2477,80 @@ def format_cost_delta(delta):
     return _fit_cost(parts) if parts else "-"
 
 
-def summary_table(pairs, funcs, max_width=None):
+def summary_table(blocks, max_width=None):
     """Instruction counts, loop spans, and outbound calls per pair
-    member, and a delta row closing each pair. Calls come last: the one
-    unbounded column stays ragged right so the counts and spans keep
-    their alignment."""
-    rows = [("function", "role", "insns", "loop spans")
+    member, and a delta row closing each pair, for the whole matrix in
+    one table.  Calls come last: the one unbounded column stays ragged
+    right so the counts and spans keep their alignment."""
+    lead = target_column(blocks)
+    rows = [lead + ("function", "role", "insns", "loop spans")
             + (("cost",) if COST else ()) + ("calls",)]
-    for old, new in pairs:
-        mixes = {}
-        for name, role in ((old, "baseline"), (new, "candidate")):
-            insns, calls = analyze(funcs[name])
-            row = (name, role, str(insns),
-                   format_spans(loop_spans(funcs[name])))
+    for block in blocks:
+        # The target cell repeats on every row of a block rather than
+        # dittoing: one grep for a target name catches all of its rows.
+        head = (block.label,) if lead else ()
+        funcs = block.funcs
+        for old, new in block.sel:
+            mixes = {}
+            for name, role in ((old, "baseline"), (new, "candidate")):
+                insns, calls = analyze(funcs[name])
+                row = (name, role, str(insns),
+                       format_spans(loop_spans(funcs[name])))
+                if COST:
+                    mixes[name] = cost_mix(funcs[name])
+                    row += (format_cost(mixes[name], block.profile),)
+                rows.append(head + row + (format_calls(calls),))
+            delta = pair_delta(funcs[old], funcs[new])
+            row = ("", "delta", format_delta_insns(delta["insns"]),
+                   format_delta_spans(loop_spans(funcs[old]),
+                                      loop_spans(funcs[new])))
             if COST:
-                mixes[name] = cost_mix(funcs[name])
-                row += (format_cost(mixes[name], COST_PROFILE),)
-            rows.append(row + (format_calls(calls),))
-        delta = pair_delta(funcs[old], funcs[new])
-        row = ("", "delta", format_delta_insns(delta["insns"]),
-               format_delta_spans(loop_spans(funcs[old]),
-                                  loop_spans(funcs[new])))
-        if COST:
-            row += (format_cost_delta(cost_delta(mixes[old], mixes[new],
-                                                 COST_PROFILE)),)
-        rows.append(row + (format_delta_calls(delta),))
+                row += (format_cost_delta(cost_delta(mixes[old], mixes[new],
+                                                     block.profile)),)
+            rows.append(head + row + (format_delta_calls(delta),))
     return render_table(rows, max_width)
 
 
-def file_summary_table(funcs, max_width=None, min_widths=None):
-    """Per-function counts plus a whole-file total row.
+def file_summary_table(blocks, max_width=None):
+    """Per-function counts plus a whole-file total row, for every
+    matrix row (and, comparing two files, every file) in one table.
 
     The total sums instruction counts over every function parsed from
     the -S output and unions their outbound calls — a coarse A/B sanity
     check, not a code-size measurement (literal pools, data, and
-    alignment are not included).
+    alignment are not included).  A block that selected nothing keeps
+    its line: which target and file came back empty is a finding.
     """
-    return render_table(file_summary_rows(funcs), max_width, min_widths)
-
-
-def file_summary_rows(funcs):
-    """The rows behind file_summary_table, header first."""
-    rows = [("function", "insns", "loop spans")
+    lead = target_column(blocks)
+    tagged = ("file",) if any(b.sel for b in blocks) else ()
+    rows = [lead + tagged + ("function", "insns", "loop spans")
             + (("cost",) if COST else ()) + ("calls",)]
-    total_insns, all_calls = 0, []
-    for name, lines in funcs.items():
-        insns, calls = analyze(lines)
-        total_insns += insns
-        for sym in calls:
-            if sym not in all_calls:
-                all_calls.append(sym)
-        row = (name, str(insns), format_spans(loop_spans(lines)))
+    for block in blocks:
+        head = ((block.label,) if lead else ()) + ((block.sel,) if tagged
+                                                   else ())
+        total_insns, all_calls = 0, []
+        for name, lines in block.funcs.items():
+            insns, calls = analyze(lines)
+            total_insns += insns
+            for sym in calls:
+                if sym not in all_calls:
+                    all_calls.append(sym)
+            row = (name, str(insns), format_spans(loop_spans(lines)))
+            if COST:
+                row += (format_cost(cost_mix(lines), block.profile),)
+            rows.append(head + row + (format_calls(calls),))
+        if not block.funcs:
+            rows.append(head + ("(none)", "-", "-")
+                        + (("-",) if COST else ()) + ("-",))
+            continue
+        total = (f"TOTAL ({len(block.funcs)} functions)",
+                 str(total_insns), "-")
         if COST:
-            row += (format_cost(cost_mix(lines), COST_PROFILE),)
-        rows.append(row + (format_calls(calls),))
-    total = (f"TOTAL ({len(funcs)} functions)", str(total_insns), "-")
-    if COST:
-        # A mix is per function; a file-wide sum of them would price
-        # nothing the rows do not already say.
-        total += ("-",)
-    rows.append(total + (format_calls(all_calls),))
-    return rows
+            # A mix is per function; a file-wide sum of them would price
+            # nothing the rows do not already say.
+            total += ("-",)
+        rows.append(head + total + (format_calls(all_calls),))
+    return render_table(rows, max_width)
 
 
 def listing(name, lines):
@@ -2290,17 +2561,22 @@ def listing(name, lines):
     return "\n".join([f"{name}:"] + body)
 
 
-def inspect_table(fn_names, funcs, max_width=None):
+def inspect_table(blocks, max_width=None):
     """Stats rows for the inspected functions only - no pair roles and
     no whole-file total, unlike summary_table/file_summary_table."""
-    rows = [("function", "insns", "loop spans")
+    lead = target_column(blocks)
+    rows = [lead + ("function", "insns", "loop spans")
             + (("cost",) if COST else ()) + ("calls",)]
-    for name in fn_names:
-        insns, calls = analyze(funcs[name])
-        row = (name, str(insns), format_spans(loop_spans(funcs[name])))
-        if COST:
-            row += (format_cost(cost_mix(funcs[name]), COST_PROFILE),)
-        rows.append(row + (format_calls(calls),))
+    for block in blocks:
+        head = (block.label,) if lead else ()
+        for name in block.sel:
+            insns, calls = analyze(block.funcs[name])
+            row = (name, str(insns),
+                   format_spans(loop_spans(block.funcs[name])))
+            if COST:
+                row += (format_cost(cost_mix(block.funcs[name]),
+                                    block.profile),)
+            rows.append(head + row + (format_calls(calls),))
     return render_table(rows, max_width)
 
 
@@ -2317,8 +2593,17 @@ def file_tags(a, b):
 
 
 def report_across(fn_names, left_funcs, right_funcs, left_tag, right_tag,
-                  ccs=(None, None)):
-    """Side-by-side + summary for the same functions from two compilations."""
+                  ccs=(None, None), labels=(None, None)):
+    """One two-sided comparison as a table block.
+
+    Checks that both sides hold every function, records the growth
+    check and the --json records, and decorates each pair member with
+    its side's tag so one table can carry both sides.  ``labels`` are
+    the matrix rows the sides came from: the same row twice when the
+    sides are two source files, two rows when they are two compilers -
+    which is also what names the block.  Returns None under --json,
+    where there is no table to build.
+    """
     missing = sorted({f for f in fn_names
                       if f not in left_funcs or f not in right_funcs})
     if missing:
@@ -2331,23 +2616,62 @@ def report_across(fn_names, left_funcs, right_funcs, left_tag, right_tag,
     if JSON_OUT is not None:
         for f in fn_names:
             JSON_OUT.append(json_record(f, left_funcs[f], cc=ccs[0],
-                                        tag=left_tag, role="baseline"))
+                                        tag=left_tag, role="baseline",
+                                        target=labels[0]))
             JSON_OUT.append(json_record(f, right_funcs[f], cc=ccs[1],
                                         tag=right_tag, role="candidate",
-                                        baseline=left_funcs[f]))
-        return
+                                        baseline=left_funcs[f],
+                                        target=labels[1]))
+        return None
     decorated, pairs = {}, []
     for f in fn_names:
         lt, rt = f"{f} [{left_tag}]", f"{f} [{right_tag}]"
         decorated[lt], decorated[rt] = left_funcs[f], right_funcs[f]
         pairs.append((lt, rt))
-    if not SUMMARY_ONLY:
-        for lt, rt in pairs:
-            print(side_by_side(decorated[lt], decorated[rt], lt, rt,
-                               collapse=COLLAPSE))
+    label = (labels[0] if labels[0] == labels[1]
+             else f"{labels[0]} vs {labels[1]}")
+    # The candidate's target is the one whose instruction set a score
+    # would belong to, so its profile prices the block.
+    return Block(label, decorated, pairs, getattr(ccs[1], "costs", None))
+
+
+def print_listings(blocks, headed):
+    """The side-by-side listings under each block, after the table.
+
+    ``headed`` prints a ``== LABEL ==`` line above each group, which is
+    what tells two targets' listings apart; a run with one group has
+    the legend and the table above it saying the same thing.
+    """
+    for block in blocks:
+        if headed:
+            print(f"\n== {block.label} ==")
+        for left, right in block.sel:
             print()
-    print(summary_table(pairs, decorated, table_width()))
-    table_footer([n for p in pairs for n in p], decorated)
+            print(side_by_side(block.funcs[left], block.funcs[right],
+                               left, right, width=listing_width(),
+                               collapse=COLLAPSE))
+
+
+def compile_matrix(matrix, sources, extra_flags, tmp):
+    """Phase one of every compile mode: every row, every source.
+
+    Returns (label, cc_cmd, [functions per source]) for each row that
+    produced assembly for all of its sources; a row whose compiler is
+    missing or whose compile failed is left out, and report_failures
+    has the reason.  Compiling the whole matrix before anything renders
+    is what lets one broken row keep the others' table.
+    """
+    collected = []
+    for label, cc_cmd in zip(matrix_labels(matrix), matrix):
+        sides = []
+        for src in sources:
+            asm = compile_to_asm(cc_cmd, extra_flags, src, tmp)
+            if asm is None:
+                break
+            sides.append(extract_functions(asm))
+        if len(sides) == len(sources):
+            collected.append((label, cc_cmd, sides))
+    return collected
 
 
 def run_across(sources, matrix, fn_names, extra_flags, tmp):
@@ -2357,48 +2681,41 @@ def run_across(sources, matrix, fn_names, extra_flags, tmp):
     compiler in the matrix.  One source file: compare FUNC between the
     first --cc entry (baseline) and each subsequent entry.
     """
+    collected = compile_matrix(matrix, sources, extra_flags, tmp)
+    blocks = []
     if len(sources) == 2:
-        ran_any = False
-        for cc_cmd in matrix:
-            sides = []
-            for src in sources:
-                asm = compile_to_asm(cc_cmd, extra_flags, src, tmp)
-                if asm is None:
-                    break
-                sides.append(extract_functions(asm))
-            if len(sides) < 2:
-                continue
-            ran_any = True
-            tags = mark_db_misses(cc_cmd, sources,
-                                  file_tags(sources[0], sources[1]))
-            if JSON_OUT is None:
-                print(f"\n== {cc_cmd} ==\n")
-            report_across(fn_names, sides[0], sides[1], *tags,
-                          ccs=(cc_cmd, cc_cmd))
-        if not ran_any:
+        if not collected:
+            report_failures()
             sys.exit("error: no usable compiler in the matrix"
                      + _skipped_suffix())
-        return 0
-
-    usable = []
-    for idx, cc_cmd in enumerate(matrix, start=1):
-        asm = compile_to_asm(cc_cmd, extra_flags, sources[0], tmp)
-        if asm is not None:
-            usable.append((f"cc#{idx}", cc_cmd, extract_functions(asm)))
-    if len(usable) < 2:
-        sys.exit("error: --across needs at least two usable compilers "
-                 "in the matrix" + _skipped_suffix())
+        for label, cc_cmd, sides in collected:
+            tags = mark_db_misses(cc_cmd, sources,
+                                  file_tags(sources[0], sources[1]))
+            blocks.append(report_across(fn_names, sides[0], sides[1], *tags,
+                                        ccs=(cc_cmd, cc_cmd),
+                                        labels=(label, label)))
+    else:
+        if len(collected) < 2:
+            report_failures()
+            sys.exit("error: --across needs at least two usable compilers "
+                     "in the matrix" + _skipped_suffix())
+        base_label, base_cc, base_sides = collected[0]
+        for label, cc_cmd, sides in collected[1:]:
+            blocks.append(report_across(fn_names, base_sides[0], sides[0],
+                                        base_label, label,
+                                        ccs=(base_cc, cc_cmd),
+                                        labels=(base_label, label)))
     if JSON_OUT is None:
+        blocks = [b for b in blocks if b is not None]
+        print_legend(matrix)
         print()
-        for tag, cc_cmd, _ in usable:
-            print(f"{tag}: {cc_cmd}")
-    base_tag, base_cc, base_funcs = usable[0]
-    for tag, cc_cmd, funcs in usable[1:]:
-        if JSON_OUT is None:
-            print(f"\n== {base_tag} vs {tag} ==\n")
-        report_across(fn_names, base_funcs, funcs, base_tag, tag,
-                      ccs=(base_cc, cc_cmd))
-    return 0
+        print(summary_table(blocks, table_width()))
+        table_footer(blocks)
+        if not SUMMARY_ONLY:
+            # One source: every block is a "A vs B" comparison and says
+            # which two rows it holds, so it keeps its header alone.
+            print_listings(blocks, len(blocks) > 1 or len(sources) == 1)
+    return 1 if report_failures() else 0
 
 
 def _compile_filter(filter_regex):
@@ -2410,62 +2727,50 @@ def _compile_filter(filter_regex):
 
 
 def run_summary(sources, matrix, extra_flags, tmp, filter_regex=None):
-    """No pairs to compare: whole-file summary, one block per file.
+    """No pairs to compare: the whole-file summary of every
+    compilation, one table with a file column when two files are given.
 
-    --filter narrows each file's table to matching functions - the
-    subsystem view of a big TU, same selection idea as ELF mode.
+    --filter narrows the table to matching functions - the subsystem
+    view of a big TU, same selection idea as ELF mode.
     """
     pattern = _compile_filter(filter_regex) if filter_regex else None
     tags = (file_tags(*sources) if len(sources) == 2
             else [Path(sources[0]).name])
-    ran_any = False
-    matched_any = False
-    for cc_cmd in matrix:
-        sections = []
-        for src in sources:
-            asm = compile_to_asm(cc_cmd, extra_flags, src, tmp)
-            if asm is None:
-                break
-            funcs = extract_functions(asm)
-            if pattern is not None:
-                funcs = {n: v for n, v in funcs.items() if pattern.search(n)}
-            sections.append(funcs)
-        if len(sections) < len(sources):
-            continue
-        ran_any = True
+    collected = compile_matrix(matrix, sources, extra_flags, tmp)
+    if not collected:
+        report_failures()
+        sys.exit("error: no usable compiler in the matrix"
+                 + _skipped_suffix())
+    blocks, matched_any = [], False
+    for label, cc_cmd, sections in collected:
+        if pattern is not None:
+            sections = [{n: v for n, v in funcs.items() if pattern.search(n)}
+                        for funcs in sections]
         use_cost_profile(cc_cmd)
         matched_any = matched_any or any(sections)
         shown = (mark_db_misses(cc_cmd, sources, tags)
                  if len(sources) == 2 else tags)
-        shared = None
-        if JSON_OUT is None:
-            print(f"\n== {cc_cmd} ==")
-            if len(sections) > 1 and all(sections):
-                # One layout for both files' tables, so a function's
-                # counts sit in the same column in each.
-                shared = column_widths(*map(file_summary_rows, sections))
         for tag, funcs in zip(shown, sections):
             if JSON_OUT is not None:
                 JSON_OUT.extend(
-                    json_record(name, lines, cc=cc_cmd,
+                    json_record(name, lines, cc=cc_cmd, target=label,
                                 tag=tag if len(sections) > 1 else None)
                     for name, lines in funcs.items())
                 continue
-            if len(sections) > 1:
-                print(f"\n-- {tag} --")
-            print()
-            print(file_summary_table(funcs, table_width(), shared) if funcs
-                  else ("(no functions match --filter)" if pattern is not None
-                        else "(no functions found)"))
-            if funcs:
-                table_footer(list(funcs), funcs)
-    if not ran_any:
-        sys.exit("error: no usable compiler in the matrix"
-                 + _skipped_suffix())
+            blocks.append(Block(label, funcs,
+                                tag if len(sections) > 1 else None,
+                                getattr(cc_cmd, "costs", None)))
     if pattern is not None and not matched_any:
+        report_failures()
         sys.exit(f"error: --filter {filter_regex!r} matched no function "
                  "in any compilation")
-    return 0
+    if JSON_OUT is None:
+        print_legend(matrix)
+        print()
+        print(file_summary_table(blocks, table_width())
+              if any(b.funcs for b in blocks) else "(no functions found)")
+        table_footer(blocks)
+    return 1 if report_failures() else 0
 
 
 def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
@@ -2474,14 +2779,15 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
     With no --pair and no old_X/new_X functions to auto-pair, falls
     back to the whole-file summary for this compilation.
     """
-    ran_any = False
-    for cc_cmd in matrix:
-        asm = compile_to_asm(cc_cmd, extra_flags, source, tmp)
-        if asm is None:
-            continue
-        ran_any = True
+    collected = compile_matrix(matrix, [source], extra_flags, tmp)
+    if not collected:
+        report_failures()
+        sys.exit("error: no usable compiler in the matrix"
+                 + _skipped_suffix())
+    blocks, unpaired = [], []
+    for label, cc_cmd, (funcs,) in collected:
         use_cost_profile(cc_cmd)
-        funcs = extract_functions(asm)
+        profile = getattr(cc_cmd, "costs", None)
         pairs = ([tuple(p.split(":", 1)) for p in pair_specs]
                  or auto_pairs(funcs))
         if not pairs:
@@ -2490,14 +2796,11 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
                       'declare the pairs extern "C" or use --pair with the '
                       'mangled names', file=sys.stderr)
             if JSON_OUT is not None:
-                JSON_OUT.extend(json_record(name, lines, cc=cc_cmd)
+                JSON_OUT.extend(json_record(name, lines, cc=cc_cmd,
+                                            target=label)
                                 for name, lines in funcs.items())
-                continue
-            print(f"\n== {cc_cmd} ==\n")
-            print(file_summary_table(funcs, table_width()) if funcs
-                  else "(no functions found)")
-            if funcs:
-                table_footer(list(funcs), funcs)
+            else:
+                unpaired.append(Block(label, funcs, None, profile))
             continue
         missing = sorted({n for p in pairs for n in p if n not in funcs})
         if missing:
@@ -2509,23 +2812,30 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
         if JSON_OUT is not None:
             for old, new in pairs:
                 JSON_OUT.append(json_record(old, funcs[old], cc=cc_cmd,
-                                            role="baseline"))
+                                            role="baseline", target=label))
                 JSON_OUT.append(json_record(new, funcs[new], cc=cc_cmd,
-                                            role="candidate",
+                                            role="candidate", target=label,
                                             baseline=funcs[old]))
             continue
-        print(f"\n== {cc_cmd} ==\n")
-        if not SUMMARY_ONLY:
-            for old, new in pairs:
-                print(side_by_side(funcs[old], funcs[new], old, new,
-                                   collapse=COLLAPSE))
-                print()
-        print(summary_table(pairs, funcs, table_width()))
-        table_footer([n for p in pairs for n in p], funcs)
-    if not ran_any:
-        sys.exit("error: no usable compiler in the matrix"
-                 + _skipped_suffix())
-    return 0
+        blocks.append(Block(label, funcs, pairs, profile))
+    if JSON_OUT is None:
+        print_legend(matrix)
+        if blocks:
+            print()
+            print(summary_table(blocks, table_width()))
+            table_footer(blocks)
+        # A row whose functions do not pair falls back to its whole-file
+        # summary; it only shares the run with paired rows when a
+        # compiler dropped one side of the pair.
+        if unpaired:
+            print()
+            print(file_summary_table(unpaired, table_width())
+                  if any(b.funcs for b in unpaired)
+                  else "(no functions found)")
+            table_footer(unpaired)
+        if blocks and not SUMMARY_ONLY:
+            print_listings(blocks, len(blocks) > 1)
+    return 1 if report_failures() else 0
 
 
 def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp,
@@ -2546,12 +2856,10 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp,
     not an error.
     """
     pattern = _compile_filter(filter_regex) if filter_regex else None
-    usable = []
-    for idx, cc_cmd in enumerate(matrix, start=1):
-        asm = compile_to_asm(cc_cmd, extra_flags, source, tmp)
-        if asm is not None:
-            usable.append((f"cc#{idx}", cc_cmd, extract_functions(asm)))
+    usable = [(label, cc_cmd, sides[0]) for label, cc_cmd, sides
+              in compile_matrix(matrix, [source], extra_flags, tmp)]
     if not usable:
+        report_failures()
         sys.exit("error: no usable compiler in the matrix"
                  + _skipped_suffix())
     for _, cc_cmd, funcs in usable:
@@ -2575,47 +2883,63 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp,
         return list(fn_names) + [m for m in matched if m in funcs]
 
     if JSON_OUT is not None:
-        for _, cc_cmd, funcs in usable:
+        for label, cc_cmd, funcs in usable:
             use_cost_profile(cc_cmd)
-            JSON_OUT.extend(json_record(name, funcs[name], cc=cc_cmd)
+            JSON_OUT.extend(json_record(name, funcs[name], cc=cc_cmd,
+                                        target=label)
                             for name in selected(funcs))
-        return 0
+        return 1 if report_failures() else 0
     if layout == "side-by-side" and len(usable) < 2:
+        report_failures()
         sys.exit("error: --layout side-by-side needs at least two usable "
                  "compilers in the matrix")
     if layout is None:
         layout = "side-by-side" if len(usable) == 2 else "list"
+    print_legend(matrix)
     if layout == "side-by-side":
-        print()
-        for tag, cc_cmd, _ in usable:
-            print(f"{tag}: {cc_cmd}")
-        base_tag, base_cc, base_funcs = usable[0]
-        for tag, cc_cmd, funcs in usable[1:]:
-            print(f"\n== {base_tag} vs {tag} ==\n")
+        blocks, notes = [], []
+        base_label, base_cc, base_funcs = usable[0]
+        for label, cc_cmd, funcs in usable[1:]:
             both = list(fn_names) + [m for m in matched
                                      if m in base_funcs and m in funcs]
-            report_across(both, base_funcs, funcs, base_tag, tag,
-                          ccs=(base_cc, cc_cmd))
+            blocks.append(report_across(both, base_funcs, funcs, base_label,
+                                        label, ccs=(base_cc, cc_cmd),
+                                        labels=(base_label, label)))
             one_sided = [m for m in matched
                          if (m in base_funcs) != (m in funcs)]
             if one_sided:
-                print("\nnote: --filter match(es) present under only one "
-                      "compiler, not compared: " + ", ".join(one_sided)
-                      + " - inspect with -l list")
-        return 0
-    for _, cc_cmd, funcs in usable:
-        use_cost_profile(cc_cmd)
-        sel = selected(funcs)
-        if len(usable) > 1:
-            print(f"\n== {cc_cmd} ==")
-        if not SUMMARY_ONLY:
-            for name in sel:
-                print()
-                print(listing(name, funcs[name]))
+                # Which comparison, only when there are several to tell
+                # apart; one comparison speaks for the whole run.
+                where = (f" in {base_label} vs {label}"
+                         if len(usable) > 2 else "")
+                notes.append("note: --filter match(es) present under only "
+                             f"one compiler, not compared{where}: "
+                             + ", ".join(one_sided)
+                             + " - inspect with -l list")
         print()
-        print(inspect_table(sel, funcs, table_width()))
-        table_footer(sel, funcs)
-    return 0
+        print(summary_table(blocks, table_width()))
+        table_footer(blocks)
+        for note in notes:
+            print("\n" + note)
+        if not SUMMARY_ONLY:
+            # Each block names the two rows it compares, so it keeps its
+            # header even when it is the only one.
+            print_listings(blocks, True)
+        return 1 if report_failures() else 0
+    blocks = [Block(label, funcs, selected(funcs),
+                    getattr(cc_cmd, "costs", None))
+              for label, cc_cmd, funcs in usable]
+    print()
+    print(inspect_table(blocks, table_width()))
+    table_footer(blocks)
+    if not SUMMARY_ONLY:
+        for block in blocks:
+            if len(blocks) > 1:
+                print(f"\n== {block.label} ==")
+            for name in block.sel:
+                print()
+                print(listing(name, block.funcs[name]))
+    return 1 if report_failures() else 0
 
 
 def derive_objdump(matrix):
@@ -2686,13 +3010,16 @@ def run_elf(elf, fn_names, filter_regex, objdump, list_matches=False,
         JSON_OUT.extend(json_record(name, funcs[name]) for name in selected)
         return 0
     listed = selected if list_matches else fn_names
+    # No matrix row stands behind a linked binary: one block, labelled
+    # by the ELF, so the table keeps the shape a single row has.
+    blocks = [Block(elf, funcs, selected, costs)]
+    print()
+    print(inspect_table(blocks, table_width()))
+    table_footer(blocks)
     if not SUMMARY_ONLY:
         for name in listed:
             print()
             print(listing(name, funcs[name]))
-    print()
-    print(inspect_table(selected, funcs, table_width()))
-    table_footer(selected, funcs)
     unlisted = len(selected) - len(listed)
     if unlisted and not SUMMARY_ONLY:
         print(f"\nnote: {unlisted} --filter match(es) summarized without "
@@ -3203,7 +3530,7 @@ def main(argv=None):
                         help="print the resolved config's default, groups, "
                              "and targets, then exit (no source file needed)")
     parser.add_argument("--span-stats", action="store_true",
-                        help="follow each stats table with a per-loop-span "
+                        help="follow the stats table with a per-loop-span "
                              "instruction mix (nesting depth and load/"
                              "store/mul/div/branch/other counts) - weighs "
                              "the span instead of the whole function")
@@ -3235,6 +3562,12 @@ def main(argv=None):
                              f"{COLLAPSE_CONTEXT} lines of context around "
                              "each difference - near-identical functions "
                              "render as a few hunks")
+    parser.add_argument("--width", type=width_arg, metavar="N",
+                        help="column budget for tables and side-by-side "
+                             "listings (default: the terminal, else "
+                             f"$COLUMNS, else {DEFAULT_WIDTH}).  0 is "
+                             "unlimited, which is what a script parsing "
+                             "the callee column wants")
     parser.add_argument("--json", action="store_true",
                         help="emit the summary as JSON on stdout instead "
                              "of tables: one record per function per "
@@ -3271,7 +3604,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     global VERBOSE, FLAGS_LIKE, SUMMARY_ONLY, COLLAPSE, SPAN_STATS
     global DB_INCLUDES, JSON_OUT, FAIL_ON_GROWTH, COST, COST_PROFILE
+    global WIDTH
     VERBOSE = args.verbose
+    WIDTH = args.width
     FLAGS_LIKE = args.flags_like
     SUMMARY_ONLY = args.summary_only or args.json
     COLLAPSE = args.collapse
@@ -3282,6 +3617,7 @@ def main(argv=None):
     COST_PROFILE = None                 # set per matrix row as it runs
     FAIL_ON_GROWTH = args.fail_on_growth
     del GROWTH[:]                       # main() may run twice in a process
+    del _FAILURES[:]
     _GLOB_CHOICES.clear()
 
     if args.example_config:

@@ -115,10 +115,21 @@ Run:
 $ asmdiff myharness.c
 ```
 
-Output (gcc section shown, one per compiler):
+Output:
 
 ```
-== gcc -O3 ... ==
+cc#1: gcc -O3
+cc#2: clang -O3
+
+target  function   role       insns  loop spans  calls
+cc#1    old_scale  baseline   3      -           -
+cc#1    new_scale  candidate  3      -           ldexpf
+cc#1               delta      0      -           +ldexpf
+cc#2    old_scale  baseline   2      -           -
+cc#2    new_scale  candidate  2      -           ldexpf
+cc#2               delta      0      -           +ldexpf
+
+== cc#1 ==
 
 old_scale                                    | new_scale
 ---------------------------------------------+---------------------------------------------
@@ -126,22 +137,36 @@ endbr64                                      | endbr64
 mulss   .LC0(%rip), %xmm0                    | movl    $-5, %edi
 ret                                          | jmp     ldexpf@PLT
 
-function   role       insns  loop spans  calls
-old_scale  baseline   3      -           -
-new_scale  candidate  3      -           ldexpf
-           delta      0      -           +ldexpf
+== cc#2 ==
+
+old_scale                                    | new_scale
+---------------------------------------------+---------------------------------------------
+mulss   .LCPI0_0(%rip), %xmm0                | movl    $-5, %edi
+retq                                         | jmp     ldexpf@PLT
 ```
 
+Every run has the same three parts: a legend naming each row of the
+compiler matrix, one table covering the whole matrix, then the listings
+grouped under `== LABEL ==`. The label in the `target` column is the
+config target a row came from; the two fallback compilers here are
+unnamed, so they are numbered by their position in the matrix. A single
+unnamed row (one `--cc`) is its own label, and then the legend and the
+`target` column are both dropped - the blocks further down this README
+show both shapes.
+
 Read the `calls` column first: `-` means the construct lowered to inline
-instructions; a symbol name means a libcall. The side-by-side asm above it is
-the evidence.
+instructions; a symbol name means a libcall. The listings under the table
+are the evidence.
 
 The `loop spans` column reports `label:N` for every local label that some
 instruction branches back to: N instructions lie between the label and the
 last backward branch targeting it. Whole-function `insns` charges loop-hoisting
 changes for their one-time setup/writeback code; the span count is the part
 that repeats. Which span is your hot loop — and how often it runs — the
-listing and your source know, not the tool.
+listing and your source know, not the tool. A function with more than
+six spans shows the first six and a `+N more` tail, since past that the
+column stops being readable and the count is what is left to say;
+`--json` carries every span.
 
 A worked example is included — `asmdiff_example.c` reproduces the
 exp2f/ldexpf analysis for both constant and runtime shift amounts:
@@ -175,7 +200,10 @@ uint32_t new_elapsed_ms(uint64_t now, uint64_t then) {
 ```
 $ asmdiff elapsed.c --cc 'xtensa-esp32s3-elf-gcc -O2 -mlongcalls'
 
-== xtensa-esp32s3-elf-gcc -O2 -mlongcalls ==
+function        role       insns  loop spans  calls
+old_elapsed_ms  baseline   10     -           __udivdi3
+new_elapsed_ms  candidate  6      -           -
+                delta      -4     -           -__udivdi3
 
 old_elapsed_ms                               | new_elapsed_ms
 ---------------------------------------------+---------------------------------------------
@@ -189,12 +217,10 @@ sub     a11, a3, a11                         |
 call8   __udivdi3                            |
 mov.n   a2, a10                              |
 retw.n                                       |
-
-function        role       insns  loop spans  calls
-old_elapsed_ms  baseline   10     -           __udivdi3
-new_elapsed_ms  candidate  6      -           -
-                delta      -4     -           -__udivdi3
 ```
+
+One `--cc` row is its own label, so this run prints neither a legend nor
+a `target` column and the listing needs no `== LABEL ==` header.
 
 The candidate is six inline instructions ending in a multiply-high by
 the reciprocal constant in `.LC0`. The baseline hands the division to
@@ -215,11 +241,12 @@ the file - no harness, no pairing:
 
     $ asmdiff src/oscillators.c render_lut
 
-With one usable compiler you get the function's listing and a stats
-row; with exactly two (the default gcc + clang matrix) the listings
-appear side by side; with a bigger matrix each compiler gets its own
-block. `-l list` / `-l side-by-side` forces a presentation. Several
-function names can be given at once.
+With one usable compiler you get a stats row and the function's
+listing under it; with exactly two (the default gcc + clang matrix)
+the two listings are set side by side; with a bigger matrix the table
+covers the whole matrix and each row's listing follows under its own
+`== LABEL ==`. `-l list` / `-l side-by-side` forces a presentation.
+Several function names can be given at once.
 
 A bare name is inspected as a function; an argument that exists on
 disk is a second source file, and a path-looking argument that does
@@ -231,6 +258,9 @@ like this:
 
 ```
 $ asmdiff dsp_util.c apply_gain --cc 'xtensa-esp32s3-elf-gcc -O2 -mlongcalls'
+
+function    insns  loop spans  calls
+apply_gain  13     .L3_LEND:4  -
 
 apply_gain:
         entry   sp, 32
@@ -249,9 +279,6 @@ apply_gain:
 .L3_LEND:
 .L1:
         retw.n
-
-function    insns  loop spans  calls
-apply_gain  13     .L3_LEND:4  -
 ```
 
 The span `.L3_LEND:4` is the four-instruction body of the Xtensa
@@ -387,10 +414,11 @@ asmdiff SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
            [--target NAME]... [--cc 'CC FLAGS']... [--config PATH]
            [--compile-commands [PATH]] [--flags-like PATH] [--db-includes]
            [--filter REGEX] [--summary-only] [--collapse] [--span-stats]
-           [--cost] [--costs NAME] [--fail-on-growth]
+           [--cost] [--costs NAME] [--fail-on-growth] [--json] [--width N]
            [--layout list|side-by-side] [-v] [-- EXTRA_FLAGS...]
 asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
            [-l list] [--summary-only] [--span-stats] [--cost] [--costs NAME]
+           [--json] [--width N]
 asmdiff --edit-config | --example-config | --list-targets | --version
 asmdiff --completion bash|zsh|fish | --install-completion [SHELL]
 ```
@@ -411,9 +439,10 @@ asmdiff --completion bash|zsh|fish | --install-completion [SHELL]
 | `--flags-like PATH` | A source with no `compile_commands` entry borrows the flags recorded for `PATH` — the way to compare a modified copy of a project source under its original's header environment. |
 | `--db-includes` | Borrow only the header-search paths from the database, dropping its defines, forced includes, and `-specs`/`--sysroot`; kept paths are re-emitted as `-idirafter` so they cannot shadow the host's own system headers. This is how a host target compiles a cross project's source. |
 | `-s`, `--summary-only` | Print only the summary/stats tables, suppressing every assembly listing (see [Shaping the output](#shaping-the-output-for-reading-vs-deciding)). |
-| `--json` | Emit the summary as JSON on stdout instead of tables — one record per function per compiler. Implies `--summary-only`; errors stay plain text on stderr. |
+| `--json` | Emit the summary as JSON on stdout instead of tables — one record per function per compiler, each carrying the `target` label of the matrix row it came from. Implies `--summary-only`; errors stay plain text on stderr. |
 | `-C, --collapse` | In side-by-side listings, omit runs of identical line pairs, keeping 3 lines of context around each difference. |
-| `--span-stats` | Follow each stats table with a per-loop-span instruction mix: nesting depth and load/store/mul/div/branch/other counts per span. |
+| `--width N` | Column budget for tables and side-by-side listings. Default: the terminal's width, else `$COLUMNS`, else 120. `0` is unlimited, leaving the callee column untrimmed for a script to grep; a negative `N` is a usage error. |
+| `--span-stats` | Follow the stats table with a per-loop-span instruction mix: nesting depth and load/store/mul/div/branch/other counts per span. |
 | `--cost` | Add a `cost` column to the stats tables: the instruction classes of each function and the tier of every call site (`softfp`, `softfp-div`, `int-div`, `libm`, `mem`, `call`), with the sites a loop span holds counted apart. Counts only; a score appears when a profile prices them. See [Cost column](#cost-column). |
 | `--costs NAME` | Price the cost column with the config's `[costs.NAME]` profile on every matrix row, `--cc` rows and ELF input included; implies `--cost`. Overrides a `costs = "NAME"` the target names. See [Cost profiles](#cost-profiles). |
 | `--fail-on-growth` | Exit 3, naming each offender on stderr, if any candidate has more instructions than its baseline; exit 0 otherwise. Needs paired functions (`--pair`, auto-paired `old_X`/`new_X`, or `--across`). |
@@ -445,29 +474,50 @@ asmdiff h.c -- -fno-math-errno
 Compilers missing from `PATH` are skipped with a warning; the run fails only
 if none are usable, and that error names each missed binary
 (`no-such-gcc: not found on PATH`) so the fix is in the message, not in a
-warning that scrolled away. Exit status is non-zero only for operational
-failures (compile error — the compiler's stderr is shown — unknown `--pair`
-name, no usable compiler). Differing assembly is the expected result, never
-an error.
+warning that scrolled away. A row whose compile *fails* is dropped the same
+way: the remaining rows are compiled, their table and listings print, and
+the failing row's compiler output follows on stderr under its label
+(`error: [esp32s3] xtensa-esp32s3-elf-gcc failed on biquad.c`) once the
+run has printed everything it could. One broken target no longer costs
+you the others; the run still exits 1.
+
+| Status | Meaning |
+|---|---|
+| 0 | The run printed what was asked for. Differing assembly is the expected result, never an error. |
+| 1 | The tool failed: a compile error, an unknown `--pair` name, a config that does not load, no usable compiler in the matrix. |
+| 2 | argparse's usage error - an unknown flag, a missing value, a negative `--width`. |
+| 3 | `--fail-on-growth` found a candidate with more instructions than its baseline. |
 
 ## Shaping the output for reading vs deciding
 
-A two-file compare over a three-target matrix prints three full
-side-by-side listings with the summary table at the *end* of each — the
-right shape for reading an unfamiliar delta, and roughly 100 KB of the
-wrong shape when the table is all the decision needs. Four flags cut the
-output to purpose:
+Every run leads with the table: the legend, one summary table for the
+whole matrix, the `--span-stats` and provenance lines that belong to it,
+and then the listings, grouped per target under `== LABEL ==`. A
+two-file compare over a three-target matrix still prints three full
+side-by-side listings under that table, roughly 100 KB of them when the
+table was all the decision needed. Four flags cut the output to purpose:
 
 - **`--summary-only`** (`-s`) keeps only the summary/stats tables. This is
   the scripted/agent view: the table is the decision input, and a listing
   is pulled with a second, narrower run only when a delta needs
-  explaining.
-- **`--collapse`** elides runs of identical line pairs in every
+  explaining. What is left is the legend, the table, and its footer.
+- **`--collapse`** (`-C`) elides runs of identical line pairs in every
   side-by-side listing, keeping 3 lines of context around each difference
   plus a `... N identical lines ...` marker. Two ~500-instruction
   functions differing by five instructions render as a few readable hunks
-  instead of ~1000 lines.
-- **`--span-stats`** follows each stats table with a per-loop-span
+  instead of ~1000 lines. Two sides that are equal line for line collapse
+  to their header with `(identical)` on the left title and no body at
+  all.
+
+  What it cannot collapse is the case where the two sides differ on every
+  line without differing in substance: a changed register allocation, a
+  reordered but equivalent schedule, one extra spill slot shifting every
+  offset. There is no identical run to elide, so the listing prints in
+  full. The summary table and `--span-stats` are the reading unit there:
+  the instruction classes, the calls, and the per-span mix say what
+  moved, where a line-by-line read of two differently allocated bodies
+  does not.
+- **`--span-stats`** follows the stats table with a per-loop-span
   instruction mix, one row per span:
 
   ```
@@ -512,14 +562,22 @@ output to purpose:
 All four combine with every compile mode; `--summary-only`,
 `--span-stats`, `--cost` and `--costs` also apply to ELF input.
 
+Tables and side-by-side listings take their width from the terminal,
+falling back off one to `$COLUMNS` and then to 120 columns; `--width N`
+sets the budget directly, and `--width 0` means unlimited, which is the
+untrimmed callee column a script greps.
+
 For scripted callers, `--json` replaces the tables entirely with one
 JSON document on stdout: a flat `results` list holding one record per
-function per compiler — `cc`, `tag` (source label in two-file runs),
-`role` (`baseline`/`candidate` in paired runs), `insns`, `loop_spans`
-(each `{label, insns, depth}`), `calls`, `delta` (on candidate
-records), `cost` when `--cost` or `--costs` is given, and `span_stats`
-when `--span-stats` is given. Flat records keep it one `jq` expression
-away from any question the tables answer.
+function per compiler — `target` (the matrix row's label, the same
+string the table's `target` column prints), `cc`, `tag` (source label
+in two-file runs), `role` (`baseline`/`candidate` in paired runs),
+`insns`, `loop_spans` (each `{label, insns, depth}`), `calls`, `delta`
+(on candidate records), `cost` when `--cost` or `--costs` is given, and
+`span_stats` when `--span-stats` is given. An ELF run compiles nothing,
+so its records have no matrix row to name and carry neither `target`
+nor `cc`. Flat records keep it one `jq` expression away from any
+question the tables answer.
 
 The pairing questions the tool answers itself, because the pairing is
 its own: every summary table closes a pair with a `delta` row (signed
@@ -687,8 +745,9 @@ flags = ["-O2", "-DMY_FEATURE", "-I$HOME/project/components/dsp/include"]
 survives toolchain upgrades (`esp-14` → `esp-15`) without editing. A
 pattern matching several installed toolchains resolves to the highest
 version-sorted one — numerically, so `esp-15` beats `esp-9` — and the
-choice is printed to stderr; the `==` header in the output always shows
-the fully resolved command that actually ran. No match is an error. Pin
+choice is printed to stderr; the legend line above the table always
+shows the fully resolved command that actually ran, so the short
+`target` label never hides which binary it was. No match is an error. Pin
 the exact directory instead when reproducibility matters more than
 convenience. Flags expand `$VARS` only (no globbing).
 
@@ -704,11 +763,20 @@ asmdiff --list-targets                       # what does my config define?
 ```
 
 A config placed next to your harness files travels with them: any invocation
-naming a source in that directory finds it, from any CWD. `default` may be a
-single name or a list (a whole default matrix). The
-included `asmdiff.example.toml` is a starting point. If a flag or include
-path must vary per machine, that's what per-machine config files are for —
-nothing lives in the tool.
+naming a source in that directory finds it, from any CWD.
+
+`default` takes whatever `-t` takes: a target name, a `[groups]` name, a
+comma list, a glob over target names, or an array mixing those
+(`default = ["native", "esp32s3"]`). A name it cannot resolve is the
+same error `-t` would give. One idiom worth knowing is the one-member
+group: `[groups] ship = ["esp32s3"]` with `default = "ship"` gives the
+standing matrix a name of its own, so widening the run later is editing
+the group rather than every `default` and script that mentions the
+target.
+
+The included `asmdiff.example.toml` is a starting point. If a flag or
+include path must vary per machine, that's what per-machine config files
+are for — nothing lives in the tool.
 
 ### Target groups
 
@@ -927,7 +995,7 @@ Details that make it robust:
 - **Absent source is an error**, not a silent empty flag set — otherwise
   you'd just hit the missing-header failure this feature exists to prevent.
   The message flags a same-basename entry recorded under a different path.
-- **`compile_commands` expands `~` and `$VARS`.** The `==` header always
+- **`compile_commands` expands `~` and `$VARS`.** The legend line always
   prints the resolved compiler command; run with `-- -v` if you want to see
   every include path the compiler actually received.
 - **`--db-includes` restricts the borrow to header-search paths**,
@@ -994,10 +1062,25 @@ Both walk up from the current directory, checking each level for
 CMake and idf.py leave it) — first hit wins. The walk stops at the
 repository root (the first directory with a `.git`), so running from any
 depth of component directory finds the project database, but an unrelated
-one further up the filesystem is never picked up. Finding nothing is an
-error: discovery is opt-in, so if you asked for it, silence would be a
-lie. It is never on by default — a target without `compile_commands` and
-no `--compile-commands` flag borrows nothing.
+one further up the filesystem is never picked up. It is never on by
+default — a target without `compile_commands` and no
+`--compile-commands` flag borrows nothing.
+
+The two opt-ins differ in what happens when the walk finds nothing:
+
+- **A bare `--compile-commands` is an error.** You asked for a database
+  in this run and there is none; compiling anyway would silently drop
+  the flags you came for.
+- **`compile_commands = true` in a target is a note.** The config
+  describes where that target is usually compiled, not what this run
+  is. A harness file compiled from a directory with no `build/` under
+  it gets `target [esp32s3]: no compile_commands.json found near the
+  current directory; compiling without borrowed flags` on stderr and
+  compiles with the target's own `cc`/`flags`, which is what a
+  standalone harness wants.
+
+`compile_commands = "PATH"` naming a database that is not there stays an
+error under both: a path that does not resolve is a typo, not a context.
 
 The precedence is what you'd hope: a target that names its own
 `compile_commands` path always keeps it; `--compile-commands` (with or
@@ -1042,24 +1125,22 @@ cross-only defines or `-specs` a host gcc would choke on.
 
 With no `--pair`, no `--across`, and no `old_*`/`new_*` functions to
 auto-pair, the tool prints what it parsed instead of erroring: every
-function's counts plus a file total. With two files, one block per file:
+function's counts plus a file total. With two files, a leading `file`
+column tells the two apart inside the one table:
 
 ```
 $ asmdiff old/delay.c new/delay.c
 
-== xtensa-esp32s3-elf-gcc -O2 ... ==
-
--- old/delay.c --
-
-function         insns  loop spans  calls
-stereo_reverb    437    .L108:327   -
-...
-TOTAL (13 functions)  956   -   malloc_caps, free, ...
-
--- new/delay.c --
-...
-TOTAL (13 functions)  1028  -   malloc_caps, free, ...
+file         function              insns  loop spans  calls
+old/delay.c  stereo_reverb         437    .L108:327   -
+old/delay.c  ...
+old/delay.c  TOTAL (13 functions)  956    -           malloc_caps, free, ...
+new/delay.c  ...
+new/delay.c  TOTAL (13 functions)  1028   -           malloc_caps, free, ...
 ```
+
+Over a matrix of several targets a `target` column leads the `file` one,
+so the whole run is still one table.
 
 The TOTAL row is a coarse sanity check — did this refactor move the file's
 weight, did a call appear that shouldn't have? It sums parsed function
@@ -1072,12 +1153,12 @@ but is not code. A `calls` list longer than 8 symbols is truncated to
 `..., ... (N total)` (the leading `...` marks the elision, so the
 marker never reads as one more callee); real firmware dispatch
 functions call dozens of distinct symbols and would otherwise make
-rows thousands of characters wide. When stdout is a terminal, rows are
-additionally trimmed to the terminal width: callees are dropped from
-the end of the `calls` column (never the first one) behind the same
-`... (N total)` marker, so every row stays on one line. Piped or
-redirected output skips the width trim and keeps the full capped list,
-so it stays stable and greppable.
+rows thousands of characters wide. Rows are additionally trimmed to the
+column budget - the terminal, else `$COLUMNS`, else 120: callees are
+dropped from the end of the `calls` column (never the first one) behind
+the same `... (N total)` marker, so every row stays on one line.
+`--width 0` turns the trim off and keeps the full capped list, which is
+the shape to pipe into a grep.
 
 ## Comparing the same function across two builds (`--across`)
 
@@ -1109,6 +1190,11 @@ asmdiff src/filters.c --across dsps_biquad_f32_ansi \
 cc#1: gcc -Os
 cc#2: gcc -O3
 
+function                     role       insns  loop spans  calls
+dsps_biquad_f32_ansi [cc#1]  baseline   59     .L27:32     SMULR6
+dsps_biquad_f32_ansi [cc#2]  candidate  89     .L26:54     -
+                             delta      +30    32 -> 54    -SMULR6
+
 == cc#1 vs cc#2 ==
 
 dsps_biquad_f32_ansi [cc#1]                  | dsps_biquad_f32_ansi [cc#2]
@@ -1137,11 +1223,6 @@ addl    %eax, %edx                           | sarl    $11, %r12d
 movl    %r14d, %r11d                         | sarl    $11, %ebp
 call    SMULR6                               | leal    1024(%rax), %edx
   [... 60 rows omitted ...]
-
-function                     role       insns  loop spans  calls
-dsps_biquad_f32_ansi [cc#1]  baseline   59     .L27:32     SMULR6
-dsps_biquad_f32_ansi [cc#2]  candidate  89     .L26:54     -
-                             delta      +30    32 -> 54    -SMULR6
 ```
 
 (The listing is abridged here; the tool prints all 92 rows. The columns
@@ -1150,14 +1231,19 @@ the listing shows why — `SMULR6` inlined into the loop body, vector setup
 around it. Whether that trade is good is your call.)
 
 The output prints a legend mapping `cc#N` tags to the full compiler
-invocations, then one section per baseline/candidate pairing. Runnable
-against the bundled example file:
+invocations, then the table, then one listing section per
+baseline/candidate pairing. Runnable against the bundled example file:
 
 ```
 $ asmdiff asmdiff_example.c --across new_rt --cc 'gcc -O0' --cc 'gcc -O3'
 
 cc#1: gcc -O0
 cc#2: gcc -O3
+
+function       role       insns  loop spans  calls
+new_rt [cc#1]  baseline   13     -           ldexpf
+new_rt [cc#2]  candidate  2      -           ldexpf
+               delta      -11    -           -
 
 == cc#1 vs cc#2 ==
 
@@ -1176,16 +1262,12 @@ movd    %eax, %xmm0                          |
 call    ldexpf@PLT                           |
 leave                                        |
 ret                                          |
-
-function       role       insns  loop spans  calls
-new_rt [cc#1]  baseline   13     -           ldexpf
-new_rt [cc#2]  candidate  2      -           ldexpf
-               delta      -11    -           -
 ```
 
 **Two files** — before/after versions of a source file (e.g. from a git
-worktree, a branch checkout, or a patched copy). Each compiler in the matrix
-gets its own section:
+worktree, a branch checkout, or a patched copy). Every compiler in the
+matrix lands in the one table under its own `target` label, and each
+gets its own listing section:
 
 ```bash
 git worktree add ../baseline main
@@ -1408,9 +1490,13 @@ standard library, and contains no project-specific constants. To port:
   `-mlongcalls` sequences are resolved to their real callee when objdump's
   literal annotation names one; genuine function-pointer dispatch still
   reads as indirect.
-- Columns truncate long instruction lines to keep pairs aligned; when a
-  line matters, widen it via the `width` parameter of `side_by_side()` or
-  read the raw `-S` output by hand.
+- Side-by-side columns truncate long instruction lines to keep pairs
+  aligned, and drop a trailing assembler comment (clang's `# TAILCALL`,
+  `# 8-byte Reload`) before truncating, so the operands survive at half
+  a terminal's width. An ARM `#4` immediate has no space after the hash
+  and is untouched. Each side gets half the column budget, so `--width`
+  widens them; `-l list`, the single-column listings and `--json` keep
+  the line as extracted, comment included.
 - Loop spans are layout facts, not loop analysis. Label numbers are
   compiler-assigned, so a baseline's `.L27` and a candidate's `.L26` may
   or may not be "the same" loop — match them through the listing, not by
