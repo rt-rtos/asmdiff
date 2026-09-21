@@ -476,12 +476,23 @@ def find_compile_commands():
     return None
 
 
-def _discovered_db(who):
-    """find_compile_commands() for a caller that opted in (compile_commands
-    = true, or a bare --compile-commands): finding nothing is then an error,
-    not a silent no-op."""
+def _discovered_db(who, required=True):
+    """find_compile_commands() for a caller that opted in.
+
+    ``required=True`` is a bare --compile-commands: the user asked for a
+    database in this run, so finding none is an error.  ``required=False``
+    is a target's ``compile_commands = true``, which describes where that
+    target is usually compiled, not what this run must have: a standalone
+    harness run from outside the project then gets a note and compiles
+    without borrowed flags instead of a dead config.
+    """
     found = find_compile_commands()
     if found is None:
+        if not required:
+            print(f"{who}: no compile_commands.json found near the current "
+                  "directory; compiling without borrowed flags",
+                  file=sys.stderr)
+            return None
         sys.exit(f"error: {who}: no compile_commands.json found in the "
                  "current directory, its build/, or any parent up to the "
                  "repository root")
@@ -1379,9 +1390,34 @@ def resolve_cc(cc, name):
         sys.exit(f"error: target [{name}]: cc pattern matched nothing: "
                  + expanded)
     if len(matches) > 1:
-        print(f"target [{name}]: cc pattern matched {len(matches)} "
-              f"toolchains, using {matches[-1]}", file=sys.stderr)
+        _GLOB_CHOICES.append((name, len(matches), matches[-1]))
     return matches[-1]
+
+
+# Glob resolutions made while building the matrix: (target, match
+# count, chosen path).  announce_glob_choices prints them grouped, so a
+# three-target ESP profile whose patterns all land in one toolchain
+# directory costs one stderr line instead of three.
+_GLOB_CHOICES = []
+
+
+def announce_glob_choices():
+    """Print the pending glob resolutions, one line per chosen
+    directory, and forget them."""
+    groups = {}
+    for name, count, chosen in _GLOB_CHOICES:
+        groups.setdefault((os.path.dirname(chosen), count), []).append(
+            (name, chosen))
+    _GLOB_CHOICES.clear()
+    for (directory, count), members in groups.items():
+        if len(members) == 1:
+            name, chosen = members[0]
+            print(f"target [{name}]: cc pattern matched {count} "
+                  f"toolchains, using {chosen}", file=sys.stderr)
+        else:
+            names = ", ".join(n for n, _ in members)
+            print(f"targets [{names}]: cc patterns matched {count} "
+                  f"toolchains, using {directory}/", file=sys.stderr)
 
 
 def config_target_names(config):
@@ -1480,8 +1516,36 @@ def load_costs(config, name, config_path, extended_by=None):
     return {"name": name, "weights": weights, "provenance": ordered}
 
 
-def _known_suffix(config, config_path):
-    """'; targets: ...; groups: ...' for unknown-name errors."""
+# Name -> "target" / "group" for everything EXAMPLE_CONFIG defines, parsed
+# on first use by _example_names().
+_EXAMPLE_NAMES = None
+
+
+def _example_names():
+    """What the built-in example config defines, parsed once and only when
+    a name has already failed to resolve - a normal run never pays for it.
+    Without tomllib (Python < 3.11) there is nothing to parse and the
+    pointer is simply omitted."""
+    global _EXAMPLE_NAMES
+    if _EXAMPLE_NAMES is None:
+        kinds = {}
+        if tomllib is not None:
+            example = tomllib.loads(EXAMPLE_CONFIG)
+            for name in config_groups(example):
+                kinds[name] = "group"
+            for name in config_target_names(example):
+                kinds[name] = "target"
+        _EXAMPLE_NAMES = kinds
+    return _EXAMPLE_NAMES
+
+
+def _known_suffix(config, config_path, name=None):
+    """'; targets: ...; groups: ...' for unknown-name errors.
+
+    A name the user's config lacks but the example config defines is
+    almost always a README example run against a hand-written config, so
+    say where the name comes from instead of only what is missing.
+    """
     targets = config_target_names(config)
     groups = list(config_groups(config, config_path))
     bits = []
@@ -1489,9 +1553,12 @@ def _known_suffix(config, config_path):
         bits.append("targets: " + ", ".join(targets))
     if groups:
         bits.append("groups: " + ", ".join(groups))
-    if not bits:
-        return "; no targets defined"
-    return "; " + "; ".join(bits)
+    suffix = "; no targets defined" if not bits else "; " + "; ".join(bits)
+    kind = _example_names().get(name) if name else None
+    if kind:
+        suffix += (f"; {name} is a {kind} in the built-in example config "
+                   "(asmdiff --example-config)")
+    return suffix
 
 
 def _split_target_token(token):
@@ -1549,7 +1616,7 @@ def _resolve_target_token(part, targets, groups, config, config_path):
         return matched
     sys.exit(f"error: no [{part}] target in "
              f"{config_path or 'any config file'}"
-             + _known_suffix(config, config_path))
+             + _known_suffix(config, config_path, part))
 
 
 def list_targets(config, config_path):
@@ -1596,7 +1663,7 @@ def target_command(config, name, config_path, want_db=True):
     if not isinstance(entry, dict) or name in CONFIG_META_KEYS:
         sys.exit(f"error: no [{name}] target in "
                  f"{config_path or 'any config file'}"
-                 + _known_suffix(config, config_path))
+                 + _known_suffix(config, config_path, name))
     cc = entry.get("cc")
     if not isinstance(cc, str):
         sys.exit(f'error: target [{name}] needs cc = "compiler"')
@@ -1607,7 +1674,8 @@ def target_command(config, name, config_path, want_db=True):
     db = entry.get("compile_commands") if want_db else None
     discovered = False
     if db is True:                       # opt in to CWD-based discovery
-        db, discovered = _discovered_db(f"target [{name}]"), True
+        db = _discovered_db(f"target [{name}]", required=False)
+        discovered = db is not None
     elif db is False:
         db = None
     elif db is not None:
@@ -1651,14 +1719,26 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
     if not entries:
         default = (config or {}).get("default")
         if default:
-            names = [default] if isinstance(default, str) else list(default)
+            if isinstance(default, str):
+                tokens = [default]
+            elif (isinstance(default, list)
+                    and all(isinstance(n, str) and n for n in default)):
+                tokens = list(default)
+            else:
+                sys.exit(f"error: {config_path or 'the config'}: default "
+                         "must be a target or group name, or an array of "
+                         "such names")
+            # Same expansion as -t, so a group, a comma list or a glob
+            # names the standing matrix as readily as a single target.
             entries = [target_command(config, name, config_path, want_db)
-                       for name in names]
+                       for name in expand_target_args(tokens, config,
+                                                      config_path)]
         else:
             entries = [f"{cc} {FALLBACK_FLAGS}" for cc in DEFAULT_COMPILERS]
     if db_arg is not None:
         if db_arg is True:
-            db, discovered = _discovered_db("--compile-commands"), True
+            db, discovered = _discovered_db("--compile-commands",
+                                            required=True), True
         else:
             db = os.path.expandvars(os.path.expanduser(db_arg))
             discovered = False
@@ -1671,6 +1751,7 @@ def build_matrix(cc_args, target_args, config, config_path, db_arg=None,
         entries = [Target(e, getattr(e, "compile_commands", None),
                           getattr(e, "db_discovered", False), profile)
                    for e in entries]
+    announce_glob_choices()
     return entries
 
 
@@ -1963,21 +2044,31 @@ def _fit_calls(cell, budget):
     return items[0] + ", " + summary
 
 
-def render_table(rows, max_width=None):
+def render_table(rows, max_width=None, min_widths=None):
     """Column-aligned text for a list of equal-length string tuples.
 
     max_width (terminal columns) keeps each row on one line by
     trimming the last column's cells (see _fit_calls); the other
-    columns are never touched. None renders untrimmed."""
+    columns are never touched. None renders untrimmed.  min_widths
+    (per column, see column_widths) lets several tables share one
+    layout: a two-file summary aligns its columns across both."""
+    widths = column_widths(rows)
+    if min_widths is not None:
+        widths = [max(w, m) for w, m in zip(widths, min_widths)]
     if max_width is not None:
-        fixed = [max(len(row[i]) for row in rows)
-                 for i in range(len(rows[0]) - 1)]
+        fixed = widths[:-1]
         budget = max_width - sum(fixed) - 2 * len(fixed)
         rows = [row[:-1] + (_fit_calls(row[-1], budget),) for row in rows]
-    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+        widths[-1] = max(len(row[-1]) for row in rows)
     return "\n".join(
         "  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip()
         for row in rows)
+
+
+def column_widths(*row_sets):
+    """Widest cell per column over every row set given."""
+    rows = [row for rows in row_sets for row in rows]
+    return [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
 
 
 def table_width():
@@ -2156,7 +2247,7 @@ def summary_table(pairs, funcs, max_width=None):
     return render_table(rows, max_width)
 
 
-def file_summary_table(funcs, max_width=None):
+def file_summary_table(funcs, max_width=None, min_widths=None):
     """Per-function counts plus a whole-file total row.
 
     The total sums instruction counts over every function parsed from
@@ -2164,6 +2255,11 @@ def file_summary_table(funcs, max_width=None):
     check, not a code-size measurement (literal pools, data, and
     alignment are not included).
     """
+    return render_table(file_summary_rows(funcs), max_width, min_widths)
+
+
+def file_summary_rows(funcs):
+    """The rows behind file_summary_table, header first."""
     rows = [("function", "insns", "loop spans")
             + (("cost",) if COST else ()) + ("calls",)]
     total_insns, all_calls = 0, []
@@ -2183,7 +2279,7 @@ def file_summary_table(funcs, max_width=None):
         # nothing the rows do not already say.
         total += ("-",)
     rows.append(total + (format_calls(all_calls),))
-    return render_table(rows, max_width)
+    return rows
 
 
 def listing(name, lines):
@@ -2341,8 +2437,13 @@ def run_summary(sources, matrix, extra_flags, tmp, filter_regex=None):
         matched_any = matched_any or any(sections)
         shown = (mark_db_misses(cc_cmd, sources, tags)
                  if len(sources) == 2 else tags)
+        shared = None
         if JSON_OUT is None:
             print(f"\n== {cc_cmd} ==")
+            if len(sections) > 1 and all(sections):
+                # One layout for both files' tables, so a function's
+                # counts sit in the same column in each.
+                shared = column_widths(*map(file_summary_rows, sections))
         for tag, funcs in zip(shown, sections):
             if JSON_OUT is not None:
                 JSON_OUT.extend(
@@ -2353,7 +2454,7 @@ def run_summary(sources, matrix, extra_flags, tmp, filter_regex=None):
             if len(sections) > 1:
                 print(f"\n-- {tag} --")
             print()
-            print(file_summary_table(funcs, table_width()) if funcs
+            print(file_summary_table(funcs, table_width(), shared) if funcs
                   else ("(no functions match --filter)" if pattern is not None
                         else "(no functions found)"))
             if funcs:
@@ -3181,6 +3282,7 @@ def main(argv=None):
     COST_PROFILE = None                 # set per matrix row as it runs
     FAIL_ON_GROWTH = args.fail_on_growth
     del GROWTH[:]                       # main() may run twice in a process
+    _GLOB_CHOICES.clear()
 
     if args.example_config:
         sys.stdout.write(EXAMPLE_CONFIG)

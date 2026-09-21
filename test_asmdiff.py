@@ -920,6 +920,46 @@ class TestBuildMatrix(unittest.TestCase):
         self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
                          ["xtensa-gcc -O2 -mlongcalls", "gcc -O3"])
 
+    # `default` is expanded exactly like -t, so the standing matrix can
+    # be named by a group, a comma list, or a glob.
+    GROUPED = {"groups": {"native": ["gcc", "clang"]},
+               "gcc": {"cc": "gcc", "flags": ["-O3"]},
+               "clang": {"cc": "clang", "flags": ["-O3"]},
+               "esp32c3": {"cc": "riscv-gcc", "flags": ["-O2"]},
+               "esp32c6": {"cc": "riscv-gcc", "flags": ["-Os"]}}
+
+    def test_config_default_may_name_a_group(self):
+        cfg = dict(self.GROUPED, default="native")
+        self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
+                         ["gcc -O3", "clang -O3"])
+
+    def test_config_default_may_be_a_glob(self):
+        cfg = dict(self.GROUPED, default="esp32c*")
+        self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
+                         ["riscv-gcc -O2", "riscv-gcc -Os"])
+
+    def test_config_default_list_mixes_targets_and_groups(self):
+        cfg = dict(self.GROUPED, default=["esp32c3", "native"])
+        self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
+                         ["riscv-gcc -O2", "gcc -O3", "clang -O3"])
+
+    def test_config_default_comma_list_expands(self):
+        cfg = dict(self.GROUPED, default="clang,esp32c3")
+        self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
+                         ["clang -O3", "riscv-gcc -O2"])
+
+    def test_config_default_unknown_name_errors_like_target(self):
+        cfg = dict(self.CONFIG, default="ghost")
+        with self.assertRaises(SystemExit) as ctx:
+            asmdiff.build_matrix([], [], cfg, "cfg.toml")
+        self.assertIn("no [ghost] target", str(ctx.exception))
+
+    def test_config_default_must_be_a_name_or_array_of_names(self):
+        cfg = dict(self.CONFIG, default=3)
+        with self.assertRaises(SystemExit) as ctx:
+            asmdiff.build_matrix([], [], cfg, "cfg.toml")
+        self.assertIn("default", str(ctx.exception))
+
     def test_fallback_is_bare_gcc_and_clang(self):
         self.assertEqual(asmdiff.build_matrix([], [], None, None),
                          ["gcc -O3", "clang -O3"])
@@ -1000,6 +1040,34 @@ class TestTargetGroups(unittest.TestCase):
         msg = str(ctx.exception)
         self.assertIn("targets: c3, s3, host", msg)
         self.assertIn("groups: esp, s3", msg)
+
+    # A name the README uses but a hand-written config lacks gets a
+    # pointer at the built-in example config rather than a bare list.
+    BARE = {"host": {"cc": "gcc", "flags": ["-O3"]}}
+
+    def test_example_group_name_is_pointed_at(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.expand("native", config=self.BARE)
+        self.assertIn("native is a group in the built-in example config "
+                      "(asmdiff --example-config)", str(ctx.exception))
+
+    def test_example_target_name_is_pointed_at(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.expand("esp32s3", config=self.BARE)
+        self.assertIn("esp32s3 is a target in the built-in example config",
+                      str(ctx.exception))
+
+    def test_name_outside_the_example_gets_no_pointer(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.expand("nosuch", config=self.BARE)
+        self.assertNotIn("example config", str(ctx.exception))
+
+    def test_pointer_is_skipped_without_tomllib(self):
+        with mock.patch.object(asmdiff, "tomllib", None), \
+                mock.patch.object(asmdiff, "_EXAMPLE_NAMES", None), \
+                self.assertRaises(SystemExit) as ctx:
+            self.expand("native", config=self.BARE)
+        self.assertNotIn("example config", str(ctx.exception))
 
     def test_group_with_undefined_member_is_an_error(self):
         cfg = dict(self.CONFIG, groups={"bad": ["c3", "ghost"]})
@@ -1700,14 +1768,31 @@ class TestDiscoveredCompileCommands(unittest.TestCase):
             self.assertEqual(matrix[0].compile_commands, str(db))
             self.assertTrue(matrix[0].db_discovered)
 
-    def test_target_true_with_no_db_anywhere_errors(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cwd = Path(tmp) / "a" / "b"
-            cwd.mkdir(parents=True)
-            cfg = {"t": {"cc": "gcc", "compile_commands": True}}
-            with _inside(cwd), self.assertRaises(SystemExit) as ctx:
-                asmdiff.build_matrix([], ["t"], cfg, "c")
-            self.assertIn("compile_commands.json", str(ctx.exception))
+    def test_target_true_with_no_db_anywhere_is_a_note(self):
+        # The config describes where the target is usually compiled; a
+        # run from outside that project still gets its compilers.
+        cfg = {"t": {"cc": "gcc", "compile_commands": True}}
+        err = io.StringIO()
+        with mock.patch.object(asmdiff, "find_compile_commands",
+                               return_value=None), \
+                contextlib.redirect_stderr(err):
+            matrix = asmdiff.build_matrix([], ["t"], cfg, "c")
+        self.assertEqual(matrix, ["gcc"])
+        self.assertIsNone(matrix[0].compile_commands)
+        self.assertFalse(matrix[0].db_discovered)
+        note = err.getvalue()
+        self.assertEqual(note.count("compile_commands.json"), 1)
+        self.assertIn("target [t]", note)
+        self.assertIn("without borrowed flags", note)
+
+    def test_cli_bare_flag_with_no_db_anywhere_still_errors(self):
+        # --compile-commands asks for a database in this run, so an
+        # empty search is an error rather than a note.
+        with mock.patch.object(asmdiff, "find_compile_commands",
+                               return_value=None), \
+                self.assertRaises(SystemExit) as ctx:
+            asmdiff.build_matrix(["gcc -O3"], [], None, None, db_arg=True)
+        self.assertIn("--compile-commands", str(ctx.exception))
 
     def test_target_false_means_off(self):
         cfg = {"t": {"cc": "gcc", "compile_commands": False}}
@@ -1787,9 +1872,31 @@ class TestResolveCc(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 resolved = asmdiff.resolve_cc(f"{tmp}/esp-*/bin/xgcc", "t")
+                asmdiff.announce_glob_choices()
             # numeric sort: 15 > 13 > 9 (lexically "esp-9" would win)
             self.assertEqual(resolved, f"{tmp}/esp-15.2.0/bin/xgcc")
-            self.assertIn("matched 3 toolchains", err.getvalue())
+            self.assertIn("target [t]: cc pattern matched 3 toolchains",
+                          err.getvalue())
+
+    def test_glob_choices_sharing_a_directory_announce_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for ver in ("esp-13.2.0", "esp-15.2.0"):
+                d = Path(tmp) / ver / "bin"
+                d.mkdir(parents=True)
+                for chip in ("esp32", "esp32s3"):
+                    (d / f"xtensa-{chip}-elf-gcc").touch()
+            cfg = {"esp32": {"cc": f"{tmp}/esp-*/bin/xtensa-esp32-elf-gcc"},
+                   "esp32s3": {"cc": f"{tmp}/esp-*/bin/xtensa-esp32s3-elf-gcc"}}
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                matrix = asmdiff.build_matrix([], ["esp32", "esp32s3"], cfg, "c")
+            self.assertEqual(len(matrix), 2)
+            lines = err.getvalue().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0],
+                             "targets [esp32, esp32s3]: cc patterns matched "
+                             f"2 toolchains, using {tmp}/esp-15.2.0/bin/")
+            self.assertEqual(asmdiff._GLOB_CHOICES, [])
 
     def test_glob_single_match_is_silent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1799,6 +1906,7 @@ class TestResolveCc(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 resolved = asmdiff.resolve_cc(f"{tmp}/esp-*/bin/xgcc", "t")
+                asmdiff.announce_glob_choices()
             self.assertEqual(resolved, f"{tmp}/esp-15.2.0/bin/xgcc")
             self.assertEqual(err.getvalue(), "")
 
@@ -1855,6 +1963,40 @@ class TestRendering(unittest.TestCase):
         self.assertRegex(lines[2], r"g\s+5\s+\.L2:2\s+malloc, free")
         self.assertRegex(lines[3],
                          r"TOTAL \(2 functions\)\s+7\s+-\s+malloc, free")
+
+    def test_pairs_mode_without_pairs_falls_back_to_summary(self):
+        asm = ".text\nlonely:\n\tret\n\t.size lonely, .-lonely\n"
+        saved = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: asm
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", saved)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            asmdiff.run_pairs("h.c", ["gcc -O2"], [], [], "/tmp")
+        self.assertIn("TOTAL (1 functions)", out.getvalue())
+
+    def test_two_file_summary_tables_share_column_layout(self):
+        short = {"f": ["ret"]}
+        long = {"a_much_longer_function_name": [".L2:", "addl\t$1, %eax",
+                                                "jne\t.L2", "call\tmalloc",
+                                                "ret"]}
+        shared = asmdiff.column_widths(asmdiff.file_summary_rows(short),
+                                       asmdiff.file_summary_rows(long))
+        a = asmdiff.file_summary_table(short, None, shared).splitlines()
+        b = asmdiff.file_summary_table(long, None, shared).splitlines()
+        # the header row is laid out identically in both tables ...
+        self.assertEqual(a[0], b[0])
+        # ... so every column starts at the same offset in each
+        self.assertEqual(a[0].index("insns"), b[0].index("insns"))
+        self.assertEqual(a[0].index("calls"), b[0].index("calls"))
+        # and a table rendered alone stays as narrow as before
+        alone = asmdiff.file_summary_table(short).splitlines()
+        self.assertLess(alone[0].index("insns"), a[0].index("insns"))
+
+    def test_min_widths_keep_fit_budget_honest(self):
+        rows = [("function", "calls"), ("f", "a, b, c, d, e, f, g, h, i")]
+        wide = asmdiff.render_table(rows, max_width=40, min_widths=[20, 0])
+        for line in wide.splitlines():
+            self.assertLessEqual(len(line), 40)
 
 
 class TestInspectRendering(unittest.TestCase):
