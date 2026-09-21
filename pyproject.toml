@@ -46,6 +46,7 @@ only-include = [
     "asmdiff_example.c",
     "asmdiff.example.toml",
     "README.md",
+    "golden",
 ]
 
 [tool.hatch.build.targets.wheel]
