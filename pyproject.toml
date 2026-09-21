@@ -50,3 +50,9 @@ only-include = [
 
 [tool.hatch.build.targets.wheel]
 include = ["asmdiff.py"]
+
+[tool.uv]
+# The version is read from asmdiff.py, so a uv install from this
+# checkout must rebuild when the module changes, not only when
+# pyproject.toml does (uv default).
+cache-keys = [{ file = "pyproject.toml" }, { file = "asmdiff.py" }]
