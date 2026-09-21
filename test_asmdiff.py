@@ -372,6 +372,20 @@ class TestLoopSpans(unittest.TestCase):
         self.assertEqual(asmdiff.loop_spans(lines),
                          [(".L1", 6), (".L2", 3)])
 
+    def test_nested_span_depths(self):
+        lines = [".L1:", "movl\t$0, %ecx", ".L2:", "addl\t$1, %ecx",
+                 "cmpl\t$4, %ecx", "jne\t.L2", "decl\t%edi",
+                 "jnz\t.L1", "ret"]
+        ranges = asmdiff.loop_span_ranges(lines)
+        self.assertEqual(asmdiff.span_depths(ranges), {".L1": 0, ".L2": 1})
+
+    def test_zero_overhead_loop_nested_in_a_branch_loop(self):
+        lines = [".L1:", "loopgt\ta3, .L5", "addi.n\ta2, a2, 1",
+                 "s32i.n\ta2, a4, 0", ".L5:", "addi\ta6, a6, -1",
+                 "bnez\ta6, .L1", "retw.n"]
+        ranges = asmdiff.loop_span_ranges(lines)
+        self.assertEqual(asmdiff.span_depths(ranges), {".L1": 0, ".L5": 1})
+
     def test_xtensa_zero_overhead_loop(self):
         # loop* references its END label; the span is what it encloses.
         lines = ["loopgt\ta3, .L5", "addi.n\ta2, a2, 1",
@@ -2066,6 +2080,10 @@ class TestJsonOutput(unittest.TestCase):
         self.assertEqual(new["function"], "new_const")
         self.assertEqual(new["role"], "candidate")
         self.assertEqual(new["calls"], ["ldexpf"])
+        self.assertNotIn("delta", old)  # the baseline has no counterpart
+        self.assertEqual(new["delta"], {"insns": 0,
+                                        "calls_added": ["ldexpf"],
+                                        "calls_removed": []})
 
     def test_across_two_files_records(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2088,6 +2106,7 @@ class TestJsonOutput(unittest.TestCase):
         rec = doc["results"][0]
         self.assertEqual(rec["function"], "new_const")
         self.assertNotIn("role", rec)
+        self.assertNotIn("delta", rec)   # nothing to pair it with
 
     def test_two_file_summary_records(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2105,10 +2124,12 @@ class TestJsonOutput(unittest.TestCase):
         doc = self._run(["h.c", "looper", "--json", "--span-stats",
                          "--cc", "gcc -O2"])
         rec = doc["results"][0]
-        self.assertEqual(rec["loop_spans"], [{"label": ".L2", "insns": 3}])
+        self.assertEqual(rec["loop_spans"],
+                         [{"label": ".L2", "insns": 3, "depth": 0}])
         self.assertEqual(rec["span_stats"],
-                         [{"label": ".L2", "insns": 3, "load": 0,
-                           "store": 0, "mul": 0, "branch": 1, "other": 2}])
+                         [{"label": ".L2", "depth": 0, "insns": 3,
+                           "load": 0, "store": 0, "mul": 0, "div": 0,
+                           "branch": 1, "other": 2}])
         doc = self._run(["h.c", "looper", "--json", "--cc", "gcc -O2"])
         self.assertNotIn("span_stats", doc["results"][0])
 
@@ -2132,6 +2153,147 @@ class TestJsonOutput(unittest.TestCase):
         ccs = {r["cc"] for r in doc["results"]}
         self.assertEqual(ccs, {"gcc -O2", "gcc -O3"})
         self.assertEqual(len(doc["results"]), 4)
+
+
+class TestDelta(unittest.TestCase):
+    """The delta row closing each pair, the JSON delta object, and
+    --fail-on-growth's exit status."""
+
+    # old_rt calls exp2f in a loop; new_rt is the rewrite that folded
+    # the loop away and reaches ldexpf instead.
+    PAIR_ASM = """\
+\t.globl\told_rt
+\t.type\told_rt, @function
+old_rt:
+\tmovl\t$0, %eax
+.L2:
+\tcall\texp2f
+\taddl\t$1, %eax
+\tcmpl\t$8, %eax
+\tjne\t.L2
+\tret
+\t.size\told_rt, .-old_rt
+\t.globl\tnew_rt
+\t.type\tnew_rt, @function
+new_rt:
+\tmovl\t$-5, %edi
+\tjmp\tldexpf@PLT
+\t.size\tnew_rt, .-new_rt
+"""
+
+    # The same pair the other way round: the candidate is two
+    # instructions bigger than the baseline.
+    GROW_ASM = """\
+\t.globl\told_rt
+\t.type\told_rt, @function
+old_rt:
+\tret
+\t.size\told_rt, .-old_rt
+\t.globl\tnew_rt
+\t.type\tnew_rt, @function
+new_rt:
+\tmovl\t$0, %eax
+\taddl\t$1, %eax
+\tret
+\t.size\tnew_rt, .-new_rt
+"""
+
+    ONE_INSN_ASM = """\
+\t.globl\trt
+\t.type\trt, @function
+rt:
+\tret
+\t.size\trt, .-rt
+"""
+
+    THREE_INSN_ASM = """\
+\t.globl\trt
+\t.type\trt, @function
+rt:
+\tmovl\t$0, %eax
+\taddl\t$1, %eax
+\tret
+\t.size\trt, .-rt
+"""
+
+    def _patch_compile(self, fn):
+        real = asmdiff.compile_to_asm
+        asmdiff.compile_to_asm = fn
+        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
+        self.addCleanup(setattr, asmdiff, "FAIL_ON_GROWTH", False)
+        self.addCleanup(setattr, asmdiff, "JSON_OUT", None)
+        self.addCleanup(setattr, asmdiff, "SUMMARY_ONLY", False)
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            status = asmdiff.main(argv)
+        return status, out.getvalue(), err.getvalue()
+
+    def test_delta_row_closes_each_pair(self):
+        funcs = asmdiff.extract_functions(self.PAIR_ASM)
+        lines = asmdiff.summary_table([("old_rt", "new_rt")],
+                                      funcs).splitlines()
+        self.assertRegex(lines[1],
+                         r"old_rt\s+baseline\s+6\s+\.L2:4\s+exp2f")
+        self.assertRegex(lines[2], r"new_rt\s+candidate\s+2\s+-\s+ldexpf")
+        self.assertRegex(lines[3],
+                         r"^\s+delta\s+-4\s+-\s+\+ldexpf -exp2f$")
+
+    def test_unchanged_pair_reads_zero_and_dashes(self):
+        funcs = {"old_a": ["ret"], "new_a": ["ret"]}
+        lines = asmdiff.summary_table([("old_a", "new_a")],
+                                      funcs).splitlines()
+        self.assertRegex(lines[3], r"^\s+delta\s+0\s+-\s+-$")
+
+    def test_span_cell_pairs_positions(self):
+        funcs = {"old_l": [".L2:", "addl\t$1, %eax", "jne\t.L2"],
+                 "new_l": [".L7:", "jne\t.L7"]}
+        lines = asmdiff.summary_table([("old_l", "new_l")],
+                                      funcs).splitlines()
+        self.assertRegex(lines[3], r"delta\s+-1\s+2 -> 1\s+-$")
+
+    def test_fail_on_growth_names_the_offender(self):
+        self._patch_compile(lambda cc, extra, src, tmp: self.GROW_ASM)
+        status, _, err = self._run(["h.c", "--fail-on-growth",
+                                    "--cc", "gcc -O2"])
+        self.assertEqual(status, 3)
+        self.assertIn("growth: new_rt +2 insns (old_rt -> new_rt)", err)
+
+    def test_fail_on_growth_passes_when_nothing_grew(self):
+        self._patch_compile(lambda cc, extra, src, tmp: GCC_ASM)
+        status, _, err = self._run(["h.c", "--fail-on-growth",
+                                    "--cc", "gcc -O2"])
+        self.assertEqual(status, 0)
+        self.assertNotIn("growth:", err)
+
+    def test_fail_on_growth_across_two_files_with_json(self):
+        asms = {"a.c": self.ONE_INSN_ASM, "b.c": self.THREE_INSN_ASM}
+        self._patch_compile(
+            lambda cc, extra, src, tmp: asms[Path(src).name])
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "a.c", Path(tmp) / "b.c"
+            a.touch()
+            b.touch()
+            status, out, err = self._run([str(a), str(b), "-a", "rt",
+                                          "--json", "--fail-on-growth",
+                                          "--cc", "gcc -O2"])
+        doc = json.loads(out)          # stdout stays pure JSON
+        base, cand = doc["results"]
+        self.assertNotIn("delta", base)
+        self.assertEqual(cand["delta"]["insns"], 2)
+        self.assertEqual(status, 3)
+        self.assertIn("growth: rt +2 insns (a.c -> b.c)", err)
+
+    def test_fail_on_growth_rejected_without_pairs(self):
+        self._patch_compile(lambda cc, extra, src, tmp: GCC_ASM)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit):
+            asmdiff.main(["h.c", "new_const", "--fail-on-growth"])
+        self.assertIn("--fail-on-growth needs paired functions",
+                      err.getvalue())
 
 
 class TestVersion(unittest.TestCase):
@@ -2161,7 +2323,8 @@ class TestVersion(unittest.TestCase):
 
 
 class TestClassifyInsn(unittest.TestCase):
-    """Mnemonic buckets behind --span-stats: load/store/mul/branch/other."""
+    """Mnemonic buckets behind --span-stats: load/store/mul/div/branch/
+    other."""
 
     def test_xtensa(self):
         self.assertEqual(asmdiff.classify_insn("l32i.n\ta8, a2, 0"), "load")
@@ -2173,6 +2336,11 @@ class TestClassifyInsn(unittest.TestCase):
         self.assertEqual(asmdiff.classify_insn("loop\ta4, .L11_LEND"),
                          "branch")
         self.assertEqual(asmdiff.classify_insn("call8\tfoo"), "branch")
+        self.assertEqual(asmdiff.classify_insn("quos\ta2, a2, a3"), "div")
+        self.assertEqual(asmdiff.classify_insn("remu\ta2, a2, a3"), "div")
+        # The FPU divide is an inline sequence, not one instruction.
+        self.assertEqual(asmdiff.classify_insn("div0.s\tf0, f1"), "other")
+        self.assertEqual(asmdiff.classify_insn("nexp01.s\tf2, f1"), "other")
         self.assertEqual(asmdiff.classify_insn("addi\ta2, a2, 4"), "other")
         self.assertEqual(asmdiff.classify_insn("nop.n"), "other")
 
@@ -2184,6 +2352,11 @@ class TestClassifyInsn(unittest.TestCase):
                          "mul")
         self.assertEqual(asmdiff.classify_insn("beqz\ta0, .L4"), "branch")
         self.assertEqual(asmdiff.classify_insn("jal\tra, memcpy"), "branch")
+        self.assertEqual(asmdiff.classify_insn("divu\ta0, a1, a2"), "div")
+        self.assertEqual(asmdiff.classify_insn("remw\ta0, a1, a2"), "div")
+        self.assertEqual(asmdiff.classify_insn("fdiv.s\tfa0, fa1, fa2"),
+                         "div")
+        self.assertEqual(asmdiff.classify_insn("fsqrt.d\tfa0, fa1"), "div")
         self.assertEqual(asmdiff.classify_insn("slli\ta0, a0, 2"), "other")
 
     def test_x86_att(self):
@@ -2202,6 +2375,10 @@ class TestClassifyInsn(unittest.TestCase):
         self.assertEqual(asmdiff.classify_insn("call\tmalloc"), "branch")
         self.assertEqual(asmdiff.classify_insn("movl\t$-5, %edi"), "other")
         self.assertEqual(asmdiff.classify_insn("pushq\t%rbp"), "store")
+        self.assertEqual(asmdiff.classify_insn("idivl\t%ecx"), "div")
+        self.assertEqual(asmdiff.classify_insn("divsd\t%xmm1, %xmm0"), "div")
+        self.assertEqual(asmdiff.classify_insn("sqrtss\t%xmm0, %xmm0"),
+                         "div")
 
     def test_arm(self):
         self.assertEqual(asmdiff.classify_insn("ldr\tr0, [r1]"), "load")
@@ -2210,7 +2387,43 @@ class TestClassifyInsn(unittest.TestCase):
                          "mul")
         self.assertEqual(asmdiff.classify_insn("cbz\tr0, .L3"), "branch")
         self.assertEqual(asmdiff.classify_insn("push\t{r4, lr}"), "store")
+        self.assertEqual(asmdiff.classify_insn("sdiv\tr0, r1, r2"), "div")
+        self.assertEqual(asmdiff.classify_insn("vdiv.f32\ts0, s1, s2"),
+                         "div")
+        self.assertEqual(asmdiff.classify_insn("vsqrt.f64\td0, d1"), "div")
         self.assertEqual(asmdiff.classify_insn("eor\tr0, r0, r1"), "other")
+
+
+class TestLibcallTier(unittest.TestCase):
+    """Called symbols tiered by what the callee is, libgcc and ARM EABI
+    spellings of one operation landing in the same tier."""
+
+    CASES = [
+        ("__addsf3", "softfp"), ("__muldf3", "softfp"),
+        ("__negdf2", "softfp"), ("__unordsf2", "softfp"),
+        ("__extendsfdf2", "softfp"), ("__truncdfsf2", "softfp"),
+        ("__fixsfsi", "softfp"), ("__fixunsdfdi", "softfp"),
+        ("__floatsidf", "softfp"), ("__floatunsisf", "softfp"),
+        ("__aeabi_dmul", "softfp"), ("__aeabi_fcmplt", "softfp"),
+        ("__aeabi_f2d", "softfp"), ("__aeabi_ui2d", "softfp"),
+        ("__divsf3", "softfp-div"), ("__divdf3", "softfp-div"),
+        ("__aeabi_fdiv", "softfp-div"), ("__aeabi_ddiv", "softfp-div"),
+        ("__divsi3", "int-div"), ("__udivdi3", "int-div"),
+        ("__umodsi3", "int-div"), ("__udivmoddi4", "int-div"),
+        ("__aeabi_idiv", "int-div"), ("__aeabi_uidivmod", "int-div"),
+        ("__aeabi_ldivmod", "int-div"),
+        ("sqrtf", "libm"), ("exp2f", "libm"), ("pow", "libm"),
+        ("atan2f", "libm"), ("ldexpf", "libm"),
+        ("memcpy", "mem"), ("memset", "mem"), ("memmove", "mem"),
+        ("memcmp", "mem"),
+        ("indirect(a8)", "call"), ("esp_timer_get_time", "call"),
+        ("__my_helper", "call"), ("sqrtish", "call"),
+    ]
+
+    def test_tiers(self):
+        for sym, tier in self.CASES:
+            with self.subTest(sym=sym):
+                self.assertEqual(asmdiff.libcall_tier(sym), tier)
 
 
 class TestSpanStats(unittest.TestCase):
@@ -2228,9 +2441,17 @@ class TestSpanStats(unittest.TestCase):
         out = asmdiff.span_stats_table(["f"], {"f": self.LINES})
         lines = out.splitlines()
         self.assertRegex(lines[0],
-                         r"function\s+span\s+insns\s+load\s+store\s+mul"
-                         r"\s+branch\s+other")
-        self.assertRegex(lines[1], r"f\s+\.L2\s+5\s+1\s+1\s+1\s+1\s+1")
+                         r"function\s+span\s+depth\s+insns\s+load\s+store"
+                         r"\s+mul\s+div\s+branch\s+other")
+        self.assertRegex(lines[1],
+                         r"f\s+\.L2\s+0\s+5\s+1\s+1\s+1\s+0\s+1\s+1")
+
+    def test_table_reports_nesting_depth(self):
+        lines = [".L1:", "movl\t$0, %ecx", ".L2:", "addl\t$1, %ecx",
+                 "jne\t.L2", "jnz\t.L1"]
+        out = asmdiff.span_stats_table(["f"], {"f": lines}).splitlines()
+        self.assertRegex(out[1], r"f\s+\.L1\s+0\s+")
+        self.assertRegex(out[2], r"f\s+\.L2\s+1\s+")
 
     def test_no_spans_prints_note(self):
         out = asmdiff.span_stats_table(["g"], {"g": ["ret"]})
@@ -2247,7 +2468,7 @@ class TestSpanStats(unittest.TestCase):
                           "--cc", "gcc -O2"])
         # .L2 span: addl, cmpl, jne -> 2 other + 1 branch
         self.assertRegex(out.getvalue(),
-                         r"looper\s+\.L2\s+3\s+0\s+0\s+0\s+1\s+2")
+                         r"looper\s+\.L2\s+0\s+3\s+0\s+0\s+0\s+0\s+1\s+2")
 
     def test_elf_mode_span_stats(self):
         real = asmdiff.run_objdump
@@ -2263,7 +2484,7 @@ class TestSpanStats(unittest.TestCase):
                               "--objdump", "od"])
         # ZOL body: add.n, l32i, add.n, nop.n -> 1 load + 3 other
         self.assertRegex(out.getvalue(),
-                         r"render_lut\s+\.L\S+\s+4\s+1\s+0\s+0\s+0\s+3")
+                         r"render_lut\s+\.L\S+\s+0\s+4\s+1\s+0\s+0\s+0\s+0\s+3")
 
 
 class TestSummaryOnly(unittest.TestCase):

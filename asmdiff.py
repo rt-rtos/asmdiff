@@ -15,7 +15,7 @@ Usage:
                              [--config PATH] [--compile-commands [PATH]]
                              [--flags-like PATH] [--db-includes]
                              [--filter REGEX] [--summary-only]
-                             [--collapse] [--span-stats]
+                             [--collapse] [--span-stats] [--fail-on-growth]
                              [--json] [--layout list|side-by-side] [-v]
                              [-- EXTRA_FLAGS...]
     tools/asmdiff/asmdiff.py FIRMWARE.elf [FUNC...] [--filter REGEX]
@@ -59,10 +59,17 @@ Five modes:
 Four flags shape the output: --summary-only prints only the stats
 tables, --collapse elides identical runs in side-by-side listings
 keeping context around each difference, --span-stats follows each
-stats table with a per-loop-span instruction mix (load/store/mul/
-branch/other counts; branch includes calls), and --json replaces the
-tables with one JSON document of per-function records (implies
---summary-only) for scripted callers.
+stats table with a per-loop-span instruction mix (nesting depth and
+load/store/mul/div/branch/other counts; branch includes calls), and
+--json replaces the tables with one JSON document of per-function
+records (implies --summary-only) for scripted callers.
+
+Paired output answers the paired question itself: every summary table
+closes a pair with a delta row (signed instruction count, per-span
+before -> after, callees gained with + and lost with -), --json carries
+the same under each candidate's `delta`, and --fail-on-growth exits 3,
+naming every grown candidate on stderr, so CI can fail a rewrite that
+was meant to shrink without reconstructing the pairing in jq.
 
 Compilers come from named targets in an asmdiff.toml config file
 (-t/--target NAME: a table, a [groups] name, a comma-list, or a glob),
@@ -798,6 +805,20 @@ def analyze(lines):
     return insns, calls
 
 
+def pair_delta(base_lines, cand_lines):
+    """What the candidate changed against its baseline: the signed
+    instruction delta and the callees it gained and lost.
+
+    The pairing is the tool's own, so the reader never has to
+    reconstruct it from two rows (or a caller from two JSON records).
+    """
+    base_insns, base_calls = analyze(base_lines)
+    cand_insns, cand_calls = analyze(cand_lines)
+    return {"insns": cand_insns - base_insns,
+            "calls_added": [s for s in cand_calls if s not in base_calls],
+            "calls_removed": [s for s in base_calls if s not in cand_calls]}
+
+
 # A local-label operand (branch target, zero-overhead loop end).  Literal
 # pool labels (.LC0) also match, but they are emitted outside function
 # bodies, so they never appear in the label map built from a body.
@@ -840,6 +861,22 @@ def loop_span_ranges(lines):
             in sorted(spans.items(), key=lambda kv: kv[1])]
 
 
+def span_depths(ranges):
+    """Return {label: depth} for loop_span_ranges output.
+
+    Depth counts the spans strictly containing a span: an outermost
+    loop is 0, a loop nested in it 1.  It says where a span sits, not
+    how hot it is - the trip counts are the source's business - but a
+    span at depth 1 runs its body once per iteration of the span at
+    depth 0.  Two labels over exactly the same range (one loop body
+    reached by two edges) contain each other under no reading, so both
+    keep the depth of whatever encloses them.
+    """
+    return {label: sum(1 for _, lo2, hi2 in ranges
+                       if (lo2, hi2) != (lo, hi) and lo2 <= lo and hi <= hi2)
+            for label, lo, hi in ranges}
+
+
 def loop_spans(lines):
     """Return [(label, insns)] spans for cleaned asm lines.
 
@@ -875,6 +912,18 @@ _STORE_MNEMONICS = frozenset("""
 _MUL_PREFIXES = ("mul", "imul", "fmul", "fmadd", "fmsub", "fnmadd",
                  "fnmsub", "madd", "msub", "mla", "mls", "smul", "umul",
                  "smla", "umla", "vmul", "vmla", "vmls", "vfma", "vfms")
+# Hardware divide and square root, the two multi-cycle arithmetic
+# instructions worth separating from the rest.  Xtensa FPU divide is an
+# inline Newton-Raphson sequence (div0.s, nexp01.s, divn.s, ...) rather
+# than one instruction, so those stay in "other": counting them as
+# divides would price one divide as eight.
+_DIV_MNEMONICS = frozenset("""
+    quos quou rems remu
+    div divu rem remu divw divuw remw remuw fdiv.s fdiv.d fsqrt.s fsqrt.d
+    sdiv udiv vdiv vsqrt
+    idiv divb divl divq idivb idivw idivl idivq
+    divss divsd divps divpd sqrtss sqrtsd
+""".split())
 _BRANCH_MNEMONICS = frozenset("""
     beq bne blt bge bltu bgeu beqz bnez beqi bnei blti bgei bltui bgeui
     bbci bbsi bbc bbs bany bnone ball bnall bt bf
@@ -886,7 +935,7 @@ _BRANCH_MNEMONICS = frozenset("""
 
 
 def classify_insn(line):
-    """Bucket one cleaned instruction: load/store/mul/branch/other.
+    """Bucket one cleaned instruction: load/store/mul/div/branch/other.
 
     Branch means any control transfer, calls included (a span's
     outbound calls are already itemised in the calls column).  For
@@ -904,6 +953,8 @@ def classify_insn(line):
         return "store"
     if base.startswith(_MUL_PREFIXES):
         return "mul"
+    if mnem in _DIV_MNEMONICS or base in _DIV_MNEMONICS:
+        return "div"
     if mnem in _BRANCH_MNEMONICS or base in _BRANCH_MNEMONICS:
         return "branch"
     if base.startswith(("j", "call", "loop")):
@@ -923,19 +974,74 @@ def classify_insn(line):
     return "other"
 
 
-_MIX_KEYS = ("load", "store", "mul", "branch", "other")
+# Outbound calls by what the callee costs, most specific tier first.
+# libgcc and the ARM EABI spell the same helper differently (__muldf3
+# vs __aeabi_dmul), so both names reach the same tier.  mem* is tiered
+# to be counted, never priced: its cost is the size argument, which the
+# asm does not show.  Names no pattern knows stay in "call", where the
+# calls column already shows them by name.
+_LIBCALL_TIERS = (
+    ("softfp-div", (
+        r"__div(sf|df)3",
+        r"__aeabi_[fd]div",
+    )),
+    ("int-div", (
+        r"__u?(div|mod)(si|di|ti)3",
+        r"__u?divmod\w+",
+        r"__aeabi_(u?idiv(mod)?|u?ldivmod)",
+    )),
+    ("softfp", (
+        r"__(add|sub|mul|neg|eq|ne|gt|ge|lt|le|unord|cmp)(sf|df)[23]?",
+        r"__(extend|trunc)(sf|df)(sf|df)2",
+        r"__fix(uns)?(sf|df)(si|di|ti)",
+        r"__float(un)?(si|di|ti)(sf|df)",
+        r"__aeabi_[fd](add|sub|mul|neg|cmp\w*|2\w+)",
+        r"__aeabi_u?[il]2[fd]",
+    )),
+    ("libm", (
+        r"(sqrt|sin|cos|tan|exp|exp2|log|log2|log10|pow|atan2?|fmod"
+        r"|ldexp|frexp)f?",
+    )),
+    ("mem", (
+        r"mem(cpy|set|move|cmp)",
+    )),
+)
+_LIBCALL_TIER_RES = [(tier, re.compile("|".join(pats)))
+                     for tier, pats in _LIBCALL_TIERS]
+
+
+def libcall_tier(sym):
+    """Tier one called symbol: softfp, softfp-div, int-div, libm, mem,
+    or call.
+
+    The tier says what a call to that symbol is, not what it costs: a
+    weight per tier comes from a measured cost profile, and mem and
+    call never get one.  A call through a register ("indirect(a8)")
+    tiers as call.
+    """
+    for tier, pattern in _LIBCALL_TIER_RES:
+        if pattern.fullmatch(sym):
+            return tier
+    return "call"
+
+
+_MIX_KEYS = ("load", "store", "mul", "div", "branch", "other")
 
 
 def span_mix(lines):
-    """[{label, insns, load, store, mul, branch, other}] per loop span
-    of one function — the data behind --span-stats, table and JSON."""
+    """[{label, depth, insns, load, store, mul, div, branch, other}] per
+    loop span of one function — the data behind --span-stats, table and
+    JSON."""
     result = []
-    for label, lo, hi in loop_span_ranges(lines):
+    ranges = loop_span_ranges(lines)
+    depths = span_depths(ranges)
+    for label, lo, hi in ranges:
         body = [ln for ln in lines[lo:hi + 1] if not ln.endswith(":")]
         counts = dict.fromkeys(_MIX_KEYS, 0)
         for ln in body:
             counts[classify_insn(ln)] += 1
-        entry = {"label": label, "insns": len(body)}
+        entry = {"label": label, "depth": depths[label],
+                 "insns": len(body)}
         entry.update(counts)
         result.append(entry)
     return result
@@ -944,15 +1050,16 @@ def span_mix(lines):
 def span_stats_table(fn_names, funcs, max_width=None):
     """Per-span instruction mix for the named functions.
 
-    One row per loop span: how many of its instructions load, store,
-    multiply, or branch.  This weighs the span the way the doctrine
-    asks — the hand-written awk this replaces kept counting past the
-    loop end into the epilogue.
+    One row per loop span: its nesting depth, and how many of its
+    instructions load, store, multiply, divide, or branch.  This weighs
+    the span the way the doctrine asks — the hand-written awk this
+    replaces kept counting past the loop end into the epilogue.
     """
-    rows = [("function", "span", "insns") + _MIX_KEYS]
+    rows = [("function", "span", "depth", "insns") + _MIX_KEYS]
     for name in fn_names:
         for mix in span_mix(funcs[name]):
-            rows.append((name, mix["label"], str(mix["insns"]))
+            rows.append((name, mix["label"], str(mix["depth"]),
+                         str(mix["insns"]))
                         + tuple(str(mix[k]) for k in _MIX_KEYS))
     if len(rows) == 1:
         return "(no loop spans)"
@@ -1315,6 +1422,25 @@ SPAN_STATS = False
 # --json: collect summary records here instead of printing tables;
 # None means normal table output.  main() dumps the collected list.
 JSON_OUT = None
+# --fail-on-growth: candidates whose instruction count exceeds their
+# baseline's, as (function, delta, baseline label, candidate label).
+# main() turns a non-empty list into exit status 3, which a CI job can
+# tell from the tool's own error status 1 and argparse's usage 2.
+FAIL_ON_GROWTH = False
+GROWTH = []
+
+
+def note_growth(func, base_lines, cand_lines, base_label, cand_label):
+    """Record a pair whose candidate grew, for --fail-on-growth.
+
+    A no-op without the flag, so the pair walk costs nothing when
+    nobody asked for the exit status.
+    """
+    if not FAIL_ON_GROWTH:
+        return
+    grew = analyze(cand_lines)[0] - analyze(base_lines)[0]
+    if grew > 0:
+        GROWTH.append((func, grew, base_label, cand_label))
 
 
 def span_stats_block(fn_names, funcs):
@@ -1325,11 +1451,12 @@ def span_stats_block(fn_names, funcs):
         print(span_stats_table(fn_names, funcs, table_width()))
 
 
-def json_record(name, lines, cc=None, tag=None, role=None):
+def json_record(name, lines, cc=None, tag=None, role=None, baseline=None):
     """One --json result: a summary-table row as data.  cc is the
     resolved compiler command, tag the source/side label of a two-file
-    comparison, role baseline/candidate for paired rows; each is
-    omitted where the mode has no such notion."""
+    comparison, role baseline/candidate for paired rows, baseline the
+    paired baseline's lines, which adds the candidate's delta object;
+    each is omitted where the mode has no such notion."""
     insns, calls = analyze(lines)
     rec = {"function": name}
     if cc is not None:
@@ -1339,9 +1466,13 @@ def json_record(name, lines, cc=None, tag=None, role=None):
     if role is not None:
         rec["role"] = role
     rec["insns"] = insns
-    rec["loop_spans"] = [{"label": label, "insns": n}
+    depths = span_depths(loop_span_ranges(lines))
+    rec["loop_spans"] = [{"label": label, "insns": n,
+                          "depth": depths[label]}
                          for label, n in loop_spans(lines)]
     rec["calls"] = calls
+    if baseline is not None:
+        rec["delta"] = pair_delta(baseline, lines)
     if SPAN_STATS:
         rec["span_stats"] = span_mix(lines)
     return rec
@@ -1580,10 +1711,39 @@ def format_calls(calls):
     return ", ".join(calls)
 
 
+def format_delta_insns(n):
+    """Signed instruction delta, with an unsigned zero so a row that
+    changed nothing does not read as a small improvement."""
+    return f"{n:+d}" if n else "0"
+
+
+def format_delta_spans(base_spans, cand_spans):
+    """Per-position "before -> after" span sizes.
+
+    Only the sizes: the labels are the compiler's and rarely survive a
+    rewrite.  Sides with different span counts print "-" instead, since
+    a loop that was fused, split or unrolled away leaves the positions
+    with nothing to line up against.
+    """
+    if not base_spans or len(base_spans) != len(cand_spans):
+        return "-"
+    return " ".join(f"{b} -> {c}" for (_, b), (_, c)
+                    in zip(base_spans, cand_spans))
+
+
+def format_delta_calls(delta):
+    """Callees the candidate gained (+) and lost (-), "-" for an
+    unchanged call set."""
+    changed = (["+" + s for s in delta["calls_added"]]
+               + ["-" + s for s in delta["calls_removed"]])
+    return " ".join(changed) or "-"
+
+
 def summary_table(pairs, funcs, max_width=None):
     """Instruction counts, loop spans, and outbound calls per pair
-    member. Calls come last: the one unbounded column stays ragged
-    right so the counts and spans keep their alignment."""
+    member, and a delta row closing each pair. Calls come last: the one
+    unbounded column stays ragged right so the counts and spans keep
+    their alignment."""
     rows = [("function", "role", "insns", "loop spans", "calls")]
     for old, new in pairs:
         for name, role in ((old, "baseline"), (new, "candidate")):
@@ -1591,6 +1751,11 @@ def summary_table(pairs, funcs, max_width=None):
             rows.append((name, role, str(insns),
                          format_spans(loop_spans(funcs[name])),
                          format_calls(calls)))
+        delta = pair_delta(funcs[old], funcs[new])
+        rows.append(("", "delta", format_delta_insns(delta["insns"]),
+                     format_delta_spans(loop_spans(funcs[old]),
+                                        loop_spans(funcs[new])),
+                     format_delta_calls(delta)))
     return render_table(rows, max_width)
 
 
@@ -1658,12 +1823,15 @@ def report_across(fn_names, left_funcs, right_funcs, left_tag, right_tag,
         sys.exit("error: function(s) not in asm: " + ", ".join(missing)
                  + f"; {left_tag} has: " + (", ".join(left_funcs) or "none")
                  + f"; {right_tag} has: " + (", ".join(right_funcs) or "none"))
+    for f in fn_names:
+        note_growth(f, left_funcs[f], right_funcs[f], left_tag, right_tag)
     if JSON_OUT is not None:
         for f in fn_names:
             JSON_OUT.append(json_record(f, left_funcs[f], cc=ccs[0],
                                         tag=left_tag, role="baseline"))
             JSON_OUT.append(json_record(f, right_funcs[f], cc=ccs[1],
-                                        tag=right_tag, role="candidate"))
+                                        tag=right_tag, role="candidate",
+                                        baseline=left_funcs[f]))
         return
     decorated, pairs = {}, []
     for f in fn_names:
@@ -1826,12 +1994,15 @@ def run_pairs(source, matrix, pair_specs, extra_flags, tmp):
             sys.exit("error: function(s) not in asm: "
                      + ", ".join(missing)
                      + "; functions seen: " + ", ".join(funcs))
+        for old, new in pairs:
+            note_growth(new, funcs[old], funcs[new], old, new)
         if JSON_OUT is not None:
             for old, new in pairs:
                 JSON_OUT.append(json_record(old, funcs[old], cc=cc_cmd,
                                             role="baseline"))
                 JSON_OUT.append(json_record(new, funcs[new], cc=cc_cmd,
-                                            role="candidate"))
+                                            role="candidate",
+                                            baseline=funcs[old]))
             continue
         print(f"\n== {cc_cmd} ==\n")
         if not SUMMARY_ONLY:
@@ -2103,9 +2274,17 @@ def main(argv=None):
                              "and targets, then exit (no source file needed)")
     parser.add_argument("--span-stats", action="store_true",
                         help="follow each stats table with a per-loop-span "
-                             "instruction mix (load/store/mul/branch/other "
-                             "counts) - weighs the span instead of the "
-                             "whole function")
+                             "instruction mix (nesting depth and load/"
+                             "store/mul/div/branch/other counts) - weighs "
+                             "the span instead of the whole function")
+    parser.add_argument("--fail-on-growth", action="store_true",
+                        help="exit 3 if any candidate has more "
+                             "instructions than its baseline, naming each "
+                             "one on stderr - the CI check for a rewrite "
+                             "that was meant to shrink.  Needs paired "
+                             "functions (--pair, auto-paired old_X/new_X, "
+                             "or --across); status 1 stays a tool error, "
+                             "2 a usage error")
     parser.add_argument("-C", "--collapse", action="store_true",
                         help="in side-by-side listings, elide runs of "
                              "identical line pairs, keeping "
@@ -2132,7 +2311,7 @@ def main(argv=None):
                              "the first lines")
     args = parser.parse_args(argv)
     global VERBOSE, FLAGS_LIKE, SUMMARY_ONLY, COLLAPSE, SPAN_STATS
-    global DB_INCLUDES, JSON_OUT
+    global DB_INCLUDES, JSON_OUT, FAIL_ON_GROWTH
     VERBOSE = args.verbose
     FLAGS_LIKE = args.flags_like
     SUMMARY_ONLY = args.summary_only or args.json
@@ -2140,6 +2319,8 @@ def main(argv=None):
     SPAN_STATS = args.span_stats
     DB_INCLUDES = args.db_includes
     JSON_OUT = [] if args.json else None
+    FAIL_ON_GROWTH = args.fail_on_growth
+    del GROWTH[:]                       # main() may run twice in a process
 
     if args.example_config:
         sys.stdout.write(EXAMPLE_CONFIG)
@@ -2154,6 +2335,14 @@ def main(argv=None):
         parser.error("SOURCE.c required")
 
     sources, fn_names = split_positionals(args.sources)
+    # Growth is a property of a pair, so the modes that never pair
+    # (inspect, whole-file summary, ELF) reject the flag rather than
+    # exiting 0 on a check that never ran.
+    if args.fail_on_growth and (is_elf(sources[0]) or fn_names
+                                or (args.filter and len(sources) == 1)
+                                or (len(sources) == 2 and not args.across)):
+        parser.error("--fail-on-growth needs paired functions: --pair, "
+                     "auto-pairs, or --across")
     if is_elf(sources[0]):
         if len(sources) > 1:
             parser.error("ELF input analyzes one binary; a second file "
@@ -2239,6 +2428,11 @@ def main(argv=None):
     if JSON_OUT is not None:
         print(json.dumps({"asmdiff": __version__, "mode": mode,
                           "results": JSON_OUT}, indent=2))
+    if GROWTH:
+        for func, grew, base_label, cand_label in GROWTH:
+            print(f"growth: {func} +{grew} insns "
+                  f"({base_label} -> {cand_label})", file=sys.stderr)
+        return 3
     return status
 
 

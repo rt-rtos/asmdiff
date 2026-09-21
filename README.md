@@ -96,6 +96,7 @@ ret                                          | jmp     ldexpf@PLT
 function   role       insns  loop spans  calls
 old_scale  baseline   3      -           -
 new_scale  candidate  3      -           ldexpf
+           delta      0      -           +ldexpf
 ```
 
 Read the `calls` column first: `-` means the construct lowered to inline
@@ -159,6 +160,7 @@ retw.n                                       |
 function        role       insns  loop spans  calls
 old_elapsed_ms  baseline   10     -           __udivdi3
 new_elapsed_ms  candidate  6      -           -
+                delta      -4     -           -__udivdi3
 ```
 
 The candidate is six inline instructions ending in a multiply-high by
@@ -352,7 +354,8 @@ asmdiff SOURCE.c [SOURCE2.c | FUNC...] [--pair OLD:NEW]... [--across FUNC]...
            [--target NAME]... [--cc 'CC FLAGS']... [--config PATH]
            [--compile-commands [PATH]] [--flags-like PATH] [--db-includes]
            [--filter REGEX] [--summary-only] [--collapse] [--span-stats]
-           [--layout list|side-by-side] [-v] [-- EXTRA_FLAGS...]
+           [--fail-on-growth] [--layout list|side-by-side] [-v]
+           [-- EXTRA_FLAGS...]
 asmdiff FIRMWARE.elf [FUNC...] [--filter REGEX] [--objdump PATH]
            [-l list] [--summary-only] [--span-stats]
 asmdiff --edit-config | --example-config | --list-targets | --version
@@ -376,7 +379,8 @@ asmdiff --edit-config | --example-config | --list-targets | --version
 | `-s`, `--summary-only` | Print only the summary/stats tables, suppressing every assembly listing (see [Shaping the output](#shaping-the-output-for-reading-vs-deciding)). |
 | `--json` | Emit the summary as JSON on stdout instead of tables — one record per function per compiler. Implies `--summary-only`; errors stay plain text on stderr. |
 | `-C, --collapse` | In side-by-side listings, omit runs of identical line pairs, keeping 3 lines of context around each difference. |
-| `--span-stats` | Follow each stats table with a per-loop-span instruction mix: load/store/mul/branch/other counts per span. |
+| `--span-stats` | Follow each stats table with a per-loop-span instruction mix: nesting depth and load/store/mul/div/branch/other counts per span. |
+| `--fail-on-growth` | Exit 3, naming each offender on stderr, if any candidate has more instructions than its baseline; exit 0 otherwise. Needs paired functions (`--pair`, auto-paired `old_X`/`new_X`, or `--across`). |
 | `--version` | Print the version and exit. |
 | `-v`, `--verbose` | On compile failure, print the full compiler command and complete error output. Default shows only the compiler, the source, and the first error lines. |
 | `-- FLAGS...` | Everything after a bare `--` is appended to *every* compiler invocation. |
@@ -429,8 +433,8 @@ output to purpose:
   instruction mix, one row per span:
 
   ```
-  function       span    insns  load  store  mul  branch  other
-  stereo_reverb  .L108   327    96    31     14    12     174
+  function       span    depth  insns  load  store  mul  div  branch  other
+  stereo_reverb  .L108   0      327    96    31     14   0    12      174
   ```
 
   This weighs the span rather than the whole function — the number that
@@ -442,6 +446,9 @@ output to purpose:
   transfer — conditional and unconditional branches, calls, and
   returns (outbound calls are already itemised by name in the `calls`
   column) — and anything the tables don't know lands in *other*.
+  *div* is a hardware divide or square root; a division done by a
+  libcall (`__divsf3`, `__udivdi3`) is a call, and the Xtensa FPU
+  divide sequence counts as the several instructions it is.
 
   Reading *branch* inside a span: a software loop's own backedge is
   one of them, because the span runs from the label to the last
@@ -462,13 +469,29 @@ For scripted callers, `--json` replaces the tables entirely with one
 JSON document on stdout: a flat `results` list holding one record per
 function per compiler — `cc`, `tag` (source label in two-file runs),
 `role` (`baseline`/`candidate` in paired runs), `insns`, `loop_spans`,
-`calls`, and `span_stats` when `--span-stats` is given. Flat records
-keep it one `jq` expression away from any question the tables answer.
-There is no built-in jq subcommand and there won't be: the tool prints
-JSON on stdout, so a plain `| jq` pipe *is* the integration, and jq
-already does the filtering better than a wrapper flag could.
+`calls`, `delta` (on candidate records), and `span_stats` when
+`--span-stats` is given. Flat records keep it one `jq` expression away
+from any question the tables answer.
+The pairing questions the tool answers itself, because the pairing is
+its own: every summary table closes a pair with a `delta` row (signed
+instruction count, per-span `before -> after`, callees gained with `+`
+and lost with `-`), each candidate record carries the same as a `delta`
+object, and `--fail-on-growth` makes it an exit status:
 
-A few recipes that cover the common questions:
+```bash
+# Fail the job when a rewrite that was meant to shrink did not
+asmdiff old.c new.c -a stereo_reverb -t esp32s3 --fail-on-growth -s
+```
+
+Exit 3 and one `growth: FUNC +N insns (BASELINE -> CANDIDATE)` line per
+offender on stderr if any candidate has more instructions than its
+baseline, exit 0 otherwise; status 1 is left meaning the tool itself
+failed and 2 is argparse's usage error, so a job can tell "grew" from
+"did not compile" from "misused the flags".
+
+Arbitrary selection stays jq's: the tool prints JSON on stdout, so a
+plain `| jq` pipe *is* the integration, and jq does that filtering
+better than a wrapper flag could. A few recipes:
 
 ```bash
 # Instruction count per function per side, as a table
@@ -478,16 +501,6 @@ asmdiff old.c new.c --json \
 # Only the functions that emit libcalls (soft-float, __divdi3, memcpy…)
 asmdiff old.c new.c --json \
   | jq '.results[] | select(.calls | length > 0) | {function, tag, calls}'
-
-# Per-function old→new instruction delta (regressions have a positive delta)
-asmdiff old.c new.c --json \
-  | jq -r '.results | group_by(.function)[] | select(length == 2)
-           | "\(.[0].function): \(.[0].insns) -> \(.[1].insns) (\(.[1].insns - .[0].insns))"'
-
-# Fail CI if any function grew, using jq's exit status
-asmdiff old.c new.c --json \
-  | jq -e '.results | group_by(.function)
-           | all(length < 2 or .[1].insns <= .[0].insns)' > /dev/null
 
 # The full record for one hot function, spans and all
 asmdiff old.c new.c -a stereo_reverb --json --span-stats \
@@ -907,6 +920,7 @@ call    SMULR6                               | leal    1024(%rax), %edx
 function                     role       insns  loop spans  calls
 dsps_biquad_f32_ansi [cc#1]  baseline   59     .L27:32     SMULR6
 dsps_biquad_f32_ansi [cc#2]  candidate  89     .L26:54     -
+                             delta      +30    32 -> 54    -SMULR6
 ```
 
 (The listing is abridged here; the tool prints all 92 rows. The columns
@@ -945,6 +959,7 @@ ret                                          |
 function       role       insns  loop spans  calls
 new_rt [cc#1]  baseline   13     -           ldexpf
 new_rt [cc#2]  candidate  2      -           ldexpf
+               delta      -11    -           -
 ```
 
 **Two files** — before/after versions of a source file (e.g. from a git
@@ -1001,8 +1016,10 @@ The summary makes the trade-off immediate:
 function                              role       insns  calls
 exp2_lut [amy-baseline/log2_exp2.c]   baseline   65     exp2f
 exp2_lut [amy/log2_exp2.c]            candidate  59     ldexpf
+                                      delta      -6     +ldexpf -exp2f
 log2_lut [amy-baseline/log2_exp2.c]   baseline   58     -
 log2_lut [amy/log2_exp2.c]            candidate  64     ldexpf
+                                      delta      +6     +ldexpf
 ```
 
 The runtime site improves (a leaner libcall replaces `exp2f` + multiply),
