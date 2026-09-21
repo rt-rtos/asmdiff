@@ -1,0 +1,17 @@
+
+function    insns  loop spans   calls
+render_lut  8      .L11_LEND:4  -
+
+function    span       depth  insns  load  store  mul  div  branch  other
+render_lut  .L11_LEND  0      4      1     0      0    0    0       3
+
+render_lut:
+	entry	a1, 32
+	movi.n	a10, 0
+	loop	a4, .L11_LEND
+	add.n	a2, a10, a3
+	l32i	a0, a2, 0
+	add.n	a10, a10, a0
+	nop.n
+.L11_LEND:
+	retw.n

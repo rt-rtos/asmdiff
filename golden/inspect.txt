@@ -1,0 +1,11 @@
+
+function  insns  loop spans  calls
+looper    5      .L2:3       -
+
+looper:
+	xorl	%eax, %eax
+.L2:
+	addl	$1, %eax
+	cmpl	$8, %eax
+	jne	.L2
+	ret

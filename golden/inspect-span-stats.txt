@@ -1,0 +1,14 @@
+
+function  insns  loop spans  calls
+looper    5      .L2:3       -
+
+function  span  depth  insns  load  store  mul  div  branch  other
+looper    .L2   0      3      0     0      0    0    1       2
+
+looper:
+	xorl	%eax, %eax
+.L2:
+	addl	$1, %eax
+	cmpl	$8, %eax
+	jne	.L2
+	ret

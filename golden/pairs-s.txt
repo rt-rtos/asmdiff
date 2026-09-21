@@ -1,0 +1,11 @@
+
+cc#1: gcc -O2
+cc#2: clang -O2
+
+target  function   role       insns  loop spans  calls
+cc#1    old_const  baseline   2      -           -
+cc#1    new_const  candidate  2      -           ldexpf
+cc#1               delta      0      -           +ldexpf
+cc#2    old_const  baseline   2      -           -
+cc#2    new_const  candidate  2      -           ldexpf
+cc#2               delta      0      -           +ldexpf

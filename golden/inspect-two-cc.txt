@@ -1,0 +1,15 @@
+
+cc#1: gcc -O2
+cc#2: clang -O2
+
+function          role       insns  loop spans  calls
+new_const [cc#1]  baseline   2      -           ldexpf
+new_const [cc#2]  candidate  2      -           ldexpf
+                  delta      0      -           -
+
+== cc#1 vs cc#2 ==
+
+new_const [cc#1]                                 | new_const [cc#2]
+-------------------------------------------------+-------------------------------------------------
+movl    $-5, %edi                                | movl    $-5, %edi
+jmp     ldexpf@PLT                               | jmp     ldexpf@PLT

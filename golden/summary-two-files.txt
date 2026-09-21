@@ -1,0 +1,8 @@
+
+file  function             insns  loop spans  calls
+a.c   old_const            2      -           -
+a.c   new_const            2      -           ldexpf
+a.c   TOTAL (2 functions)  4      -           ldexpf
+b.c   old_const            2      -           -
+b.c   new_const            2      -           ldexpf
+b.c   TOTAL (2 functions)  4      -           ldexpf

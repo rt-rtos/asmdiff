@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for asmdiff.py.  Run: python3 tools/asmdiff/test_asmdiff.py -v"""
 import contextlib
+import difflib
 import io
 import json
 import os
@@ -639,15 +640,6 @@ class TestElfMode(unittest.TestCase):
         self.assertEqual(asmdiff.derive_objdump(["clang -O3", "gcc -O2"]),
                          "objdump")
 
-    def test_named_function_listing_and_table(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            status, out = self._run([self._elf(tmp), "render_lut",
-                                     "--objdump", "od"])
-        self.assertEqual(status, 0)
-        self.assertIn("render_lut:", out)
-        self.assertIn("loop\ta4, .L11_LEND", out)
-        self.assertIn("function", out)           # stats table header
-
     def test_filter_prints_table_without_listings(self):
         with tempfile.TemporaryDirectory() as tmp:
             status, out = self._run([self._elf(tmp), "--filter", "render_",
@@ -678,11 +670,41 @@ class TestElfMode(unittest.TestCase):
         self.assertIn("render_lut:", out)
         self.assertNotIn("summarized without listings", out)
 
-    def test_layout_side_by_side_rejected_for_elf(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self._expect_error([self._elf(tmp), "--filter", "r",
-                                "-l", "side-by-side", "--objdump", "od"],
-                               "-l list")
+    # (case, argv with ELF and SOURCE standing in for the two files the
+    # case needs on disk, fragment the message must carry)
+    ARGUMENT_ERRORS = [
+        ("side-by-side layout",
+         ["ELF", "--filter", "r", "-l", "side-by-side", "--objdump", "od"],
+         "-l list"),
+        ("misspelled function name",
+         ["ELF", "rendr_lut", "--objdump", "od"], "render_lut"),
+        ("neither a name nor a filter",
+         ["ELF", "--objdump", "od"], "--filter"),
+        ("filter matches nothing",
+         ["ELF", "--filter", "zzz", "--objdump", "od"], "matched no function"),
+        ("bad filter regex",
+         ["ELF", "--filter", "(", "--objdump", "od"], "bad --filter regex"),
+        ("compile-only flags",
+         ["ELF", "f", "--pair", "a:b", "--objdump", "od"], "disassembled"),
+        ("a second file",
+         ["ELF", "SOURCE", "--objdump", "od"], "one binary"),
+        ("filter with a pair",
+         ["SOURCE", "--pair", "a:b", "--filter", "r"],
+         "--pair/--across name their functions"),
+        ("no gcc to derive an objdump from",
+         ["ELF", "f", "--cc", "clang -O3"], "--objdump"),
+    ]
+
+    def test_elf_argument_errors(self):
+        for case, argv, fragment in self.ARGUMENT_ERRORS:
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory() as tmp:
+                    source = Path(tmp) / "b.c"
+                    source.touch()
+                    filled = [{"ELF": self._elf(tmp),
+                               "SOURCE": str(source)}.get(arg, arg)
+                              for arg in argv]
+                    self._expect_error(filled, fragment)
 
     def test_names_and_filter_combine(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -692,48 +714,6 @@ class TestElfMode(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("fx_mix:", out)            # named: listed
         self.assertIn("render_lut", out)         # filtered: in the table
-
-    def test_unknown_function_suggests_close_match(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self._expect_error([self._elf(tmp), "rendr_lut",
-                                "--objdump", "od"],
-                               "render_lut")
-
-    def test_bare_elf_needs_names_or_filter(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self._expect_error([self._elf(tmp), "--objdump", "od"],
-                               "--filter")
-
-    def test_filter_matching_nothing_errors(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self._expect_error([self._elf(tmp), "--filter", "zzz",
-                                "--objdump", "od"], "matched no function")
-
-    def test_bad_filter_regex_errors(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self._expect_error([self._elf(tmp), "--filter", "(",
-                                "--objdump", "od"], "bad --filter regex")
-
-    def test_compile_flags_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self._expect_error([self._elf(tmp), "f", "--pair", "a:b",
-                                "--objdump", "od"], "disassembled")
-
-    def test_second_file_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            other = Path(tmp) / "b.c"
-            other.touch()
-            self._expect_error([self._elf(tmp), str(other),
-                                "--objdump", "od"], "one binary")
-
-    def test_filter_with_pair_rejected(self):
-        self._expect_error(["x.c", "--pair", "a:b", "--filter", "r"],
-                           "--pair/--across name their functions")
-
-    def test_no_gcc_in_matrix_needs_objdump(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self._expect_error([self._elf(tmp), "f", "--cc", "clang -O3"],
-                               "--objdump")
 
     def test_target_db_discovery_not_triggered(self):
         # ELF mode never compiles, so a target's compile_commands = true
@@ -842,42 +822,32 @@ class TestSplitPositionals(unittest.TestCase):
     """SOURCE.c FUNC grammar: extra positionals are files when they
     exist, function names when bare, and errors when path-like typos."""
 
-    def test_existing_file_is_a_source(self):
+    def test_positional_grammar(self):
         with tempfile.TemporaryDirectory() as tmp:
             second = Path(tmp) / "b.c"
             second.touch()
-            sources, fns = asmdiff.split_positionals(["a.c", str(second)])
-        self.assertEqual(sources, ["a.c", str(second)])
-        self.assertEqual(fns, [])
+            # (positionals, sources, function names)
+            cases = [
+                (["a.c", str(second)], ["a.c", str(second)], []),
+                (["a.c", "render_lut"], ["a.c"], ["render_lut"]),
+                (["a.c", "f", "g"], ["a.c"], ["f", "g"]),
+                # The first positional is the source whatever it looks like.
+                (["no_suffix_name"], ["no_suffix_name"], []),
+            ]
+            for argv, sources, fns in cases:
+                with self.subTest(argv=argv):
+                    self.assertEqual(asmdiff.split_positionals(argv),
+                                     (sources, fns))
 
-    def test_bare_name_is_a_function(self):
-        sources, fns = asmdiff.split_positionals(["a.c", "render_lut"])
-        self.assertEqual(sources, ["a.c"])
-        self.assertEqual(fns, ["render_lut"])
-
-    def test_several_function_names(self):
-        sources, fns = asmdiff.split_positionals(["a.c", "f", "g"])
-        self.assertEqual(sources, ["a.c"])
-        self.assertEqual(fns, ["f", "g"])
-
-    def test_missing_source_suffix_arg_errors(self):
-        with self.assertRaises(SystemExit) as ctx:
-            asmdiff.split_positionals(["a.c", "typo.c"])
-        self.assertIn("no such file", str(ctx.exception))
-
-    def test_missing_path_separator_arg_errors(self):
-        with self.assertRaises(SystemExit) as ctx:
-            asmdiff.split_positionals(["a.c", "src/render"])
-        self.assertIn("no such file", str(ctx.exception))
-
-    def test_uppercase_asm_suffix_is_path_like(self):
-        with self.assertRaises(SystemExit):
-            asmdiff.split_positionals(["a.c", "startup.S"])
-
-    def test_first_positional_is_always_a_source(self):
-        sources, fns = asmdiff.split_positionals(["no_suffix_name"])
-        self.assertEqual(sources, ["no_suffix_name"])
-        self.assertEqual(fns, [])
+    def test_path_like_positional_errors(self):
+        # A suffix, a path separator, or an uppercase .S: a mistyped file
+        # rather than a function name, and named as such.
+        for argv in (["a.c", "typo.c"], ["a.c", "src/render"],
+                     ["a.c", "startup.S"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(SystemExit) as ctx:
+                    asmdiff.split_positionals(argv)
+                self.assertIn("no such file", str(ctx.exception))
 
 
 class TestAsmOutputName(unittest.TestCase):
@@ -911,15 +881,6 @@ class TestBuildMatrix(unittest.TestCase):
                                       self.CONFIG, "cfg.toml")
         self.assertEqual(matrix, ["tcc -O1", "gcc -O3"])
 
-    def test_config_default_target_used_when_nothing_given(self):
-        self.assertEqual(asmdiff.build_matrix([], [], self.CONFIG, "c"),
-                         ["xtensa-gcc -O2 -mlongcalls"])
-
-    def test_config_default_may_be_a_list(self):
-        cfg = dict(self.CONFIG, default=["s3", "host"])
-        self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
-                         ["xtensa-gcc -O2 -mlongcalls", "gcc -O3"])
-
     # `default` is expanded exactly like -t, so the standing matrix can
     # be named by a group, a comma list, or a glob.
     GROUPED = {"groups": {"native": ["gcc", "clang"]},
@@ -928,57 +889,49 @@ class TestBuildMatrix(unittest.TestCase):
                "esp32c3": {"cc": "riscv-gcc", "flags": ["-O2"]},
                "esp32c6": {"cc": "riscv-gcc", "flags": ["-Os"]}}
 
-    def test_config_default_may_name_a_group(self):
-        cfg = dict(self.GROUPED, default="native")
-        self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
-                         ["gcc -O3", "clang -O3"])
+    # (config, its `default` value, the matrix it builds)
+    DEFAULTS = [
+        (CONFIG, "s3", ["xtensa-gcc -O2 -mlongcalls"]),
+        (CONFIG, ["s3", "host"], ["xtensa-gcc -O2 -mlongcalls", "gcc -O3"]),
+        (GROUPED, "native", ["gcc -O3", "clang -O3"]),
+        (GROUPED, "esp32c*", ["riscv-gcc -O2", "riscv-gcc -Os"]),
+        (GROUPED, ["esp32c3", "native"],
+         ["riscv-gcc -O2", "gcc -O3", "clang -O3"]),
+        (GROUPED, "clang,esp32c3", ["clang -O3", "riscv-gcc -O2"]),
+    ]
 
-    def test_config_default_may_be_a_glob(self):
-        cfg = dict(self.GROUPED, default="esp32c*")
-        self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
-                         ["riscv-gcc -O2", "riscv-gcc -Os"])
-
-    def test_config_default_list_mixes_targets_and_groups(self):
-        cfg = dict(self.GROUPED, default=["esp32c3", "native"])
-        self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
-                         ["riscv-gcc -O2", "gcc -O3", "clang -O3"])
-
-    def test_config_default_comma_list_expands(self):
-        cfg = dict(self.GROUPED, default="clang,esp32c3")
-        self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
-                         ["clang -O3", "riscv-gcc -O2"])
-
-    def test_config_default_unknown_name_errors_like_target(self):
-        cfg = dict(self.CONFIG, default="ghost")
-        with self.assertRaises(SystemExit) as ctx:
-            asmdiff.build_matrix([], [], cfg, "cfg.toml")
-        self.assertIn("no [ghost] target", str(ctx.exception))
-
-    def test_config_default_must_be_a_name_or_array_of_names(self):
-        cfg = dict(self.CONFIG, default=3)
-        with self.assertRaises(SystemExit) as ctx:
-            asmdiff.build_matrix([], [], cfg, "cfg.toml")
-        self.assertIn("default", str(ctx.exception))
+    def test_config_default_expands_like_target(self):
+        for config, default, matrix in self.DEFAULTS:
+            with self.subTest(default=default):
+                cfg = dict(config, default=default)
+                self.assertEqual(asmdiff.build_matrix([], [], cfg, "c"),
+                                 matrix)
 
     def test_fallback_is_bare_gcc_and_clang(self):
         self.assertEqual(asmdiff.build_matrix([], [], None, None),
                          ["gcc -O3", "clang -O3"])
 
-    def test_unknown_target_errors_and_lists_known(self):
-        with self.assertRaises(SystemExit) as ctx:
-            asmdiff.build_matrix([], ["nope"], self.CONFIG, "cfg.toml")
-        self.assertIn("host", str(ctx.exception))
-        self.assertIn("s3", str(ctx.exception))
+    # (case, config, -t tokens, fragments the error must carry)
+    CONFIG_ERRORS = [
+        ("unknown default", dict(CONFIG, default="ghost"), [],
+         ["no [ghost] target"]),
+        ("default of the wrong type", dict(CONFIG, default=3), [],
+         ["default"]),
+        ("unknown target names the known ones", CONFIG, ["nope"],
+         ["host", "s3"]),
+        ("flags not an array", {"bad": {"cc": "gcc", "flags": "-O3"}},
+         ["bad"], ["flags must be an array"]),
+        ("target without cc", {"bad": {"flags": ["-O3"]}}, ["bad"],
+         ['needs cc = "compiler"']),
+    ]
 
-    def test_target_flags_must_be_an_array(self):
-        cfg = {"bad": {"cc": "gcc", "flags": "-O3"}}
-        with self.assertRaises(SystemExit):
-            asmdiff.build_matrix([], ["bad"], cfg, "cfg.toml")
-
-    def test_target_needs_cc_string(self):
-        cfg = {"bad": {"flags": ["-O3"]}}
-        with self.assertRaises(SystemExit):
-            asmdiff.build_matrix([], ["bad"], cfg, "cfg.toml")
+    def test_matrix_config_errors(self):
+        for case, cfg, targets, fragments in self.CONFIG_ERRORS:
+            with self.subTest(case=case):
+                with self.assertRaises(SystemExit) as ctx:
+                    asmdiff.build_matrix([], targets, cfg, "cfg.toml")
+                for fragment in fragments:
+                    self.assertIn(fragment, str(ctx.exception))
 
     def test_costs_table_is_not_a_target(self):
         cfg = dict(self.CONFIG, costs={"bench": {"measured_on": "S3",
@@ -1006,61 +959,60 @@ class TestTargetGroups(unittest.TestCase):
         return asmdiff.expand_target_args(list(tokens),
                                           config or self.CONFIG, "cfg.toml")
 
-    def test_group_expands_in_declared_order(self):
-        self.assertEqual(self.expand("esp"), ["c3", "s3"])
+    # (-t tokens, the target names they expand to, in order)
+    EXPANSIONS = [
+        (["esp"], ["c3", "s3"]),                    # a group, as declared
+        (["host,c3", "s3"], ["host", "c3", "s3"]),  # comma list then a name
+        (["?3"], ["c3", "s3"]),                     # glob, in config order
+        (["s3"], ["s3"]),                           # target beats the group
+        (["[c,s]3"], ["c3", "s3"]),                 # comma inside a class
+    ]
 
-    def test_comma_list_and_repeat_keep_order(self):
-        self.assertEqual(self.expand("host,c3", "s3"), ["host", "c3", "s3"])
-
-    def test_glob_matches_targets_in_config_order(self):
-        self.assertEqual(self.expand("?3"), ["c3", "s3"])
-
-    def test_exact_target_beats_group_of_same_name(self):
-        self.assertEqual(self.expand("s3"), ["s3"])
-
-    def test_comma_inside_glob_class_does_not_split(self):
-        self.assertEqual(self.expand("[c,s]3"), ["c3", "s3"])
+    def test_expansion_order(self):
+        for tokens, expected in self.EXPANSIONS:
+            with self.subTest(tokens=tokens):
+                self.assertEqual(self.expand(*tokens), expected)
 
     def test_group_resolves_through_build_matrix(self):
         self.assertEqual(
             asmdiff.build_matrix([], ["esp"], self.CONFIG, "cfg.toml"),
             ["riscv-gcc -O2", "xtensa-gcc -Os"])
 
-    def _expect_exit(self, fragment, *tokens, config=None):
-        with self.assertRaises(SystemExit) as ctx:
-            self.expand(*tokens, config=config)
-        self.assertIn(fragment, str(ctx.exception))
-
-    def test_glob_with_no_match_is_an_error(self):
-        self._expect_exit("matched no target", "zz*")
-
-    def test_unknown_name_lists_targets_and_groups(self):
-        with self.assertRaises(SystemExit) as ctx:
-            self.expand("nope")
-        msg = str(ctx.exception)
-        self.assertIn("targets: c3, s3, host", msg)
-        self.assertIn("groups: esp, s3", msg)
-
     # A name the README uses but a hand-written config lacks gets a
     # pointer at the built-in example config rather than a bare list.
     BARE = {"host": {"cc": "gcc", "flags": ["-O3"]}}
 
-    def test_example_group_name_is_pointed_at(self):
-        with self.assertRaises(SystemExit) as ctx:
-            self.expand("native", config=self.BARE)
-        self.assertIn("native is a group in the built-in example config "
-                      "(asmdiff --example-config)", str(ctx.exception))
+    # (case, config, -t tokens, fragments present, fragments absent)
+    EXPANSION_ERRORS = [
+        ("glob matching nothing", None, ["zz*"], ["matched no target"], []),
+        ("unknown name lists what there is", None, ["nope"],
+         ["targets: c3, s3, host", "groups: esp, s3"], []),
+        ("group naming an undefined target",
+         dict(CONFIG, groups={"bad": ["c3", "ghost"]}), ["bad"],
+         ["ghost"], []),
+        ("empty group", dict(CONFIG, groups={"none": []}), ["none"],
+         ["non-empty"], []),
+        ("group that is not an array",
+         dict(CONFIG, groups={"bad": "c3"}), ["bad"], ["groups.bad"], []),
+        ("empty token", None, [","], ["empty --target"], []),
+        ("example group name", BARE, ["native"],
+         ["native is a group in the built-in example config "
+          "(asmdiff --example-config)"], []),
+        ("example target name", BARE, ["esp32s3"],
+         ["esp32s3 is a target in the built-in example config"], []),
+        ("name in no config at all", BARE, ["nosuch"], [], ["example config"]),
+    ]
 
-    def test_example_target_name_is_pointed_at(self):
-        with self.assertRaises(SystemExit) as ctx:
-            self.expand("esp32s3", config=self.BARE)
-        self.assertIn("esp32s3 is a target in the built-in example config",
-                      str(ctx.exception))
-
-    def test_name_outside_the_example_gets_no_pointer(self):
-        with self.assertRaises(SystemExit) as ctx:
-            self.expand("nosuch", config=self.BARE)
-        self.assertNotIn("example config", str(ctx.exception))
+    def test_expansion_errors(self):
+        for case, config, tokens, present, absent in self.EXPANSION_ERRORS:
+            with self.subTest(case=case):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.expand(*tokens, config=config)
+                msg = str(ctx.exception)
+                for fragment in present:
+                    self.assertIn(fragment, msg)
+                for fragment in absent:
+                    self.assertNotIn(fragment, msg)
 
     def test_pointer_is_skipped_without_tomllib(self):
         with mock.patch.object(asmdiff, "tomllib", None), \
@@ -1068,21 +1020,6 @@ class TestTargetGroups(unittest.TestCase):
                 self.assertRaises(SystemExit) as ctx:
             self.expand("native", config=self.BARE)
         self.assertNotIn("example config", str(ctx.exception))
-
-    def test_group_with_undefined_member_is_an_error(self):
-        cfg = dict(self.CONFIG, groups={"bad": ["c3", "ghost"]})
-        self._expect_exit("ghost", "bad", config=cfg)
-
-    def test_empty_group_is_an_error(self):
-        cfg = dict(self.CONFIG, groups={"none": []})
-        self._expect_exit("non-empty", "none", config=cfg)
-
-    def test_group_must_be_an_array_of_strings(self):
-        cfg = dict(self.CONFIG, groups={"bad": "c3"})
-        self._expect_exit("groups.bad", "bad", config=cfg)
-
-    def test_empty_token_is_an_error(self):
-        self._expect_exit("empty --target", ",")
 
     def test_groups_table_is_not_a_target(self):
         self.assertEqual(asmdiff.config_target_names(self.CONFIG),
@@ -1142,70 +1079,62 @@ class TestListTargets(unittest.TestCase):
 class TestIncludeFlags(unittest.TestCase):
     """Lifting include/define flags out of one recorded compile command."""
 
-    def test_glued_and_split_include_paths(self):
-        toks = ["cc", "-Iinc", "-I", "inc2", "-c", "a.c"]
-        self.assertEqual(asmdiff.include_flags(toks, "/build"),
-                         ["-I", "/build/inc", "-I", "/build/inc2"])
-
-    def test_absolute_paths_left_alone(self):
-        self.assertEqual(asmdiff.include_flags(["-I/abs/inc"], "/build"),
-                         ["-I", "/abs/inc"])
-
-    def test_defines_glued_and_split(self):
-        self.assertEqual(
-            asmdiff.include_flags(["-DFOO=1", "-D", "BAR", "-UNDEBUG"], "/b"),
-            ["-DFOO=1", "-DBAR", "-UNDEBUG"])
-
-    def test_system_and_forced_include_families(self):
-        toks = ["-isystem", "sys", "-iquote", "q", "-idirafter", "d",
-                "-include", "cfg.h", "-imacros", "m.h"]
-        self.assertEqual(
-            asmdiff.include_flags(toks, "/build"),
-            ["-isystem", "/build/sys", "-iquote", "/build/q",
-             "-idirafter", "/build/d", "-include", "/build/cfg.h",
-             "-imacros", "/build/m.h"])
-
-    def test_non_include_flags_and_source_dropped(self):
-        toks = ["gcc", "-O2", "-std=c11", "-Wall", "-g", "-c", "a.c",
-                "-o", "a.o", "-Iinc"]
-        self.assertEqual(asmdiff.include_flags(toks, "/b"), ["-I", "/b/inc"])
-
-    def test_dangling_flag_at_end_ignored(self):
-        self.assertEqual(asmdiff.include_flags(["-Iinc", "-I"], "/b"),
-                         ["-I", "/b/inc"])
-
-    def test_lowercase_isystem_not_split_as_capital_I(self):
+    # (case, tokens of the recorded command, directory, flags lifted)
+    CASES = [
+        ("glued and split include paths",
+         ["cc", "-Iinc", "-I", "inc2", "-c", "a.c"], "/build",
+         ["-I", "/build/inc", "-I", "/build/inc2"]),
+        ("absolute path left alone", ["-I/abs/inc"], "/build",
+         ["-I", "/abs/inc"]),
+        ("defines glued and split",
+         ["-DFOO=1", "-D", "BAR", "-UNDEBUG"], "/b",
+         ["-DFOO=1", "-DBAR", "-UNDEBUG"]),
+        ("system and forced include families",
+         ["-isystem", "sys", "-iquote", "q", "-idirafter", "d",
+          "-include", "cfg.h", "-imacros", "m.h"], "/build",
+         ["-isystem", "/build/sys", "-iquote", "/build/q",
+          "-idirafter", "/build/d", "-include", "/build/cfg.h",
+          "-imacros", "/build/m.h"]),
+        ("non-include flags and the source dropped",
+         ["gcc", "-O2", "-std=c11", "-Wall", "-g", "-c", "a.c",
+          "-o", "a.o", "-Iinc"], "/b", ["-I", "/b/inc"]),
+        ("dangling flag at the end", ["-Iinc", "-I"], "/b",
+         ["-I", "/b/inc"]),
         # -isystem must not be read as -I + "system".
-        self.assertEqual(asmdiff.include_flags(["-isystem", "/s"], ""),
-                         ["-isystem", "/s"])
+        ("lowercase isystem", ["-isystem", "/s"], "", ["-isystem", "/s"]),
+    ]
+
+    def test_include_flag_families(self):
+        for case, toks, directory, expected in self.CASES:
+            with self.subTest(case=case):
+                self.assertEqual(asmdiff.include_flags(toks, directory),
+                                 expected)
 
 
 class TestSpecsAndSysroot(unittest.TestCase):
     """Driver flags that change the header environment (-specs, --sysroot)."""
 
-    def test_specs_glued_bare_name_not_resolved(self):
+    # (case, tokens, directory, flags lifted)
+    CASES = [
         # A bare specs name (no path separator) is found in the compiler's
         # own search dirs; gluing a directory onto it would break it.
-        self.assertEqual(
-            asmdiff.include_flags(["-specs=picolibc.specs"], "/build"),
-            ["-specs=picolibc.specs"])
+        ("bare specs name", ["-specs=picolibc.specs"], "/build",
+         ["-specs=picolibc.specs"]),
+        ("specs with a path", ["-specs=./custom/my.specs"], "/build",
+         ["-specs=/build/custom/my.specs"]),
+        ("split and double-dash specs",
+         ["-specs", "nano.specs", "--specs=nosys.specs"], "/b",
+         ["-specs=nano.specs", "--specs=nosys.specs"]),
+        ("sysroot glued and split",
+         ["--sysroot=sr", "--sysroot", "/abs"], "/b",
+         ["--sysroot=/b/sr", "--sysroot=/abs"]),
+    ]
 
-    def test_specs_with_path_resolved_against_directory(self):
-        self.assertEqual(
-            asmdiff.include_flags(["-specs=./custom/my.specs"], "/build"),
-            ["-specs=/build/custom/my.specs"])
-
-    def test_specs_split_and_double_dash(self):
-        self.assertEqual(
-            asmdiff.include_flags(["-specs", "nano.specs",
-                                   "--specs=nosys.specs"], "/b"),
-            ["-specs=nano.specs", "--specs=nosys.specs"])
-
-    def test_sysroot_glued_and_split(self):
-        self.assertEqual(
-            asmdiff.include_flags(["--sysroot=sr", "--sysroot", "/abs"],
-                                  "/b"),
-            ["--sysroot=/b/sr", "--sysroot=/abs"])
+    def test_specs_and_sysroot_forms(self):
+        for case, toks, directory, expected in self.CASES:
+            with self.subTest(case=case):
+                self.assertEqual(asmdiff.include_flags(toks, directory),
+                                 expected)
 
 
 class TestResponseFiles(unittest.TestCase):
@@ -1657,15 +1586,18 @@ class TestMarkDbMisses(unittest.TestCase):
 
 
 class TestMangledPairHint(unittest.TestCase):
-    def test_mangled_old_new_detected(self):
-        self.assertTrue(asmdiff.mangled_pair_hint(
-            ["_Z9old_scalef", "_Z9new_scalef"]))
+    # (function names seen in the asm, hint offered)
+    CASES = [
+        (["_Z9old_scalef", "_Z9new_scalef"], True),
+        (["scale", "helper"], False),
+        (["_Z6renderv"], False),
+    ]
 
-    def test_plain_c_names_no_hint(self):
-        self.assertFalse(asmdiff.mangled_pair_hint(["scale", "helper"]))
-
-    def test_mangled_but_not_old_new_no_hint(self):
-        self.assertFalse(asmdiff.mangled_pair_hint(["_Z6renderv"]))
+    def test_mangled_pair_hint_cases(self):
+        for names, expected in self.CASES:
+            with self.subTest(names=names):
+                self.assertEqual(bool(asmdiff.mangled_pair_hint(names)),
+                                 expected)
 
 
 class TestCompileFailureOutput(unittest.TestCase):
@@ -1739,30 +1671,26 @@ class TestLabels(unittest.TestCase):
     def labels(self, *args, **kw):
         return [row.label for row in asmdiff.build_matrix(*args, **kw)]
 
-    def test_target_rows_take_the_config_name(self):
-        self.assertEqual(self.labels([], ["host"], self.CONFIG, "cfg.toml"),
-                         ["host"])
+    # (case, --cc strings, -t names, config, labels)
+    ROWS = [
+        ("target rows take the config name", [], ["host"], CONFIG, ["host"]),
+        ("the default entry too", [], [], CONFIG, ["s3"]),
+        ("--cc rows are numbered by position", ["gcc -O2", "clang -O2"], [],
+         None, ["cc#1", "cc#2"]),
+        ("a lone --cc row keeps its command", ["gcc -O2"], [], None,
+         ["gcc -O2"]),
+        ("a mixed matrix numbers only the --cc rows", ["gcc -O2"], ["host"],
+         CONFIG, ["cc#1", "host"]),
+        ("the fallback matrix is numbered", [], [], None, ["cc#1", "cc#2"]),
+    ]
 
-    def test_default_entry_takes_the_config_name(self):
-        self.assertEqual(self.labels([], [], self.CONFIG, "cfg.toml"),
-                         ["s3"])
-
-    def test_cc_rows_are_numbered_by_position(self):
-        self.assertEqual(self.labels(["gcc -O2", "clang -O2"], [],
-                                     None, None),
-                         ["cc#1", "cc#2"])
-
-    def test_lone_cc_row_keeps_its_command(self):
-        self.assertEqual(self.labels(["gcc -O2"], [], None, None),
-                         ["gcc -O2"])
-
-    def test_mixed_matrix_numbers_only_the_cc_rows(self):
-        self.assertEqual(self.labels(["gcc -O2"], ["host"], self.CONFIG,
-                                     "cfg.toml"),
-                         ["cc#1", "host"])
-
-    def test_fallback_rows_are_numbered(self):
-        self.assertEqual(self.labels([], [], None, None), ["cc#1", "cc#2"])
+    def test_matrix_row_labels(self):
+        for case, ccs, targets, config, expected in self.ROWS:
+            with self.subTest(case=case):
+                self.assertEqual(
+                    self.labels(ccs, targets, config,
+                                "cfg.toml" if config else None),
+                    expected)
 
     def test_label_survives_the_costs_override(self):
         cfg = dict(self.CONFIG,
@@ -1785,19 +1713,24 @@ class TestLabels(unittest.TestCase):
             asmdiff.print_legend(rows)
         return out.getvalue()
 
-    def test_lone_cc_row_prints_no_legend(self):
-        self.assertEqual(self._legend(asmdiff.build_matrix(["gcc -O2"], [],
-                                                           None, None)), "")
-
-    def test_lone_target_row_prints_a_legend(self):
-        rows = asmdiff.build_matrix([], ["host"], self.CONFIG, "cfg.toml")
-        self.assertIn("host: gcc -O3", self._legend(rows))
-
-    def test_several_rows_print_a_legend(self):
-        legend = self._legend(asmdiff.build_matrix(["gcc -O2", "clang -O2"],
-                                                   [], None, None))
-        self.assertIn("cc#1: gcc -O2", legend)
-        self.assertIn("cc#2: clang -O2", legend)
+    def test_legend_per_matrix_shape(self):
+        # A lone --cc row is its own legend, so printing one would only
+        # repeat the command line; every other shape resolves a label.
+        cases = [
+            ("lone --cc row", ["gcc -O2"], [], None, []),
+            ("lone target row", [], ["host"], self.CONFIG, ["host: gcc -O3"]),
+            ("two --cc rows", ["gcc -O2", "clang -O2"], [], None,
+             ["cc#1: gcc -O2", "cc#2: clang -O2"]),
+        ]
+        for case, ccs, targets, config, expected in cases:
+            with self.subTest(case=case):
+                rows = asmdiff.build_matrix(ccs, targets, config,
+                                            "cfg.toml" if config else None)
+                legend = self._legend(rows)
+                if not expected:
+                    self.assertEqual(legend, "")
+                for line in expected:
+                    self.assertIn(line, legend)
 
 
 class TestCollectedFailures(unittest.TestCase):
@@ -1877,18 +1810,18 @@ class TestCollectedFailures(unittest.TestCase):
 
 
 class TestFormatCalls(unittest.TestCase):
-    def test_short_list_unchanged(self):
-        self.assertEqual(asmdiff.format_calls(["a", "b"]), "a, b")
-
-    def test_empty_is_dash(self):
-        self.assertEqual(asmdiff.format_calls([]), "-")
-
-    def test_long_list_capped(self):
-        calls = [f"fn{i}" for i in range(12)]
-        out = asmdiff.format_calls(calls)
-        self.assertTrue(out.endswith("... (12 total)"))
-        self.assertIn("fn7", out)
-        self.assertNotIn("fn8,", out)
+    def test_callee_cell_cases(self):
+        # (case, callees, the cell they render as)
+        cases = [
+            ("short list unchanged", ["a", "b"], "a, b"),
+            ("no callees", [], "-"),
+            ("long list capped, the count kept",
+             [f"fn{i}" for i in range(12)],
+             "fn0, fn1, fn2, fn3, fn4, fn5, fn6, fn7, ... (12 total)"),
+        ]
+        for case, calls, expected in cases:
+            with self.subTest(case=case):
+                self.assertEqual(asmdiff.format_calls(calls), expected)
 
 
 class TestTableMaxWidth(unittest.TestCase):
@@ -2199,13 +2132,6 @@ class TestResolveCc(unittest.TestCase):
 
 
 class TestRendering(unittest.TestCase):
-    def test_side_by_side_pads_and_fills(self):
-        out = asmdiff.side_by_side(["a"], ["b", "c"], "L", "R", width=4)
-        lines = out.splitlines()
-        self.assertEqual(lines[0], "L    | R")
-        self.assertEqual(lines[2], "a    | b")
-        self.assertEqual(lines[3], "     | c")
-
     def test_side_by_side_drops_trailing_comments(self):
         cases = [
             # (line, width, what survives, what the comment took away)
@@ -2226,38 +2152,6 @@ class TestRendering(unittest.TestCase):
         out = asmdiff.listing("f", ["jmp\tldexpf@PLT # TAILCALL"])
         self.assertIn("# TAILCALL", out)
 
-    def test_summary_table(self):
-        funcs = {"old_c": ["mulss\tx, %xmm0", "ret"],
-                 "new_c": ["jmp\tldexpf@PLT"]}
-        out = asmdiff.summary_table(
-            [asmdiff.Block("gcc -O2", funcs, [("old_c", "new_c")])])
-        lines = out.splitlines()
-        self.assertIn("function", lines[0])
-        self.assertIn("loop spans", lines[0])
-        self.assertTrue(lines[0].endswith("calls"))
-        self.assertRegex(lines[1], r"old_c\s+baseline\s+2\s+-\s+-")
-        self.assertRegex(lines[2], r"new_c\s+candidate\s+1\s+-\s+ldexpf")
-
-    def test_summary_table_loop_spans_column(self):
-        funcs = {"a": [".L2:", "addl\t$1, %eax", "jne\t.L2"],
-                 "b": ["ret"]}
-        out = asmdiff.summary_table(
-            [asmdiff.Block("gcc -O2", funcs, [("a", "b")])])
-        lines = out.splitlines()
-        self.assertRegex(lines[1], r"a\s+baseline\s+2\s+\.L2:2\s+-")
-        self.assertRegex(lines[2], r"b\s+candidate\s+1\s+-\s+-")
-
-    def test_file_summary_totals_and_call_union(self):
-        funcs = {"f": ["call\tmalloc", "ret"],
-                 "g": [".L2:", "addl\t$1, %eax", "jne\t.L2",
-                       "call\tmalloc", "call\tfree", "ret"]}
-        out = asmdiff.file_summary_table([asmdiff.Block("gcc -O2", funcs)])
-        lines = out.splitlines()
-        self.assertRegex(lines[1], r"f\s+2\s+-\s+malloc")
-        self.assertRegex(lines[2], r"g\s+5\s+\.L2:2\s+malloc, free")
-        self.assertRegex(lines[3],
-                         r"TOTAL \(2 functions\)\s+7\s+-\s+malloc, free")
-
     def test_pairs_mode_without_pairs_falls_back_to_summary(self):
         asm = ".text\nlonely:\n\tret\n\t.size lonely, .-lonely\n"
         saved = asmdiff.compile_to_asm
@@ -2268,23 +2162,6 @@ class TestRendering(unittest.TestCase):
             asmdiff.run_pairs("h.c", ["gcc -O2"], [], [], "/tmp")
         self.assertIn("TOTAL (1 functions)", out.getvalue())
 
-    def test_two_file_summary_is_one_table_with_a_file_column(self):
-        short = {"f": ["ret"]}
-        long = {"a_much_longer_function_name": [".L2:", "addl\t$1, %eax",
-                                                "jne\t.L2", "call\tmalloc",
-                                                "ret"]}
-        out = asmdiff.file_summary_table(
-            [asmdiff.Block("gcc -O2", short, "a.c"),
-             asmdiff.Block("gcc -O2", long, "b.c")]).splitlines()
-        # One matrix row, so no target column; the file column leads
-        # and every row says which file it came from.
-        self.assertRegex(out[0], r"^file\s+function\s+insns")
-        self.assertRegex(out[1], r"^a\.c\s+f\s+1\s+")
-        self.assertRegex(out[3], r"^b\.c\s+a_much_longer_function_name\s+")
-        # ... and one layout: a column starts at the same offset in
-        # both files' rows.
-        self.assertEqual(out[1].index("a.c"), out[3].index("b.c"))
-
     def test_several_rows_lead_with_a_target_column(self):
         funcs = {"f": ["ret"]}
         out = asmdiff.file_summary_table(
@@ -2294,99 +2171,11 @@ class TestRendering(unittest.TestCase):
         self.assertRegex(out[1], r"^gcc\s+a\.c\s+f\s+")
         self.assertRegex(out[3], r"^esp32s3\s+a\.c\s+f\s+")
 
-    def test_single_row_keeps_the_plain_header(self):
-        funcs = {"old_c": ["ret"], "new_c": ["ret"]}
-        blocks = [asmdiff.Block("gcc -O2", funcs, [("old_c", "new_c")])]
-        header = asmdiff.summary_table(blocks).splitlines()[0]
-        self.assertRegex(header,
-                         r"^function\s+role\s+insns\s+loop spans\s+calls$")
-
-    def test_pair_table_repeats_the_target_on_every_row(self):
-        funcs = {"old_c": ["ret"], "new_c": ["ret"]}
-        pairs = [("old_c", "new_c")]
-        lines = asmdiff.summary_table(
-            [asmdiff.Block("gcc", funcs, pairs),
-             asmdiff.Block("esp32s3", funcs, pairs)]).splitlines()
-        self.assertRegex(lines[0], r"^target\s+function\s+role\s+insns")
-        self.assertRegex(lines[1], r"^gcc\s+old_c\s+baseline")
-        self.assertRegex(lines[3], r"^gcc\s+delta\s+0")  # no function cell
-        self.assertRegex(lines[4], r"^esp32s3\s+old_c\s+baseline")
-
     def test_empty_block_keeps_its_line(self):
         out = asmdiff.file_summary_table(
             [asmdiff.Block("gcc", {"f": ["ret"]}, "a.c"),
              asmdiff.Block("gcc", {}, "b.c")]).splitlines()
         self.assertRegex(out[-1], r"^b\.c\s+\(none\)")
-
-    def _run_pairs(self, matrix):
-        saved = asmdiff.compile_to_asm
-        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
-        self.addCleanup(setattr, asmdiff, "compile_to_asm", saved)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            asmdiff.run_pairs("h.c", matrix, [], [], "/tmp")
-        return out.getvalue()
-
-    def test_pairs_run_prints_one_table_before_the_listings(self):
-        matrix = asmdiff.build_matrix(["gcc -O2", "clang -O2"], [],
-                                      None, None)
-        lines = self._run_pairs(matrix).splitlines()
-        headers = [i for i, line in enumerate(lines)
-                   if line.startswith("target ")]
-        self.assertEqual(len(headers), 1)        # one table for the matrix
-        self.assertRegex(lines[headers[0]],
-                         r"^target\s+function\s+role\s+insns")
-        groups = [i for i, line in enumerate(lines)
-                  if line.startswith("== ")]
-        self.assertEqual([lines[i] for i in groups],
-                         ["== cc#1 ==", "== cc#2 =="])
-        self.assertLess(headers[0], groups[0])   # table, then listings
-
-    def test_single_row_run_keeps_the_0_4_0_header(self):
-        matrix = asmdiff.build_matrix(["gcc -O2"], [], None, None)
-        out = self._run_pairs(matrix)
-        header = next(line for line in out.splitlines()
-                      if line.startswith("function"))
-        self.assertRegex(header,
-                         r"^function\s+role\s+insns\s+loop spans\s+calls$")
-        self.assertNotIn("target", out)          # nothing to tell apart
-        self.assertNotIn("== ", out)             # nor to group listings by
-
-
-class TestInspectRendering(unittest.TestCase):
-    def test_listing_layout(self):
-        funcs = asmdiff.extract_functions(LOOP_ASM)
-        lines = asmdiff.listing("looper", funcs["looper"]).splitlines()
-        self.assertEqual(lines[0], "looper:")
-        self.assertEqual(lines[1], "\txorl\t%eax, %eax")
-        self.assertEqual(lines[2], ".L2:")   # local label back at column 0
-        self.assertEqual(lines[3], "\taddl\t$1, %eax")
-
-    def test_inspect_table_only_requested_functions(self):
-        funcs = asmdiff.extract_functions(GCC_ASM)
-        out = asmdiff.inspect_table(
-            [asmdiff.Block("gcc -O2", funcs, ["new_const"])])
-        lines = out.splitlines()
-        self.assertIn("function", lines[0])
-        self.assertEqual(len(lines), 2)      # header + the one function
-        self.assertRegex(lines[1], r"new_const\s+2\s+-\s+ldexpf")
-        self.assertNotIn("TOTAL", out)
-
-    def test_inspect_table_loop_spans(self):
-        funcs = asmdiff.extract_functions(LOOP_ASM)
-        out = asmdiff.inspect_table(
-            [asmdiff.Block("gcc -O2", funcs, ["looper"])])
-        self.assertRegex(out.splitlines()[1], r"looper\s+5\s+\.L2:3\s+-")
-
-    def test_inspect_table_leads_with_the_target_for_several_rows(self):
-        funcs = asmdiff.extract_functions(GCC_ASM)
-        out = asmdiff.inspect_table(
-            [asmdiff.Block("gcc", funcs, ["new_const"]),
-             asmdiff.Block("esp32s3", funcs, ["new_const"])]).splitlines()
-        self.assertRegex(out[0], r"^target\s+function\s+insns")
-        self.assertRegex(out[1], r"^gcc\s+new_const\s+")
-        self.assertRegex(out[2], r"^esp32s3\s+new_const\s+")
-
 
 class TestRunInspect(unittest.TestCase):
     """Layout selection in inspect mode, with compile_to_asm stubbed."""
@@ -2402,20 +2191,6 @@ class TestRunInspect(unittest.TestCase):
         finally:
             asmdiff.compile_to_asm = real
         return out.getvalue()
-
-    def test_one_compiler_plain_listing_and_stats(self):
-        out = self._run(["gcc -O2"], ["new_const"])
-        self.assertIn("new_const:", out)
-        self.assertIn("\tjmp\tldexpf@PLT", out)
-        self.assertIn("function", out)           # stats table present
-        self.assertNotIn("==", out)              # no per-compiler header
-        self.assertNotIn(" | ", out)             # not side-by-side
-
-    def test_two_compilers_side_by_side(self):
-        out = self._run(["gcc -O2", "clang -O2"], ["new_const"])
-        self.assertIn("cc#1: gcc -O2", out)
-        self.assertIn("== cc#1 vs cc#2 ==", out)
-        self.assertIn(" | ", out)
 
     def test_three_compilers_sequential_blocks(self):
         out = self._run(["gcc -O1", "gcc -O2", "gcc -O3"], ["new_const"])
@@ -2808,13 +2583,6 @@ rt:
         self.assertRegex(lines[3],
                          r"^\s+delta\s+-4\s+-\s+\+ldexpf -exp2f$")
 
-    def test_unchanged_pair_reads_zero_and_dashes(self):
-        funcs = {"old_a": ["ret"], "new_a": ["ret"]}
-        lines = asmdiff.summary_table(
-            [asmdiff.Block("gcc -O2", funcs,
-                           [("old_a", "new_a")])]).splitlines()
-        self.assertRegex(lines[3], r"^\s+delta\s+0\s+-\s+-$")
-
     def test_span_cell_pairs_positions(self):
         funcs = {"old_l": [".L2:", "addl\t$1, %eax", "jne\t.L2"],
                  "new_l": [".L7:", "jne\t.L7"]}
@@ -2895,72 +2663,63 @@ class TestClassifyInsn(unittest.TestCase):
     """Mnemonic buckets behind --span-stats: load/store/mul/div/branch/
     other."""
 
-    def test_xtensa(self):
-        self.assertEqual(asmdiff.classify_insn("l32i.n\ta8, a2, 0"), "load")
-        self.assertEqual(asmdiff.classify_insn("s32i\ta8, a2, 0"), "store")
-        self.assertEqual(asmdiff.classify_insn("mull\ta8, a8, a9"), "mul")
-        self.assertEqual(asmdiff.classify_insn("mul.s\tf0, f1, f2"), "mul")
-        self.assertEqual(asmdiff.classify_insn("madd.s\tf0, f1, f2"), "mul")
-        self.assertEqual(asmdiff.classify_insn("bne\ta2, a6, .L2"), "branch")
-        self.assertEqual(asmdiff.classify_insn("loop\ta4, .L11_LEND"),
-                         "branch")
-        self.assertEqual(asmdiff.classify_insn("call8\tfoo"), "branch")
-        self.assertEqual(asmdiff.classify_insn("quos\ta2, a2, a3"), "div")
-        self.assertEqual(asmdiff.classify_insn("remu\ta2, a2, a3"), "div")
+    # (ISA, instruction, bucket)
+    CASES = [
+        ("xtensa", "l32i.n\ta8, a2, 0", "load"),
+        ("xtensa", "s32i\ta8, a2, 0", "store"),
+        ("xtensa", "mull\ta8, a8, a9", "mul"),
+        ("xtensa", "mul.s\tf0, f1, f2", "mul"),
+        ("xtensa", "madd.s\tf0, f1, f2", "mul"),
+        ("xtensa", "bne\ta2, a6, .L2", "branch"),
+        ("xtensa", "loop\ta4, .L11_LEND", "branch"),
+        ("xtensa", "call8\tfoo", "branch"),
+        ("xtensa", "quos\ta2, a2, a3", "div"),
+        ("xtensa", "remu\ta2, a2, a3", "div"),
         # The FPU divide is an inline sequence, not one instruction.
-        self.assertEqual(asmdiff.classify_insn("div0.s\tf0, f1"), "other")
-        self.assertEqual(asmdiff.classify_insn("nexp01.s\tf2, f1"), "other")
-        self.assertEqual(asmdiff.classify_insn("addi\ta2, a2, 4"), "other")
-        self.assertEqual(asmdiff.classify_insn("nop.n"), "other")
+        ("xtensa", "div0.s\tf0, f1", "other"),
+        ("xtensa", "nexp01.s\tf2, f1", "other"),
+        ("xtensa", "addi\ta2, a2, 4", "other"),
+        ("xtensa", "nop.n", "other"),
+        ("riscv", "lw\ta0, 0(a1)", "load"),
+        ("riscv", "fsw\tfa0, 4(a1)", "store"),
+        ("riscv", "mulh\ta0, a1, a2", "mul"),
+        ("riscv", "fmadd.s\tfa0, fa1, fa2, fa3", "mul"),
+        ("riscv", "beqz\ta0, .L4", "branch"),
+        ("riscv", "jal\tra, memcpy", "branch"),
+        ("riscv", "divu\ta0, a1, a2", "div"),
+        ("riscv", "remw\ta0, a1, a2", "div"),
+        ("riscv", "fdiv.s\tfa0, fa1, fa2", "div"),
+        ("riscv", "fsqrt.d\tfa0, fa1", "div"),
+        ("riscv", "slli\ta0, a0, 2", "other"),
+        # x86 has no load/store mnemonics: the memory operand decides.
+        ("x86-att", "movl\t8(%rax), %eax", "load"),
+        ("x86-att", "movl\t%eax, 8(%rax)", "store"),
+        ("x86-att", "addl\t(%rdi), %eax", "load"),
+        ("x86-att", "leaq\t8(%rax), %rbx", "other"),
+        ("x86-att", "nopw\t0x0(%rax,%rax,1)", "other"),
+        ("x86-att", "mulss\t.LC0(%rip), %xmm0", "mul"),
+        ("x86-att", "jne\t.L2", "branch"),
+        ("x86-att", "call\tmalloc", "branch"),
+        ("x86-att", "movl\t$-5, %edi", "other"),
+        ("x86-att", "pushq\t%rbp", "store"),
+        ("x86-att", "idivl\t%ecx", "div"),
+        ("x86-att", "divsd\t%xmm1, %xmm0", "div"),
+        ("x86-att", "sqrtss\t%xmm0, %xmm0", "div"),
+        ("arm", "ldr\tr0, [r1]", "load"),
+        ("arm", "str\tr0, [r1, #4]", "store"),
+        ("arm", "vmul.f32\ts0, s1, s2", "mul"),
+        ("arm", "cbz\tr0, .L3", "branch"),
+        ("arm", "push\t{r4, lr}", "store"),
+        ("arm", "sdiv\tr0, r1, r2", "div"),
+        ("arm", "vdiv.f32\ts0, s1, s2", "div"),
+        ("arm", "vsqrt.f64\td0, d1", "div"),
+        ("arm", "eor\tr0, r0, r1", "other"),
+    ]
 
-    def test_riscv(self):
-        self.assertEqual(asmdiff.classify_insn("lw\ta0, 0(a1)"), "load")
-        self.assertEqual(asmdiff.classify_insn("fsw\tfa0, 4(a1)"), "store")
-        self.assertEqual(asmdiff.classify_insn("mulh\ta0, a1, a2"), "mul")
-        self.assertEqual(asmdiff.classify_insn("fmadd.s\tfa0, fa1, fa2, fa3"),
-                         "mul")
-        self.assertEqual(asmdiff.classify_insn("beqz\ta0, .L4"), "branch")
-        self.assertEqual(asmdiff.classify_insn("jal\tra, memcpy"), "branch")
-        self.assertEqual(asmdiff.classify_insn("divu\ta0, a1, a2"), "div")
-        self.assertEqual(asmdiff.classify_insn("remw\ta0, a1, a2"), "div")
-        self.assertEqual(asmdiff.classify_insn("fdiv.s\tfa0, fa1, fa2"),
-                         "div")
-        self.assertEqual(asmdiff.classify_insn("fsqrt.d\tfa0, fa1"), "div")
-        self.assertEqual(asmdiff.classify_insn("slli\ta0, a0, 2"), "other")
-
-    def test_x86_att(self):
-        self.assertEqual(asmdiff.classify_insn("movl\t8(%rax), %eax"),
-                         "load")
-        self.assertEqual(asmdiff.classify_insn("movl\t%eax, 8(%rax)"),
-                         "store")
-        self.assertEqual(asmdiff.classify_insn("addl\t(%rdi), %eax"), "load")
-        self.assertEqual(asmdiff.classify_insn("leaq\t8(%rax), %rbx"),
-                         "other")
-        self.assertEqual(
-            asmdiff.classify_insn("nopw\t0x0(%rax,%rax,1)"), "other")
-        self.assertEqual(asmdiff.classify_insn("mulss\t.LC0(%rip), %xmm0"),
-                         "mul")
-        self.assertEqual(asmdiff.classify_insn("jne\t.L2"), "branch")
-        self.assertEqual(asmdiff.classify_insn("call\tmalloc"), "branch")
-        self.assertEqual(asmdiff.classify_insn("movl\t$-5, %edi"), "other")
-        self.assertEqual(asmdiff.classify_insn("pushq\t%rbp"), "store")
-        self.assertEqual(asmdiff.classify_insn("idivl\t%ecx"), "div")
-        self.assertEqual(asmdiff.classify_insn("divsd\t%xmm1, %xmm0"), "div")
-        self.assertEqual(asmdiff.classify_insn("sqrtss\t%xmm0, %xmm0"),
-                         "div")
-
-    def test_arm(self):
-        self.assertEqual(asmdiff.classify_insn("ldr\tr0, [r1]"), "load")
-        self.assertEqual(asmdiff.classify_insn("str\tr0, [r1, #4]"), "store")
-        self.assertEqual(asmdiff.classify_insn("vmul.f32\ts0, s1, s2"),
-                         "mul")
-        self.assertEqual(asmdiff.classify_insn("cbz\tr0, .L3"), "branch")
-        self.assertEqual(asmdiff.classify_insn("push\t{r4, lr}"), "store")
-        self.assertEqual(asmdiff.classify_insn("sdiv\tr0, r1, r2"), "div")
-        self.assertEqual(asmdiff.classify_insn("vdiv.f32\ts0, s1, s2"),
-                         "div")
-        self.assertEqual(asmdiff.classify_insn("vsqrt.f64\td0, d1"), "div")
-        self.assertEqual(asmdiff.classify_insn("eor\tr0, r0, r1"), "other")
+    def test_mnemonic_classes(self):
+        for isa, insn, bucket in self.CASES:
+            with self.subTest(isa=isa, insn=insn):
+                self.assertEqual(asmdiff.classify_insn(insn), bucket)
 
 
 class TestLibcallTier(unittest.TestCase):
@@ -3028,36 +2787,6 @@ class TestSpanStats(unittest.TestCase):
         out = asmdiff.span_stats_table(
             [asmdiff.Block("gcc -O2", {"g": ["ret"]}, ["g"])])
         self.assertIn("no loop spans", out)
-
-    def test_main_wires_flag_in_inspect_mode(self):
-        real = asmdiff.compile_to_asm
-        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: LOOP_ASM
-        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
-        self.addCleanup(setattr, asmdiff, "SPAN_STATS", False)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            asmdiff.main(["h.c", "looper", "--span-stats",
-                          "--cc", "gcc -O2"])
-        # .L2 span: addl, cmpl, jne -> 2 other + 1 branch
-        self.assertRegex(out.getvalue(),
-                         r"looper\s+\.L2\s+0\s+3\s+0\s+0\s+0\s+0\s+1\s+2")
-
-    def test_elf_mode_span_stats(self):
-        real = asmdiff.run_objdump
-        asmdiff.run_objdump = lambda objdump, elf: OBJDUMP_ASM
-        self.addCleanup(setattr, asmdiff, "run_objdump", real)
-        self.addCleanup(setattr, asmdiff, "SPAN_STATS", False)
-        out = io.StringIO()
-        with tempfile.TemporaryDirectory() as tmp:
-            elf = Path(tmp) / "fw.elf"
-            elf.write_bytes(b"\x7fELF" + b"\0" * 12)
-            with contextlib.redirect_stdout(out):
-                asmdiff.main([str(elf), "render_lut", "--span-stats",
-                              "--objdump", "od"])
-        # ZOL body: add.n, l32i, add.n, nop.n -> 1 load + 3 other
-        self.assertRegex(out.getvalue(),
-                         r"render_lut\s+\.L\S+\s+0\s+4\s+1\s+0\s+0\s+0\s+0\s+3")
-
 
 class TestCostMix(unittest.TestCase):
     """cost_mix: class counts, call tiers, and what a loop span holds."""
@@ -3172,40 +2901,6 @@ class TestCostColumn(unittest.TestCase):
     def _blocks(self, funcs, sel, profile=None):
         return [asmdiff.Block("gcc -O2", funcs, sel, profile)]
 
-    def test_summary_table_header_unchanged_without_the_flag(self):
-        funcs = {"old_a": self.BASE, "new_a": self.CAND}
-        header = asmdiff.summary_table(
-            self._blocks(funcs, [("old_a", "new_a")])).splitlines()[0]
-        self.assertRegex(header,
-                         r"^function\s+role\s+insns\s+loop spans\s+calls$")
-
-    def test_summary_table_gains_the_column_with_the_flag(self):
-        asmdiff.COST = True
-        funcs = {"old_a": self.BASE, "new_a": self.CAND}
-        lines = asmdiff.summary_table(
-            self._blocks(funcs, [("old_a", "new_a")])).splitlines()
-        self.assertRegex(lines[0],
-                         r"^function\s+role\s+insns\s+loop spans\s+"
-                         r"cost\s+calls$")
-        self.assertRegex(lines[1], r"old_a\s+baseline\s+2\s+-\s+br 2 "
-                                   r"softfp 1\s+__muldf3")
-        self.assertRegex(lines[3],
-                         r"delta\s+0\s+-\s+ld \+1 br -1 softfp -1\s+")
-
-    def test_main_wires_the_flag_into_the_tables(self):
-        real = asmdiff.compile_to_asm
-        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: GCC_ASM
-        self.addCleanup(setattr, asmdiff, "compile_to_asm", real)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            asmdiff.main(["h.c", "--cost", "-s", "--cc", "gcc -O2"])
-        text = out.getvalue()
-        self.assertRegex(text, r"function\s+role\s+insns\s+loop spans"
-                               r"\s+cost\s+calls")
-        self.assertRegex(text, r"new_const\s+candidate\s+2\s+-\s+"
-                               r"br 1 oth 1 libm 1\s+ldexpf")
-        self.assertRegex(text, r"delta\s+0\s+-\s+mul -1 oth \+1 libm \+1")
-
     def test_inspect_and_file_tables_gain_the_column(self):
         asmdiff.COST = True
         funcs = {"f": self.CAND}
@@ -3290,39 +2985,37 @@ costs = "bench"
         self.assertEqual(profile["provenance"]["measured_on"],
                          "S3 rev 0.2, -flto")
 
-    def test_extends_chain_is_an_error(self):
-        text = ('[costs.a]\nmeasured_on = "x"\nmethod = "y"\n'
-                '[costs.b]\nextends = "a"\nmeasured_on = "x"\n'
-                'method = "y"\n'
-                '[costs.c]\nextends = "b"\nmeasured_on = "x"\n'
-                'method = "y"\n')
-        self.assertIn("one level only", self._error(text, "c"))
+    EXTENDS_CHAIN = ('[costs.a]\nmeasured_on = "x"\nmethod = "y"\n'
+                     '[costs.b]\nextends = "a"\nmeasured_on = "x"\n'
+                     'method = "y"\n'
+                     '[costs.c]\nextends = "b"\nmeasured_on = "x"\n'
+                     'method = "y"\n')
 
-    def test_unknown_profile_lists_the_known_ones(self):
-        msg = self._error(self.CONFIG, "nope")
-        self.assertIn("no [costs.nope]", msg)
-        self.assertIn("cost profiles: bench, bench-lto", msg)
+    # (case, config text, profile asked for, fragments of the error)
+    PROFILE_ERRORS = [
+        ("extends chain", EXTENDS_CHAIN, "c", ["one level only"]),
+        ("unknown profile lists the known ones", CONFIG, "nope",
+         ["no [costs.nope]", "cost profiles: bench, bench-lto"]),
+        ("config with no profile at all", '[s3]\ncc = "gcc"\n', "bench",
+         ["defines no cost profiles"]),
+        ("measured_on without method",
+         '[costs.p]\nmeasured_on = "S3"\nload = 2\n', "p", ["method"]),
+        ("method without measured_on",
+         '[costs.p]\nmethod = "harness"\nload = 2\n', "p", ["measured_on"]),
+        ("a tier that is never priced",
+         '[costs.p]\nmeasured_on = "S3"\nmethod = "h"\nmem = 40\n', "p",
+         ["mem has no weight"]),
+        ("a weight of the wrong type",
+         '[costs.p]\nmeasured_on = "S3"\nmethod = "h"\nload = [1, 2]\n', "p",
+         ["load must be a weight"]),
+    ]
 
-    def test_config_without_any_profile_says_so(self):
-        msg = self._error('[s3]\ncc = "gcc"\n', "bench")
-        self.assertIn("defines no cost profiles", msg)
-
-    def test_provenance_fields_are_required(self):
-        msg = self._error('[costs.p]\nmeasured_on = "S3"\nload = 2\n')
-        self.assertIn("method", msg)
-        msg = self._error('[costs.p]\nmethod = "harness"\nload = 2\n')
-        self.assertIn("measured_on", msg)
-
-    def test_mem_and_call_have_no_weight(self):
-        text = ('[costs.p]\nmeasured_on = "S3"\nmethod = "h"\n'
-                'mem = 40\n')
-        self.assertIn("mem has no weight", self._error(text))
-
-    def test_other_value_types_name_the_key(self):
-        text = ('[costs.p]\nmeasured_on = "S3"\nmethod = "h"\n'
-                'load = [1, 2]\n')
-        msg = self._error(text)
-        self.assertIn("load must be a weight", msg)
+    def test_profile_errors(self):
+        for case, text, name, fragments in self.PROFILE_ERRORS:
+            with self.subTest(case=case):
+                msg = self._error(text, name)
+                for fragment in fragments:
+                    self.assertIn(fragment, msg)
 
     def test_provenance_line_names_where_and_how(self):
         profile = asmdiff.load_costs(self._config(), "bench", "cfg.toml")
@@ -3474,12 +3167,6 @@ class TestSummaryOnly(unittest.TestCase):
             fn(*args)
         return out.getvalue()
 
-    def test_pairs_mode_prints_table_only(self):
-        out = self._capture(asmdiff.run_pairs, "h.c", ["gcc -O2"],
-                            [], [], "/tmp")
-        self.assertIn("baseline", out)
-        self.assertNotIn(" | ", out)
-
     def test_across_mode_prints_table_only(self):
         out = self._capture(asmdiff.run_inspect, "h.c",
                             ["gcc -O2", "clang -O2"], ["new_const"],
@@ -3502,17 +3189,6 @@ class TestSummaryOnly(unittest.TestCase):
         self.assertIn("render_lut", out)     # stats row
         self.assertNotIn("render_lut:", out)  # no listing header
 
-    def test_output_is_the_legend_and_the_table(self):
-        matrix = asmdiff.build_matrix(["gcc -O2", "clang -O2"], [],
-                                      None, None)
-        out = self._capture(asmdiff.run_pairs, "h.c", matrix, [], [], "/tmp")
-        lines = [line for line in out.splitlines() if line.strip()]
-        self.assertEqual(lines[:2], ["cc#1: gcc -O2", "cc#2: clang -O2"])
-        self.assertRegex(lines[2], r"^target\s+function\s+role")
-        # header plus one pair - baseline, candidate, delta - per row,
-        # and nothing else: no listings, no group headers.
-        self.assertEqual(len(lines), 2 + 1 + 6)
-
     def test_main_wires_the_flag(self):
         asmdiff.SUMMARY_ONLY = False
         out = io.StringIO()
@@ -3523,18 +3199,20 @@ class TestSummaryOnly(unittest.TestCase):
 
 
 class TestFileTags(unittest.TestCase):
-    def test_distinct_basenames_used_directly(self):
-        self.assertEqual(asmdiff.file_tags("p/old.c", "p/new.c"),
-                         ("old.c", "new.c"))
-
-    def test_same_basename_disambiguated_by_parent(self):
-        self.assertEqual(asmdiff.file_tags("/tmp/amy-exp2f/log2.c",
-                                           "/tmp/amy-ldexpf/log2.c"),
-                         ("amy-exp2f/log2.c", "amy-ldexpf/log2.c"))
-
-    def test_identical_parents_fall_back_to_full_paths(self):
-        self.assertEqual(asmdiff.file_tags("a/src/f.c", "b/src/f.c"),
-                         ("a/src/f.c", "b/src/f.c"))
+    def test_file_tag_cases(self):
+        # (case, the two paths, the tags they are labelled with)
+        cases = [
+            ("distinct basenames", ("p/old.c", "p/new.c"),
+             ("old.c", "new.c")),
+            ("same basename, distinct parents",
+             ("/tmp/amy-exp2f/log2.c", "/tmp/amy-ldexpf/log2.c"),
+             ("amy-exp2f/log2.c", "amy-ldexpf/log2.c")),
+            ("same basename and parent", ("a/src/f.c", "b/src/f.c"),
+             ("a/src/f.c", "b/src/f.c")),
+        ]
+        for case, paths, tags in cases:
+            with self.subTest(case=case):
+                self.assertEqual(asmdiff.file_tags(*paths), tags)
 
 
 class TestAcrossValidation(unittest.TestCase):
@@ -3547,30 +3225,29 @@ class TestAcrossValidation(unittest.TestCase):
                 asmdiff.main(argv)
         self.assertIn(fragment, err.getvalue())
 
-    def test_across_and_pair_mutually_exclusive(self):
-        self._expect_error(["x.c", "--across", "f", "--pair", "a:b"],
-                           "mutually exclusive")
+    # (case, argv with A, B, C standing in for files on disk, fragment)
+    ARGUMENT_ERRORS = [
+        ("--across with --pair", ["x.c", "--across", "f", "--pair", "a:b"],
+         "mutually exclusive"),
+        ("two files with --pair", ["A", "B", "--pair", "x:y"],
+         "--pair compares within one file"),
+        ("three files", ["A", "B", "C", "--across", "f"], "at most two"),
+        ("one file, one compiler",
+         ["a.c", "--across", "f", "--cc", "gcc -O3"], "at least two --cc"),
+    ]
 
-    def test_two_files_with_pair_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            a, b = Path(tmp) / "a.c", Path(tmp) / "b.c"
-            a.touch()
-            b.touch()
-            self._expect_error([str(a), str(b), "--pair", "x:y"],
-                               "--pair compares within one file")
-
-    def test_at_most_two_files(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            argv = []
-            for name in ("a.c", "b.c", "c.c"):
-                p = Path(tmp) / name
-                p.touch()
-                argv.append(str(p))
-            self._expect_error(argv + ["--across", "f"], "at most two")
-
-    def test_across_one_file_needs_two_cc_entries(self):
-        self._expect_error(["a.c", "--across", "f", "--cc", "gcc -O3"],
-                           "at least two --cc")
+    def test_across_argument_errors(self):
+        for case, argv, fragment in self.ARGUMENT_ERRORS:
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory() as tmp:
+                    files = {}
+                    for key, name in (("A", "a.c"), ("B", "b.c"),
+                                      ("C", "c.c")):
+                        path = Path(tmp) / name
+                        path.touch()
+                        files[key] = str(path)
+                    self._expect_error([files.get(arg, arg) for arg in argv],
+                                       fragment)
 
 
 class TestInspectValidation(unittest.TestCase):
@@ -3584,31 +3261,32 @@ class TestInspectValidation(unittest.TestCase):
         # parser.error writes to stderr; sys.exit carries the message
         self.assertIn(fragment, err.getvalue() + str(ctx.exception))
 
-    def test_function_with_pair_rejected(self):
-        self._expect_error(["x.c", "f", "--pair", "a:b"],
-                           "cannot be combined")
+    # (case, argv with A and B standing in for files on disk, fragment)
+    ARGUMENT_ERRORS = [
+        ("function with --pair", ["x.c", "f", "--pair", "a:b"],
+         "cannot be combined"),
+        ("function with --across", ["x.c", "f", "--across", "g"],
+         "cannot be combined"),
+        ("two files plus a function", ["A", "B", "f"], "--across"),
+        ("--layout without a function", ["x.c", "--layout", "list"],
+         "--layout only applies"),
+        ("unknown --layout value", ["x.c", "f", "--layout", "diagonal"],
+         "invalid choice"),
+        ("a mistyped filename is not a function", ["x.c", "typo.c"],
+         "no such file"),
+    ]
 
-    def test_function_with_across_rejected(self):
-        self._expect_error(["x.c", "f", "--across", "g"],
-                           "cannot be combined")
-
-    def test_two_files_plus_function_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            a, b = Path(tmp) / "a.c", Path(tmp) / "b.c"
-            a.touch()
-            b.touch()
-            self._expect_error([str(a), str(b), "f"], "--across")
-
-    def test_layout_without_function_rejected(self):
-        self._expect_error(["x.c", "--layout", "list"],
-                           "--layout only applies")
-
-    def test_layout_value_checked(self):
-        self._expect_error(["x.c", "f", "--layout", "diagonal"],
-                           "invalid choice")
-
-    def test_typo_filename_is_not_a_function(self):
-        self._expect_error(["x.c", "typo.c"], "no such file")
+    def test_inspect_argument_errors(self):
+        for case, argv, fragment in self.ARGUMENT_ERRORS:
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory() as tmp:
+                    files = {}
+                    for key, name in (("A", "a.c"), ("B", "b.c")):
+                        path = Path(tmp) / name
+                        path.touch()
+                        files[key] = str(path)
+                    self._expect_error([files.get(arg, arg) for arg in argv],
+                                       fragment)
 
 
 class TestShortAliases(unittest.TestCase):
@@ -3622,22 +3300,20 @@ class TestShortAliases(unittest.TestCase):
                 asmdiff.main(argv)
         self.assertIn(fragment, err.getvalue() + str(ctx.exception))
 
-    def test_p_is_pair(self):
-        self._expect_error(["x.c", "-p", "nocolon"], "expects OLD:NEW")
+    # (alias, argv, fragment of the long option's own error)
+    ALIASES = [
+        ("-p", ["x.c", "-p", "nocolon"], "expects OLD:NEW"),
+        ("-a", ["x.c", "-a", "f", "--cc", "gcc -O3"], "at least two --cc"),
+        ("-l", ["x.c", "-l", "list"], "--layout only applies"),
+        ("-t", ["x.c", "f", "-t", "nope"], "no [nope] target"),
+        ("-f", ["x.c", "-f", "old_", "-p", "a:b"],
+         "--filter selects functions"),
+    ]
 
-    def test_a_is_across(self):
-        self._expect_error(["x.c", "-a", "f", "--cc", "gcc -O3"],
-                           "at least two --cc")
-
-    def test_l_is_layout(self):
-        self._expect_error(["x.c", "-l", "list"], "--layout only applies")
-
-    def test_t_is_target(self):
-        self._expect_error(["x.c", "f", "-t", "nope"], "no [nope] target")
-
-    def test_f_is_filter(self):
-        self._expect_error(["x.c", "-f", "old_", "-p", "a:b"],
-                           "--filter selects functions")
+    def test_aliases_reach_their_option(self):
+        for alias, argv, fragment in self.ALIASES:
+            with self.subTest(alias=alias):
+                self._expect_error(argv, fragment)
 
     def test_C_is_collapse(self):
         # --collapse has no validation of its own; check the global it sets.
@@ -3835,22 +3511,19 @@ class TestCompletion(unittest.TestCase):
         self.assertIn("-db", opts)
         self.assertNotIn("--complete", opts)   # help=SUPPRESS
 
-    def test_bash_script_lists_every_option(self):
-        script = self._script("bash")
-        for opt in self._parser_options():
-            self.assertIn(opt, script, opt)
-
-    def test_zsh_script_lists_every_option(self):
-        script = self._script("zsh")
-        for opt in self._parser_options():
-            self.assertIn(opt, script, opt)
-
-    def test_fish_script_lists_every_option(self):
-        script = self._script("fish")
-        for opt in self._parser_options():
-            flag = "-l " + opt[2:] if opt.startswith("--") else None
-            if flag:
-                self.assertIn(flag, script, opt)
+    def test_scripts_list_every_option(self):
+        # fish spells a long option as "-l NAME" and has nothing to say
+        # about the short ones.
+        options = self._parser_options()
+        for shell in asmdiff.COMPLETION_SHELLS:
+            with self.subTest(shell=shell):
+                script = self._script(shell)
+                for opt in options:
+                    if shell == "fish":
+                        if opt.startswith("--"):
+                            self.assertIn("-l " + opt[2:], script, opt)
+                    else:
+                        self.assertIn(opt, script, opt)
 
     def test_candidate_list_omits_the_hidden_helper(self):
         # --complete exists for the script to call, not for the user to
@@ -4005,6 +3678,106 @@ class TestCompletion(unittest.TestCase):
                          "asmdiff.py")
         # A test runner or an interpreter is not a command to complete.
         self.assertEqual(asmdiff.completion_prog("python3"), "asmdiff")
+
+
+GOLDEN_DIR = Path(__file__).resolve().parent / "golden"
+
+
+class TestGolden(unittest.TestCase):
+    """What each (mode, flag set) renders, against a file in golden/.
+
+    These carry the presentation: column order, headers, the legend, the
+    delta row, group headers, listings.  A contract test asserts the one
+    thing it is about; the shape of the whole page is what a diff against
+    a checked-in file reads best.
+
+    Every case runs through main() with the compiler (or objdump) mocked
+    to a fixture and --width 100 pinned, so nothing here depends on a
+    terminal, on $COLUMNS, or on a compiler being installed.
+    ASMDIFF_UPDATE_GOLDEN=1 rewrites the files.
+    """
+
+    # (golden file, argv, fixture, files to create in the run directory)
+    CASES = [
+        ("pairs.txt",
+         ["asmdiff_example.c", "--cc", "gcc -O2"], "GCC_ASM", ()),
+        ("pairs-two-cc.txt",
+         ["asmdiff_example.c", "--cc", "gcc -O2", "--cc", "clang -O2"],
+         "GCC_ASM", ()),
+        ("pairs-s.txt",
+         ["asmdiff_example.c", "-s", "--cc", "gcc -O2", "--cc", "clang -O2"],
+         "GCC_ASM", ()),
+        ("pairs-cost.txt",
+         ["asmdiff_example.c", "--cost", "-s", "--cc", "gcc -O2"],
+         "GCC_ASM", ()),
+        ("inspect.txt",
+         ["asmdiff_example.c", "looper", "--cc", "gcc -O2"], "LOOP_ASM", ()),
+        ("inspect-span-stats.txt",
+         ["asmdiff_example.c", "looper", "--span-stats", "--cc", "gcc -O2"],
+         "LOOP_ASM", ()),
+        ("inspect-two-cc.txt",
+         ["asmdiff_example.c", "new_const", "--cc", "gcc -O2",
+          "--cc", "clang -O2"], "GCC_ASM", ()),
+        ("across-two-files.txt",
+         ["a.c", "b.c", "-a", "looper", "--cc", "gcc -O2"],
+         "LOOP_ASM", ("a.c", "b.c")),
+        ("summary-two-files.txt",
+         ["a.c", "b.c", "--cc", "gcc -O2"], "GCC_ASM", ("a.c", "b.c")),
+        ("elf.txt",
+         ["fw.elf", "render_lut", "--objdump", "od"],
+         "OBJDUMP_ASM", ("fw.elf",)),
+        ("elf-span-stats.txt",
+         ["fw.elf", "render_lut", "--span-stats", "--objdump", "od"],
+         "OBJDUMP_ASM", ("fw.elf",)),
+    ]
+
+    # Globals main() sets from its arguments; restored so a case cannot
+    # leak a flag into the next one or into another class.
+    GLOBALS = ("WIDTH", "COST", "COST_PROFILE", "SPAN_STATS", "SUMMARY_ONLY",
+               "COLLAPSE", "JSON_OUT", "FAIL_ON_GROWTH", "VERBOSE")
+
+    def _render(self, argv, fixture, needs):
+        asm = globals()[fixture]
+        for name in ("compile_to_asm", "run_objdump"):
+            self.addCleanup(setattr, asmdiff, name, getattr(asmdiff, name))
+        for name in self.GLOBALS:
+            self.addCleanup(setattr, asmdiff, name, getattr(asmdiff, name))
+        asmdiff.compile_to_asm = lambda cc, extra, src, tmp: asm
+        asmdiff.run_objdump = lambda objdump, elf: asm
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in needs:
+                path = Path(tmp) / name
+                # is_elf() reads the magic bytes; the disassembly comes
+                # from the mock, so the rest of the file is padding.
+                if name.endswith(".elf"):
+                    path.write_bytes(b"\x7fELF" + b"\0" * 12)
+                else:
+                    path.touch()
+            # Relative paths only: an absolute tempdir would land in the
+            # output as a file tag and no two runs would agree.
+            with _inside(tmp), contextlib.redirect_stdout(out):
+                asmdiff.main(list(argv) + ["--width", "100"])
+        return out.getvalue()
+
+    def test_rendered_output(self):
+        update = os.environ.get("ASMDIFF_UPDATE_GOLDEN")
+        for name, argv, fixture, needs in self.CASES:
+            with self.subTest(case=name):
+                text = self._render(argv, fixture, needs)
+                path = GOLDEN_DIR / name
+                if update:
+                    GOLDEN_DIR.mkdir(exist_ok=True)
+                    path.write_text(text)
+                    continue
+                diff = "".join(difflib.unified_diff(
+                    path.read_text().splitlines(keepends=True),
+                    text.splitlines(keepends=True),
+                    f"golden/{name}", "this run"))
+                if diff:
+                    self.fail(f"{name} does not match this run "
+                              "(ASMDIFF_UPDATE_GOLDEN=1 rewrites it):\n"
+                              + diff)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+
+function   role       insns  loop spans  calls
+old_const  baseline   2      -           -
+new_const  candidate  2      -           ldexpf
+           delta      0      -           +ldexpf
+
+old_const                                        | new_const
+-------------------------------------------------+-------------------------------------------------
+mulss   .LC0(%rip), %xmm0                        | movl    $-5, %edi
+ret                                              | jmp     ldexpf@PLT

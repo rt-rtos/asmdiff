@@ -1,0 +1,14 @@
+
+function      role       insns  loop spans  calls
+looper [a.c]  baseline   5      .L2:3       -
+looper [b.c]  candidate  5      .L2:3       -
+              delta      0      3 -> 3      -
+
+looper [a.c]                                     | looper [b.c]
+-------------------------------------------------+-------------------------------------------------
+xorl    %eax, %eax                               | xorl    %eax, %eax
+.L2:                                             | .L2:
+addl    $1, %eax                                 | addl    $1, %eax
+cmpl    $8, %eax                                 | cmpl    $8, %eax
+jne     .L2                                      | jne     .L2
+ret                                              | ret
