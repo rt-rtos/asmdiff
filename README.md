@@ -397,6 +397,20 @@ cue to pass a matching target.
 A whole firmware has over a thousand functions, so a bare ELF with no
 function names and no `--filter` is an error, not a thousand-row table.
 
+**Other toolchains.** Besides GNU objdump output, the JieLi pi32v2
+objdump's dialect is read (the AC79 family, e.g. the M-VAVE FM-1 and
+its open firmwares): bare `name:` headers, the space-padded byte column,
+`<sym+0x96 : addr >` targets and the decimal displacement before
+`call`/`goto` are normalised into the GNU shape, `.rodata` dumps are
+skipped, and the algebraic instruction form (`r5_r4 = r4 * r14 (s)`,
+`[r6+0] += r4`) is bucketed by shape for `--span-stats`. The
+toolchain's objdump sits beside its clang, so the bundled `pi32v2`
+profile (or any `--cc` naming that clang by path) derives it; otherwise
+pass `--objdump`. Compile mode works with
+`--cc '$JIELI_TOOLCHAIN/pi32v2/bin/clang -target pi32v2 -Os'`. The
+compiler has not been seen to emit the `rep` hardware loop, so there is
+no ZOL-style span naming for it.
+
 If the question behind the sweep is "did my hot loops ship as
 zero-overhead loops", the empirical rules (verified on esp-gcc 15.2,
 `-O2`) are worth knowing before blaming the compiler:

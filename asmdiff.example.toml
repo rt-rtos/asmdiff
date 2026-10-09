@@ -143,3 +143,12 @@ flags = ["-O2", "-mcpu=cortex-m4", "-mthumb"]
 [rp2350]
 cc = "riscv64-unknown-elf-gcc"
 flags = ["-O2", "-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"]
+
+# JieLi pi32v2 (the AC79 family: M-VAVE FM-1 and other JieLi-based
+# devices).  The vendor's clang 4.0.1 fork comes as one tarball from
+# pkgman.jieliapp.com/s/linux-toolchain; unpack it anywhere and point
+# JIELI_TOOLCHAIN at the directory holding pi32v2/ and common/.  Its
+# objdump sits beside clang, so ELF input needs no --objdump.
+[pi32v2]
+cc = "$JIELI_TOOLCHAIN/pi32v2/bin/clang"
+flags = ["-target", "pi32v2", "-Os"]

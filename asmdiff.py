@@ -46,8 +46,10 @@ Four modes, plus the no-flag whole-file summary:
                   listed in full; --filter matches are summarized
                   only, unless -l list asks for their listings too.
                   objdump comes from
-                  --objdump PATH or the first gcc in the matrix
-                  (trailing gcc swapped for objdump); Xtensa
+                  --objdump PATH, the first gcc in the matrix
+                  (trailing gcc swapped for objdump), or an objdump
+                  beside a clang given by path.  GNU and JieLi
+                  pi32v2 objdump output are both read; Xtensa
                   -mlongcalls call sequences are resolved to their
                   real callees when the disassembly names them,
                   and report as indirect(<reg>) when it does not.
@@ -173,7 +175,7 @@ except ModuleNotFoundError:
 
 # Single source of truth for the package version: pyproject.toml reads
 # it from here (hatchling dynamic version).
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 DEFAULT_COMPILERS = ["gcc", "clang"]
 FALLBACK_FLAGS = "-O3"
@@ -330,6 +332,15 @@ flags = ["-O2", "-mcpu=cortex-m4", "-mthumb"]
 [rp2350]
 cc = "riscv64-unknown-elf-gcc"
 flags = ["-O2", "-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"]
+
+# JieLi pi32v2 (the AC79 family: M-VAVE FM-1 and other JieLi-based
+# devices).  The vendor's clang 4.0.1 fork comes as one tarball from
+# pkgman.jieliapp.com/s/linux-toolchain; unpack it anywhere and point
+# JIELI_TOOLCHAIN at the directory holding pi32v2/ and common/.  Its
+# objdump sits beside clang, so ELF input needs no --objdump.
+[pi32v2]
+cc = "$JIELI_TOOLCHAIN/pi32v2/bin/clang"
+flags = ["-target", "pi32v2", "-Os"]
 """
 
 # Preprocessor flags lifted from a compile_commands.json entry so a project
@@ -669,6 +680,10 @@ NOISE = re.compile(
 )
 # Compiler-generated bracketing labels that add nothing (.LFB0:, .Lfunc_end0:).
 NOISE_LABEL = re.compile(r"^\.(LFB|LFE|Lfunc_begin|Lfunc_end)\d*:")
+# clang annotates local labels in the target's comment syntax
+# (".LBB2_1:   ; =>This Inner Loop Header: Depth=1" - '#' on x86, '@' on
+# ARM, ';' on pi32v2); the loop-span scan keys on lines ending in ':'.
+LABEL_COMMENT = re.compile(r"^(\.?[\w$.]+:)\s*(?:;|#|@|//).*$")
 # Data emitted *inside* a function body: switch jump tables (.long/.word
 # entries), inline constants, strings.  These are not instructions, so they
 # must not be counted; and a self-relative table entry (".long .L5-.L4")
@@ -714,9 +729,12 @@ def extract_functions(asm_text):
             current = None
             continue
         line = raw.strip()
-        if not line or line.startswith(("#", "//")):
+        if not line or line.startswith(("#", "//", ";", "@")):
             continue
         if NOISE.match(line) or NOISE_LABEL.match(line) or DATA.match(line):
+            continue
+        line = LABEL_COMMENT.sub(r"\1", line)
+        if line == "}":                     # pi32v2 predicated-block close
             continue
         funcs[current].append(line)
     return funcs
@@ -724,19 +742,39 @@ def extract_functions(asm_text):
 
 # `objdump -d` function header: "40370400 <render_lut>:".
 OBJDUMP_HEADER = re.compile(r"^([0-9a-f]+) <([^>]+)>:\s*$")
+# JieLi's pi32v2 objdump writes the header as a bare label ("rev_hall:");
+# the function's address is its first instruction's.
+OBJDUMP_BARE_HEADER = re.compile(r"^([A-Za-z_][\w$.]*):\s*$")
 # `objdump -d` instruction line: address, one byte-dump field (hex digits
-# and spaces; "004136" is the encoding, not the mnemonic), then the
-# mnemonic and operands.
+# and spaces; "004136" is the encoding, not the mnemonic), a tab, then
+# the mnemonic and operands.  GNU separates the fields with tabs; JieLi's
+# pads the byte field with spaces before the tab.  A data line (JieLi's
+# objdump dumps .rodata too) ends in an ASCII column with no tab after
+# the bytes, so it does not match.
 OBJDUMP_INSN = re.compile(
-    r"^\s*([0-9a-f]+):\t[0-9a-f ]+\t\s*(\S+)[ \t]*(.*?)\s*$")
+    r"^\s*([0-9a-f]+):\s*[0-9a-f][0-9a-f ]*\t\s*(\S+)[ \t]*(.*?)\s*$")
+# Section banner; data sections are skipped (GNU -d never prints them,
+# JieLi's does, as bare-label symbols over byte dumps).
+OBJDUMP_SECTION = re.compile(r"^Disassembly of section (\S+):")
 # An "addr <annotation>" operand: branch, loop or call target.
 OBJDUMP_TARGET = re.compile(r"\b([0-9a-f]+) <([^>]+)>")
+# JieLi's objdump annotates a target as "<sym+0x96 : 2039318 >" (GNU:
+# "2039318 <sym+0x96>") and puts the decimal displacement before it
+# ("call 762 <fm1_fatal_common : 2000458 >", "goto -26 <...>").  Both are
+# rewritten to the GNU shape so the relabel and call detection apply.
+JIELI_TARGET = re.compile(r"<\s*([^<>:]+?)\s*:\s*([0-9a-f]+)\s*>")
+JIELI_DISP = re.compile(r"(^|goto |call )(-?\d+)\s+(?=[0-9a-f]+ <)")
+
+
+def _normalize_targets(ops):
+    ops = JIELI_TARGET.sub(r"\2 <\1>", ops)
+    return JIELI_DISP.sub(r"\1", ops)
 # A nearest-symbol offset annotation ("<_etext+0x100>"): objdump's name
 # for an address that is not a symbol start.  For addresses outside the
 # current function the base symbol is usually unrelated (a literal-pool
 # word or data landing after some other object), so the annotation is
 # misleading, not informative.
-OFFSET_ANNOT = re.compile(r"[+-]0x[0-9a-f]+$")
+OFFSET_ANNOT = re.compile(r"[+-]0x[0-9a-f]+$", re.IGNORECASE)
 
 
 def extract_functions_objdump(dump_text):
@@ -758,23 +796,43 @@ def extract_functions_objdump(dump_text):
     """
     funcs = {}
     current = None
+    in_code = True
     for raw in dump_text.splitlines():
+        s = OBJDUMP_SECTION.match(raw)
+        if s:
+            in_code = not s.group(1).startswith((".rodata", ".data", ".bss"))
+            current = None
+            continue
+        if not in_code:
+            continue
         h = OBJDUMP_HEADER.match(raw)
         if h:
-            name = h.group(2)
+            name, start = h.group(2), int(h.group(1), 16)
+        else:
+            h = OBJDUMP_BARE_HEADER.match(raw)
+            if h:
+                name, start = h.group(1), None
+        if h:
             if OFFSET_ANNOT.search(name):
                 current = None          # symbol-less gap, not a function
             else:
                 current = []
-                funcs[name] = (int(h.group(1), 16), current)
+                funcs[name] = (start, current)
             continue
         if current is None:
             continue
         m = OBJDUMP_INSN.match(raw)
         if m:
-            current.append((int(m.group(1), 16), m.group(2), m.group(3)))
-    return {name: _relabel_objdump(name, start, _resolve_longcalls(insns))
-            for name, (start, insns) in funcs.items()}
+            current.append((int(m.group(1), 16), m.group(2),
+                            _normalize_targets(m.group(3))))
+    out = {}
+    for name, (start, insns) in funcs.items():
+        if start is None:
+            if not insns:
+                continue                # bare-label data symbol in a code section
+            start = insns[0][0]
+        out[name] = _relabel_objdump(name, start, _resolve_longcalls(insns))
+    return out
 
 
 # The value annotation objdump appends to an l32r whose literal resolves
@@ -1051,6 +1109,33 @@ _BRANCH_MNEMONICS = frozenset("""
 """.split())
 
 
+# pi32v2 (JieLi) assembly is algebraic: "r4 = h[r3++=2] (s)", "[r6+0] += r4",
+# "r5_r4 = r4 * r14 (s)", "if (--r2 != 0) goto .L1".  No mnemonic table
+# fits, so the shape of the line picks the bucket: memory on the left of
+# the assignment is a store (push and read-modify-write included), on
+# the right a load (pop included), a product or quotient on the right is
+# mul or div, and the if/goto/return forms are branches.
+_ALGEBRAIC = re.compile(
+    r"^(?:[hbwd]?\[|\{|(?:r\d+(?:_r\d+)?(?:\.[lh])?|sp|psr|icfg)\s*[-+*/|&^<>]*="
+    r"|(?:ifs?|goto|rts|ret[iex]|rets|rep)\b)")
+_ALGEBRAIC_BRANCH = frozenset("if ifs goto rts reti rete retx rets rep".split())
+
+
+def _classify_algebraic(line, mnem):
+    if mnem in _ALGEBRAIC_BRANCH:
+        return "branch"
+    lhs, _, rhs = line.partition("=")
+    if "[" in lhs:
+        return "store"
+    if "[" in rhs:
+        return "load"
+    if "*" in rhs:
+        return "mul"
+    if "/" in rhs:
+        return "div"
+    return "other"
+
+
 def classify_insn(line):
     """Bucket one cleaned instruction: load/store/mul/div/branch/other.
 
@@ -1059,11 +1144,14 @@ def classify_insn(line):
     mnemonics no table knows, an AT&T-style memory operand decides
     load (source side) vs store (destination, the last operand);
     lea and alignment nops are excluded from that heuristic first.
+    pi32v2's algebraic lines are bucketed by shape (_classify_algebraic).
     """
     parts = line.split(None, 1)
     mnem = parts[0].lower()
     rest = parts[1] if len(parts) > 1 else ""
     base = mnem.split(".", 1)[0]
+    if _ALGEBRAIC.match(line):
+        return _classify_algebraic(line, mnem)
     if mnem in _LOAD_MNEMONICS or base in _LOAD_MNEMONICS:
         return "load"
     if mnem in _STORE_MNEMONICS or base in _STORE_MNEMONICS:
@@ -2945,12 +3033,18 @@ def run_inspect(source, matrix, fn_names, layout, extra_flags, tmp,
 def derive_objdump(matrix):
     """Objdump belonging to the first gcc in the matrix: the toolchain
     prefix stays, the tool name swaps (xtensa-esp32s3-elf-gcc ->
-    xtensa-esp32s3-elf-objdump).  None when no entry is gcc-based;
-    clang has no paired cross-objdump to guess at."""
+    xtensa-esp32s3-elf-objdump).  A clang given by path counts when an
+    objdump sits beside it in the same bin directory (JieLi's pi32v2
+    toolchain ships one there).  None otherwise: a bare clang has no
+    paired cross-objdump to guess at."""
     for cc_cmd in matrix:
         cc = shlex.split(cc_cmd)[0]
         if cc == "gcc" or cc.endswith(("-gcc", "/gcc")):
             return cc[:-3] + "objdump"
+        if cc.endswith("/clang"):
+            sibling = cc[:-5] + "objdump"
+            if os.path.exists(sibling):
+                return sibling
     return None
 
 
@@ -3481,7 +3575,8 @@ def main(argv=None):
     parser.add_argument("--objdump", metavar="PATH",
                         help="disassembler for ELF input; default: derived "
                              "from the first gcc in the matrix by swapping "
-                             "the trailing gcc for objdump")
+                             "the trailing gcc for objdump, or an objdump "
+                             "beside a clang given by path")
     parser.add_argument("-t", "--target", action="append", default=[],
                         metavar="NAME",
                         help="named [table], [groups] name, comma-list, or "

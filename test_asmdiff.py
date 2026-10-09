@@ -3782,3 +3782,143 @@ class TestGolden(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# JieLi pi32v2 clang -S output: algebraic assembly, ';' comments, labels
+# annotated with a trailing comment, a predicated block closed by '}'.
+PI32V2_S = """\
+\t.section\t.text.dot16,"ax",@progbits
+\t.globl\tdot16
+\t.type\tdot16,@function
+dot16:                                  ; @dot16
+; BB#0:
+\t[--sp] = {rets, r5, r4}
+\tr3 = r0
+\tr0 = 0
+\tifs (r2 < 1) goto .LBB2_2
+.LBB2_1:                                ; =>This Inner Loop Header: Depth=1
+\tr4 = h[r3++=2] (s)
+\tr5 = h[r1++=2] (s)
+\tr4 *= r5
+\tr0 += r4
+\tif (--r2 != 0) goto .LBB2_1
+.LBB2_2:
+\t{pc, r5, r4} = [sp++]
+.Lfunc_end2:
+\t.size\tdot16, .Lfunc_end2-dot16
+\t.section\t.text.add16_sat,"ax",@progbits
+\t.globl\tadd16_sat
+\t.type\tadd16_sat,@function
+add16_sat:                              ; @add16_sat
+; BB#0:
+\tr3 = -32768
+.LBB0_2:                                ; =>This Inner Loop Header: Depth=1
+\tr5 += r4
+\tr4 = 32767
+\tifs (r5 < 32768) {
+\t\tr4 = smax(r5, r3)
+\t}
+\th[r0++=2] = r4
+\tif (--r2 != 0) goto .LBB0_2
+\t{pc, r5, r4} = [sp++]
+.Lfunc_end0:
+\t.size\tadd16_sat, .Lfunc_end0-add16_sat
+"""
+
+# JieLi pi32v2 `objdump -d`: bare-label headers, space-padded byte column,
+# "<sym : addr >" targets with a decimal displacement before them, and a
+# .rodata section dumped as a symbol over byte lines.
+PI32V2_OBJDUMP = """\
+
+build/felucca.elf:\tfile format ELF32-pi32v2
+
+Disassembly of section .text:
+_start:
+ 2000120:    04 81             \tgoto 2 <_start+0x4 : 2000124 >
+ 2000122:    80 00             \trts
+ 2000124:    81 ea 12 77       \tcall 192036 <fm1_cstart : 202ef7a >
+ 2000128:    49 e0 fe 07       \tr9 = 2046 <build/felucca_size.ll+0x7FE : 7fe >
+ 200012c:    80 00             \trts
+fm6_op_run:
+ 203916e:    05 90             \tr5 = [r1+r7<<2]
+ 2039170:    44 d1 0d 00       \tr4 = r12 >> 13
+ 2039174:    45 1c             \tr5_r4 = r4 * r14 (s)
+ 2039176:    b0 20             \t[r6+0] += r4
+ 2039178:    87 f8 e5 1f       \tif (r7 != 32) goto -10 <fm6_op_run : 203916e >
+ 203917c:    7f 05             \t{pc, r14-r4} = [sp++]
+Disassembly of section .rodata:
+SINE:
+ 203b5f4:\t 00 00 24 03 48 06 6c 09         ..$.H.l.
+ 203b5fc:\t 90 0c b3 0f d6 12 f8 15         ........
+"""
+
+
+class TestPi32v2(unittest.TestCase):
+    """JieLi pi32v2 dialect: clang -S with ';' comments and annotated
+    labels, the vendor objdump's header, byte-column and target syntax,
+    and shape-based span-stats buckets for algebraic assembly."""
+
+    def test_s_label_comment_stripped_so_span_is_found(self):
+        funcs = asmdiff.extract_functions(PI32V2_S)
+        self.assertEqual(sorted(funcs), ["add16_sat", "dot16"])
+        self.assertIn(".LBB2_1:", funcs["dot16"])
+        self.assertEqual(asmdiff.loop_spans(funcs["dot16"]), [(".LBB2_1", 5)])
+
+    def test_s_comment_lines_and_block_close_not_counted(self):
+        body = asmdiff.extract_functions(PI32V2_S)["add16_sat"]
+        self.assertNotIn("}", body)
+        self.assertFalse(any(ln.startswith(";") for ln in body))
+        self.assertEqual(asmdiff.loop_spans(body), [(".LBB0_2", 6)])
+
+    def test_objdump_bare_headers_and_data_section(self):
+        funcs = asmdiff.extract_functions_objdump(PI32V2_OBJDUMP)
+        self.assertEqual(sorted(funcs), ["_start", "fm6_op_run"])
+
+    def test_objdump_targets_normalized(self):
+        funcs = asmdiff.extract_functions_objdump(PI32V2_OBJDUMP)
+        self.assertIn("goto\t.L4", funcs["_start"])
+        self.assertIn("call\tfm1_cstart", funcs["_start"])
+        # uppercase nearest-symbol offset: noise, rendered as the raw address
+        self.assertIn("r9\t= 2046 0x7fe", funcs["_start"])
+        self.assertEqual(asmdiff.call_symbol("call\tfm1_cstart"), "fm1_cstart")
+        self.assertEqual(asmdiff.loop_spans(funcs["fm6_op_run"]), [(".L0", 5)])
+
+    def test_objdump_insn_lines_cleaned(self):
+        body = asmdiff.extract_functions_objdump(PI32V2_OBJDUMP)["fm6_op_run"]
+        self.assertEqual(body[1], "r5\t= [r1+r7<<2]")
+        for ln in body:
+            self.assertNotRegex(ln, r"^[0-9a-f]+\s")
+
+    def test_algebraic_buckets(self):
+        cases = {"r5\t= [r1+r7<<2]": "load",
+                 "{pc,\tr14-r4} = [sp++]": "load",
+                 "[r6+0]\t+= r4": "store",
+                 "[--sp]\t= {rets, r5, r4}": "store",
+                 "h[r0++=2]\t= r4": "store",
+                 "r5_r4\t= r4 * r14 (s)": "mul",
+                 "r1_r0\t+= r6 * r5 (s)": "mul",
+                 "r2\t= r2 / r3 (s)": "div",
+                 "if\t(r7 != 32) goto .L0": "branch",
+                 "ifs\t(r5 < 32768) {": "branch",
+                 "goto\t.L4": "branch",
+                 "rts": "branch",
+                 "call\t__mulsf3": "branch",
+                 "r4\t= r12 >> 13": "other",
+                 "r4\t= smax(r5, r3)": "other",
+                 "r12\t= r7  #": "other"}
+        for line, want in cases.items():
+            self.assertEqual(asmdiff.classify_insn(line), want, line)
+
+    def test_gnu_buckets_untouched_by_algebraic_rule(self):
+        self.assertEqual(asmdiff.classify_insn("l32i\ta0, a2, 0"), "load")
+        self.assertEqual(asmdiff.classify_insn("movl\t%eax, (%rdi)"), "store")
+
+    def test_objdump_beside_clang_is_derived(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary = Path(d) / "pi32v2" / "bin"
+            binary.mkdir(parents=True)
+            (binary / "clang").write_text("")
+            self.assertIsNone(asmdiff.derive_objdump([str(binary / "clang")]))
+            (binary / "objdump").write_text("")
+            self.assertEqual(asmdiff.derive_objdump([str(binary / "clang") + " -target pi32v2"]),
+                             str(binary / "objdump"))
