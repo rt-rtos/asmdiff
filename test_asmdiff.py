@@ -1006,6 +1006,10 @@ class TestTargetGroups(unittest.TestCase):
     def test_expansion_errors(self):
         for case, config, tokens, present, absent in self.EXPANSION_ERRORS:
             with self.subTest(case=case):
+                # The example-config pointer needs tomllib to read the
+                # example; without it the pointer is omitted (_example_names).
+                if case.startswith("example ") and asmdiff.tomllib is None:
+                    self.skipTest("tomllib requires Python >= 3.11")
                 with self.assertRaises(SystemExit) as ctx:
                     self.expand(*tokens, config=config)
                 msg = str(ctx.exception)
