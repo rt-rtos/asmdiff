@@ -736,6 +736,8 @@ def extract_functions(asm_text):
         line = LABEL_COMMENT.sub(r"\1", line)
         if line == "}":                     # pi32v2 predicated-block close
             continue
+        if line == "dummy":                 # pi32v2 rep-end filler, no bytes
+            continue
         funcs[current].append(line)
     return funcs
 
@@ -758,6 +760,11 @@ OBJDUMP_INSN = re.compile(
 OBJDUMP_SECTION = re.compile(r"^Disassembly of section (\S+):")
 # An "addr <annotation>" operand: branch, loop or call target.
 OBJDUMP_TARGET = re.compile(r"\b([0-9a-f]+) <([^>]+)>")
+# pi32v2 hardware loop as objdump prints it: "rep 6 r7 {" or
+# "rep 20 16 {" - the body length in bytes (decimal), then the repeat
+# count (register or immediate).  The body starts at the next
+# instruction; the closing "}" line has no address and is ignored.
+OBJDUMP_REP = re.compile(r"^(\d+)\s+(\S+)\s*\{?$")
 # JieLi's objdump annotates a target as "<sym+0x96 : 2039318 >" (GNU:
 # "2039318 <sym+0x96>") and puts the decimal displacement before it
 # ("call 762 <fm1_fatal_common : 2000458 >", "goto -26 <...>").  Both are
@@ -787,8 +794,11 @@ def extract_functions_objdump(dump_text):
     synthetic local labels (.L<hex-offset>) inserted at the target
     instruction; an Xtensa zero-overhead loop's end address becomes
     .L<off>_LEND, keeping the ZOL-vs-branch naming convention -S output
-    has.  Targets outside the function keep a bare-symbol annotation,
-    so calls still name their callee; offset-form annotations of other
+    has.  A pi32v2 "rep <bytes> <count> {" block is rewritten to the
+    shape its -S output has ("rep .L<off>_LEND <count>"), with the
+    label at the address the body ends on.  Targets outside the
+    function keep a bare-symbol annotation, so calls still name their
+    callee; offset-form annotations of other
     symbols are nearest-symbol noise and become raw hex addresses (see
     _relabel_objdump).  Offset-form headers
     (``<sym+0x..>``/``<sym-0x..>``: literal pools and other symbol-less
@@ -891,7 +901,14 @@ def _relabel_objdump(name, start, insns):
     rendered as the raw hex address instead."""
     addrs = {addr for addr, _, _ in insns}
     labels = {}
-    for _, mnem, ops in insns:
+    reps = {}                               # rep addr -> (end addr, count)
+    for k, (addr, mnem, ops) in enumerate(insns):
+        r = OBJDUMP_REP.match(ops) if mnem == "rep" else None
+        if r and k + 1 < len(insns):
+            end = insns[k + 1][0] + int(r.group(1))
+            if end in addrs:
+                reps[addr] = (end, r.group(2))
+                labels[end] = ".L%x_LEND" % (end - start)
         for m in OBJDUMP_TARGET.finditer(ops):
             taddr = int(m.group(1), 16)
             if taddr not in addrs:
@@ -914,7 +931,10 @@ def _relabel_objdump(name, start, insns):
     for addr, mnem, ops in insns:
         if addr in labels:
             lines.append(labels[addr] + ":")
-        ops = OBJDUMP_TARGET.sub(target_name, ops)
+        if addr in reps:
+            ops = "%s %s" % (labels[reps[addr][0]], reps[addr][1])
+        else:
+            ops = OBJDUMP_TARGET.sub(target_name, ops)
         lines.append(mnem + "\t" + ops if ops else mnem)
     return lines
 
@@ -1002,8 +1022,9 @@ def loop_span_ranges(lines):
     A span is the run of instructions from a local label to the last
     instruction that references it from below — a backward branch, which
     is what a compiled loop looks like on every target the tool parses.
-    Xtensa zero-overhead loops (loop/loopnez/loopgt) reference their END
-    label instead; there the span is the instructions the loop encloses.
+    Xtensa zero-overhead loops (loop/loopnez/loopgt) and pi32v2's rep
+    reference their END label instead; there the span is the
+    instructions the loop encloses.
     Spans are reported in order of appearance, one per label; nested
     labels yield nested spans.
     """
@@ -1020,8 +1041,8 @@ def loop_span_ranges(lines):
             j = label_at[ref]
             if j < i:                       # label above: backward branch
                 lo, hi = j, i
-            elif mnem.startswith("loop"):   # Xtensa: end label below
-                lo, hi = i + 1, j - 1
+            elif mnem.startswith("loop") or mnem == "rep":
+                lo, hi = i + 1, j - 1       # Xtensa/pi32v2: end label below
             else:
                 continue
             if ref in spans:                # several edges to one label

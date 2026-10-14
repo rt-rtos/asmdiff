@@ -321,11 +321,11 @@ everywhere else; two things are ELF-specific:
   targets, not labels, so in-function targets are rewritten to
   `.L<hex-offset>` labels (the offset from the function start - stable
   across rebuilds of an unchanged function, unlike link addresses). An
-  Xtensa zero-overhead loop's end address becomes `.L<off>_LEND`, so a
-  hardware loop is distinguishable from a branch loop in the `loop
-  spans` column at a glance: `render_lut` shipped its 32-instruction
-  body as a ZOL, `render_lut_cub` fell back to a 74-instruction
-  branch loop.
+  Xtensa zero-overhead loop's end address (a pi32v2 `rep` block's too)
+  becomes `.L<off>_LEND`, so a hardware loop is distinguishable from a
+  branch loop in the `loop spans` column at a glance: `render_lut`
+  shipped its 32-instruction body as a ZOL, `render_lut_cub` fell back
+  to a 74-instruction branch loop.
 - **`-mlongcalls` calls are resolved.** An out-of-range call survives
   linking as `l32r a8, <lit>` + `callx8 a8`, which has no callee name
   of its own. When the disassembly annotates the literal with its
@@ -408,8 +408,10 @@ toolchain's objdump sits beside its clang, so the bundled `pi32v2`
 profile (or any `--cc` naming that clang by path) derives it; otherwise
 pass `--objdump`. Compile mode works with
 `--cc '$JIELI_TOOLCHAIN/pi32v2/bin/clang -target pi32v2 -Os'`. The
-compiler has not been seen to emit the `rep` hardware loop, so there is
-no ZOL-style span naming for it.
+compiler does not emit the `rep` hardware loop from C, but vendor inline
+asm uses it (`rep n rN { ... }`); a `rep` block gets a span over its
+body, named `.L<off>_LEND` in ELF input like an Xtensa zero-overhead
+loop.
 
 If the question behind the sweep is "did my hot loops ship as
 zero-overhead loops", the empirical rules (verified on esp-gcc 15.2,
@@ -1413,6 +1415,9 @@ names its *end* label, forward:
 .L5:
     retw.n
 ```
+
+pi32v2's `rep` hardware loop (`rep .Ltmp8 r7` in `-S` output, `rep 6 r7 {`
+in objdump) is the same case, with its body ending at the named label.
 
 That is the entire mechanism. There is no CFG, no trip count, and no
 notion of "the" loop: a backward `goto` produces a span exactly like a

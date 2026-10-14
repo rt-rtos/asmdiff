@@ -3921,5 +3921,249 @@ class TestPi32v2(unittest.TestCase):
                              str(binary / "objdump"))
 
 
+# JieLi pi32v2 `rep` hardware loops (clang 4.0.1 fork, -Os), assembled from
+# inline asm after fast_i2f in JieLi's jl_fft.c: "rep %1 { ... }" with a
+# register count.  rep_two holds two blocks after a plain C loop,
+# rep_nested one inside a C loop.  In -S the block's "}" is an end label
+# followed by a "dummy" placeholder; objdump prints "rep <body bytes> rN {".
+PI32V2_REP_S = """\
+\t.globl\trep_two
+\t.p2align\t1
+\t.type\trep_two,@function
+rep_two:                                ; @rep_two
+; BB#0:
+\t[--sp] = {rets, r8-r4}
+\tr8 = [sp+24]
+\tifs (r3 < 1) goto .LBB0_3
+; BB#1:
+\tr5 = r3
+\tr6 = r2
+\tr7 = r0
+.LBB0_2:                                ; =>This Inner Loop Header: Depth=1
+\tr4 = [r7++=4] 
+\tr4 += 1
+\t[r6++=4] = r4
+\tif (--r5 != 0) goto .LBB0_2
+.LBB0_3:
+\tr5 = r1
+\tr6 = r8
+\tr7 = r3
+\t;APP
+.Ltmp7:
+\trep .Ltmp8 r7
+
+\tr4 = [r0++=4] 
+
+\tr4 = r4 + r6
+
+\t[r5++=4] = r4
+
+.Ltmp8:
+\tdummy
+
+\tif (r7 > 0) goto .Ltmp7
+
+
+\t;NO_APP
+\t;APP
+.Ltmp9:
+\trep .Ltmp10 r3
+
+\tr0 = [r1++=4] 
+
+\tr0 += r8
+
+\tr0 = r0 << 1
+
+\t[r2++=4] = r0
+
+.Ltmp10:
+\tdummy
+
+\tif (r3 > 0) goto .Ltmp9
+
+
+\t;NO_APP
+\t{pc, r8-r4} = [sp++]
+.Lfunc_end0:
+\t.size\trep_two, .Lfunc_end0-rep_two
+
+\t.globl\trep_nested
+\t.p2align\t1
+\t.type\trep_nested,@function
+rep_nested:                             ; @rep_nested
+; BB#0:
+\t[--sp] = {rets, r10-r4}
+\tifs (r3 < 1) goto .LBB1_3
+; BB#1:
+\tr8 = [sp+32]
+\tr9 = r2 << 2
+.LBB1_2:                                ; =>This Inner Loop Header: Depth=1
+\tr10 = r0
+\tr7 = r8
+\tr4 = r2
+\tr5 = r1
+\t;APP
+.Ltmp20:
+\trep .Ltmp21 r4
+
+\tr6 = [r10++=4]
+
+\tr6 = r6 + r7
+
+\t[r5++=4] = r6
+
+.Ltmp21:
+\tdummy
+
+\tif (r4 > 0) goto .Ltmp20
+
+
+\t;NO_APP
+\tr1 += r9
+\tif (--r3 != 0) goto .LBB1_2
+.LBB1_3:
+\t{pc, r10-r4} = [sp++]
+.Lfunc_end1:
+\t.size\trep_nested, .Lfunc_end1-rep_nested
+
+
+"""
+
+PI32V2_REP_OBJDUMP = """\
+
+rep_demo.o:\tfile format ELF32-pi32v2
+
+Disassembly of section .text:
+rep_two:
+       0:    78 04             \t[--sp] = {rets, r8-r4}
+       2:    d4 e9 18 80       \tr8 = [sp+24]
+       6:    83 fd 08 02       \tifs (r3 < 1) goto 16 <rep_two+0x1A : 1a >
+       a:    35 16             \tr5 = r3
+       c:    26 16             \tr6 = r2
+       e:    07 16             \tr7 = r0
+      10:    74 05             \tr4 = [r7++=4] 
+      12:    c4 21             \tr4 += 1
+      14:    e4 05             \t[r6++=4] = r4
+      16:    05 ea fb ff       \tif (--r5 != 0) goto -10 <rep_two+0x10 : 10 >
+      1a:    15 16             \tr5 = r1
+      1c:    86 16             \tr6 = r8
+      1e:    37 16             \tr7 = r3
+      20:    27 03             \trep 6 r7 {
+      22:    04 05             \t\tr4 = [r0++=4] 
+      24:    c4 1d             \t\tr4 = r4 + r6
+      26:    d4 05             \t\t[r5++=4] = r4
+                               \t}
+      28:    07 fc fa 01       \tif (r7 > 0) goto -12 <rep_two+0x20 : 20 >
+      2c:    33 03             \trep 8 r3 {
+      2e:    10 05             \t\tr0 = [r1++=4] 
+      30:    80 18             \t\tr0 += r8
+      32:    00 a1             \t\tr0 = r0 << 1
+      34:    a0 05             \t\t[r2++=4] = r0
+                               \t}
+      36:    03 fc f9 01       \tif (r3 > 0) goto -14 <rep_two+0x2C : 2c >
+      3a:    58 04             \t{pc, r8-r4} = [sp++]
+
+
+rep_nested:
+      3c:    7a 04             \t[--sp] = {rets, r10-r4}
+      3e:    83 fd 12 02       \tifs (r3 < 1) goto 36 <rep_nested+0x2A : 66 >
+      42:    d4 e9 20 80       \tr8 = [sp+32]
+      46:    c0 e1 22 90       \tr9 = r2 << 2
+      4a:    0a 16             \tr10 = r0
+      4c:    87 16             \tr7 = r8
+      4e:    24 16             \tr4 = r2
+      50:    15 16             \tr5 = r1
+      52:    34 03             \trep 8 r4 {
+      54:    d8 ec a4 60       \t\tr6 = [r10++=4]
+      58:    ee 1d             \t\tr6 = r6 + r7
+      5a:    d6 05             \t\t[r5++=4] = r6
+                               \t}
+      5c:    04 fc f9 01       \tif (r4 > 0) goto -14 <rep_nested+0x16 : 52 >
+      60:    91 18             \tr1 += r9
+      62:    03 ea f2 ff       \tif (--r3 != 0) goto -28 <rep_nested+0xE : 4a >
+      66:    5a 04             \t{pc, r10-r4} = [sp++]
+
+"""
+
+# An immediate count ("rep 20 16 {"), from a second probe object.
+PI32V2_REP_IMM_OBJDUMP = """\
+
+imm.o:\tfile format ELF32-pi32v2
+
+Disassembly of section .text:
+rep_imm:
+       0:    90 8f             \trep 20 16 {
+       2:    02 05             \t\tr2 = [r0++=4] 
+       4:    2a 1c             \t\tr2 = r2 + r1
+       6:    22 a1             \t\tr2 = r2 << 1
+       8:    2a 1c             \t\tr2 = r2 + r1
+       a:    2a 1c             \t\tr2 = r2 + r1
+       c:    2a 1c             \t\tr2 = r2 + r1
+       e:    2a 1c             \t\tr2 = r2 + r1
+      10:    2a 1c             \t\tr2 = r2 + r1
+      12:    2a 1c             \t\tr2 = r2 + r1
+      14:    82 05             \t\t[r0++=4] = r2
+                               \t}
+      16:    80 00             \trts
+
+"""
+
+
+class TestPi32v2Rep(unittest.TestCase):
+    """pi32v2 `rep` hardware loops: the span covers the repeated body,
+    in -S output (rep names its end label) and in objdump output (the
+    body length in bytes becomes a .L<off>_LEND label, as for Xtensa)."""
+
+    spans = staticmethod(asmdiff.loop_spans)
+
+    def test_s_rep_span_is_the_body(self):
+        # Same counts as the ELF of this object: the zero-byte "dummy"
+        # clang puts after a rep end label is not an instruction.
+        body = asmdiff.extract_functions(PI32V2_REP_S)["rep_two"]
+        self.assertNotIn("dummy", body)
+        self.assertEqual(self.spans(body),
+                         [(".LBB0_2", 4), (".Ltmp7", 5), (".Ltmp8", 3),
+                          (".Ltmp9", 6), (".Ltmp10", 4)])
+
+    def test_s_rep_inside_c_loop_nests(self):
+        body = asmdiff.extract_functions(PI32V2_REP_S)["rep_nested"]
+        ranges = asmdiff.loop_span_ranges(body)
+        self.assertEqual(self.spans(body),
+                         [(".LBB1_2", 11), (".Ltmp20", 5), (".Ltmp21", 3)])
+        self.assertEqual(asmdiff.span_depths(ranges),
+                         {".LBB1_2": 0, ".Ltmp20": 1, ".Ltmp21": 2})
+
+    def test_objdump_rep_gets_end_label(self):
+        body = asmdiff.extract_functions_objdump(PI32V2_REP_OBJDUMP)["rep_two"]
+        self.assertIn("rep\t.L28_LEND r7", body)
+        self.assertIn("rep\t.L36_LEND r3", body)
+        self.assertNotIn("}", body)
+        self.assertEqual(body[body.index(".L28_LEND:") + 1],
+                         "if\t(r7 > 0) goto .L20")
+
+    def test_objdump_rep_spans(self):
+        funcs = asmdiff.extract_functions_objdump(PI32V2_REP_OBJDUMP)
+        self.assertEqual(self.spans(funcs["rep_two"]),
+                         [(".L10", 4), (".L20", 5), (".L28_LEND", 3),
+                          (".L2c", 6), (".L36_LEND", 4)])
+        self.assertEqual(self.spans(funcs["rep_nested"]),
+                         [(".Le", 11), (".L16", 5), (".L20_LEND", 3)])
+
+    def test_objdump_rep_immediate_count(self):
+        body = asmdiff.extract_functions_objdump(
+            PI32V2_REP_IMM_OBJDUMP)["rep_imm"]
+        self.assertEqual(body[0], "rep\t.L16_LEND 16")
+        self.assertEqual(self.spans(body), [(".L16_LEND", 10)])
+
+    def test_rep_stays_a_branch(self):
+        self.assertEqual(asmdiff.classify_insn("rep\t.L28_LEND r7"), "branch")
+        self.assertEqual(asmdiff.classify_insn("rep\t.Ltmp8 r7"), "branch")
+
+    def test_x86_rep_prefix_makes_no_span(self):
+        self.assertEqual(asmdiff.loop_span_ranges(
+            ["rep movsb", ".L2:", "addl\t$1, %eax"]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
