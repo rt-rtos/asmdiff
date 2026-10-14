@@ -3780,9 +3780,6 @@ class TestGolden(unittest.TestCase):
                               + diff)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # JieLi pi32v2 clang -S output: algebraic assembly, ';' comments, labels
 # annotated with a trailing comment, a predicated block closed by '}'.
@@ -3922,3 +3919,7 @@ class TestPi32v2(unittest.TestCase):
             (binary / "objdump").write_text("")
             self.assertEqual(asmdiff.derive_objdump([str(binary / "clang") + " -target pi32v2"]),
                              str(binary / "objdump"))
+
+
+if __name__ == "__main__":
+    unittest.main()
